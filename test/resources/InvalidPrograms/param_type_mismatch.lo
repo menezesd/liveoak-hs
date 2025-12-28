@@ -1,0 +1,10 @@
+class Main(){
+  int main(this Main){
+    return 0;
+  }
+}
+class Foo(){
+  int bar(this Foo, int x){
+    return x;
+  }
+}

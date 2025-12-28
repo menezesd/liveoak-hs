@@ -1,0 +1,4 @@
+class Main {
+{ UnknownType x; }
+int main(){ return 0; }
+}

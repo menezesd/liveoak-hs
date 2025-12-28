@@ -1,0 +1,335 @@
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE RecordWildCards #-}
+
+-- | Semantic analysis for LiveOak.
+-- Performs type checking and validation on the AST.
+module LiveOak.Semantic
+  ( -- * Semantic Checking
+    checkProgram
+  , checkMethod
+  , checkStmt
+  , checkExpr
+
+    -- * Type Inference
+  , inferType
+  , inferClassName
+  ) where
+
+import Control.Monad (when, unless, forM_)
+
+import LiveOak.Types
+import LiveOak.Ast
+import LiveOak.Symbol
+import LiveOak.Diag
+
+-- | Context for semantic checking.
+data CheckCtx = CheckCtx
+  { ctxMethod  :: MethodSymbol
+  , ctxSymbols :: ProgramSymbols
+  }
+
+-- | Check an entire program.
+checkProgram :: Program -> ProgramSymbols -> Result ()
+checkProgram (Program classes) syms = do
+  -- Check entry point exists
+  case getEntrypoint syms of
+    Nothing -> resolveErr "Missing Main.main entry point" 0 0
+    Just ms -> do
+      when (expectedUserArgs ms > 0) $
+        syntaxErr "Main.main must not have parameters" 0 0
+  -- Check all methods
+  forM_ classes $ \cls ->
+    forM_ (classMethods cls) $ \method ->
+      checkMethod method syms
+
+-- | Check a single method.
+checkMethod :: MethodDecl -> ProgramSymbols -> Result ()
+checkMethod MethodDecl{..} syms = do
+  -- Look up method symbol
+  cs <- fromMaybe (ResolveError ("Unknown class: " ++ methodClassName) 0 0)
+          (lookupClass methodClassName syms)
+  ms <- fromMaybe (ResolveError ("Unknown method: " ++ methodName) 0 0)
+          (lookupMethod methodName cs)
+  let ctx = CheckCtx ms syms
+  -- Check body
+  checkStmt ctx methodBody
+  -- Check return coverage for non-void methods
+  when (methodReturnSig /= Void) $ do
+    unless (endsWithReturn methodBody) $
+      syntaxErr "Non-void method must end with return" (stmtPos methodBody) 0
+
+-- | Check if a statement ends with a return.
+endsWithReturn :: Stmt -> Bool
+endsWithReturn = \case
+  Return _ _    -> True
+  Block stmts _ -> not (null stmts) && endsWithReturn (last stmts)
+  If _ th el _  -> endsWithReturn th && endsWithReturn el
+  _             -> False
+
+-- | Check a statement.
+checkStmt :: CheckCtx -> Stmt -> Result ()
+checkStmt ctx@CheckCtx{..} = \case
+  Block stmts _ ->
+    mapM_ (checkStmt ctx) stmts
+
+  VarDecl _name vtOpt initOpt pos -> do
+    case initOpt of
+      Nothing -> ok ()
+      Just initExpr -> do
+        checkExpr ctx initExpr
+        case vtOpt of
+          Nothing -> ok ()
+          Just expectedVt -> checkAssignable ctx expectedVt initExpr pos
+
+  Assign name value pos -> do
+    checkExpr ctx value
+    case lookupVar name ctxMethod of
+      Just vs -> checkAssignable ctx (vsType vs) value pos
+      Nothing ->
+        -- Check if it's a field of 'this'
+        case lookupVar "this" ctxMethod of
+          Just thisVs -> case typeClassName (vsType thisVs) of
+            Just cn -> case lookupClass cn ctxSymbols of
+              Just cs -> case lookupField name cs of
+                Just fv -> checkAssignable ctx (vsType fv) value pos
+                Nothing -> resolveErr ("Undeclared variable: " ++ name) pos 0
+              Nothing -> resolveErr ("Undeclared variable: " ++ name) pos 0
+            Nothing -> resolveErr ("Undeclared variable: " ++ name) pos 0
+          Nothing -> resolveErr ("Undeclared variable: " ++ name) pos 0
+
+  FieldAssign target field _ value pos -> do
+    checkExpr ctx target
+    checkExpr ctx value
+    case target of
+      NullLit _ -> syntaxErr ("Null dereference in field assignment: " ++ field) pos 0
+      _ -> ok ()
+
+  Return valueOpt pos -> do
+    let retSig = getReturnSig ctxMethod
+    case (valueOpt, retSig) of
+      (Nothing, Void) -> ok ()
+      (Nothing, _)    -> typeErr "Non-void method must return a value" pos 0
+      (Just _, Void)  -> typeErr "Void method should not return a value" pos 0
+      (Just expr, RetPrim t) -> do
+        checkExpr ctx expr
+        exprT <- inferType ctx expr
+        unless (exprT == Just t) $
+          typeErr "Return type mismatch" pos 0
+      (Just expr, RetObj cn) -> do
+        checkExpr ctx expr
+        case expr of
+          NullLit _ -> ok ()  -- null is valid for object return
+          _ -> do
+            exprCn <- inferClassName ctx expr
+            unless (exprCn == Just cn) $
+              typeErr "Return object type mismatch" pos 0
+
+  If cond thenB elseB pos -> do
+    checkExpr ctx cond
+    condT <- inferType ctx cond
+    unless (condT == Just TBool) $
+      typeErr "If condition must be bool" pos 0
+    checkStmt ctx thenB
+    checkStmt ctx elseB
+
+  While cond body pos -> do
+    checkExpr ctx cond
+    condT <- inferType ctx cond
+    unless (condT == Just TBool) $
+      typeErr "While condition must be bool" pos 0
+    checkStmt ctx body
+
+  Break _ -> ok ()
+
+  ExprStmt expr _ -> checkExpr ctx expr
+
+-- | Check assignability of an expression to a value type.
+checkAssignable :: CheckCtx -> ValueType -> Expr -> Int -> Result ()
+checkAssignable ctx expected expr pos = case expected of
+  ObjectRefType _ -> case expr of
+    NullLit _ -> ok ()  -- null is assignable to any object type
+    _ -> do
+      exprCn <- inferClassName ctx expr
+      let expectedCn = typeClassName expected
+      unless (exprCn == expectedCn) $
+        typeErr "Object type mismatch in assignment" pos 0
+  PrimitiveType t -> do
+    exprT <- inferType ctx expr
+    unless (exprT == Just t) $
+      typeErr "Type mismatch in assignment" pos 0
+
+-- | Check an expression.
+checkExpr :: CheckCtx -> Expr -> Result ()
+checkExpr ctx@CheckCtx{..} = \case
+  IntLit _ _  -> ok ()
+  BoolLit _ _ -> ok ()
+  StrLit _ _  -> ok ()
+  NullLit _   -> ok ()
+  This _      -> ok ()
+
+  Var name pos ->
+    case lookupVar name ctxMethod of
+      Just _  -> ok ()
+      Nothing ->
+        -- Check if it's a field of 'this'
+        case lookupVar "this" ctxMethod of
+          Just thisVs -> case typeClassName (vsType thisVs) of
+            Just cn -> case lookupClass cn ctxSymbols of
+              Just cs -> case lookupField name cs of
+                Just _  -> ok ()
+                Nothing -> checkGlobalMethod name pos
+              Nothing -> checkGlobalMethod name pos
+            Nothing -> checkGlobalMethod name pos
+          Nothing -> checkGlobalMethod name pos
+    where
+      -- Check if the name is a method call without parentheses (unlikely, but be lenient)
+      checkGlobalMethod n p = resolveErr ("Undeclared variable: " ++ n) p 0
+
+  Unary _ expr _ -> checkExpr ctx expr
+
+  Binary _ left right _ -> do
+    checkExpr ctx left
+    checkExpr ctx right
+
+  Ternary cond thenE elseE _pos -> do
+    checkExpr ctx cond
+    checkExpr ctx thenE
+    checkExpr ctx elseE
+
+  Call _ args _ -> mapM_ (checkExpr ctx) args
+
+  InstanceCall target _method args pos -> do
+    case target of
+      This _ -> syntaxErr "Explicit this.method() is not allowed" pos 0
+      NullLit _ -> syntaxErr "Null dereference in instance call" pos 0
+      InstanceCall _ _ _ _ -> syntaxErr "Method chaining is not allowed" pos 0
+      FieldAccess _ _ _ -> syntaxErr "Method chaining is not allowed" pos 0
+      _ -> ok ()
+    checkExpr ctx target
+    mapM_ (checkExpr ctx) args
+
+  NewObject _ args _ -> mapM_ (checkExpr ctx) args
+
+  FieldAccess target field pos -> do
+    case target of
+      NullLit _ -> syntaxErr ("Null dereference in field access: " ++ field) pos 0
+      _ -> ok ()
+    checkExpr ctx target
+
+-- | Infer the primitive type of an expression (if primitive).
+inferType :: CheckCtx -> Expr -> Result (Maybe Type)
+inferType ctx@CheckCtx{..} = \case
+  IntLit _ _  -> ok (Just TInt)
+  BoolLit _ _ -> ok (Just TBool)
+  StrLit _ _  -> ok (Just TString)
+  NullLit _   -> ok Nothing  -- null has no primitive type
+
+  Var name _ -> case lookupVar name ctxMethod of
+    Just vs -> ok $ primitiveType (vsType vs)
+    Nothing ->
+      -- Check if it's a field of 'this'
+      case lookupVar "this" ctxMethod of
+        Just thisVs -> case typeClassName (vsType thisVs) of
+          Just cn -> case lookupClass cn ctxSymbols of
+            Just cs -> case lookupField name cs of
+              Just vs -> ok $ primitiveType (vsType vs)
+              Nothing -> ok Nothing
+            Nothing -> ok Nothing
+          Nothing -> ok Nothing
+        Nothing -> ok Nothing
+
+  This _ -> ok Nothing  -- 'this' is an object
+
+  Unary Neg _ _  -> ok (Just TInt)  -- negation returns int (or string for ~)
+  Unary Not _ _  -> ok (Just TBool)
+
+  Binary op left right _ -> case op of
+    -- Add can be integer addition or string concatenation
+    Add -> do
+      leftT <- inferType ctx left
+      rightT <- inferType ctx right
+      if leftT == Just TString || rightT == Just TString
+        then ok (Just TString)
+        else ok (Just TInt)
+    Sub -> ok (Just TInt)
+    Mul -> ok (Just TInt)
+    Div -> ok (Just TInt)
+    Mod -> ok (Just TInt)
+    And -> ok (Just TBool)
+    Or  -> ok (Just TBool)
+    Eq  -> ok (Just TBool)
+    Ne  -> ok (Just TBool)
+    Lt  -> ok (Just TBool)
+    Le  -> ok (Just TBool)
+    Gt  -> ok (Just TBool)
+    Ge  -> ok (Just TBool)
+    Concat -> ok (Just TString)
+
+  Ternary _ thenE _ _ -> inferType ctx thenE
+
+  Call _name _ _ -> ok Nothing  -- would need to look up method return type
+
+  InstanceCall target method _ _ -> do
+    targetCn <- inferClassName ctx target
+    case targetCn of
+      Nothing -> ok Nothing
+      Just cn -> case lookupProgramMethod cn method ctxSymbols of
+        Nothing -> ok Nothing
+        Just ms -> ok $ primitiveType =<< msReturnType ms
+
+  NewObject _ _ _ -> ok Nothing  -- object type
+
+  FieldAccess target field _ -> do
+    targetCn <- inferClassName ctx target
+    case targetCn of
+      Nothing -> ok Nothing
+      Just cn -> case lookupClass cn ctxSymbols of
+        Nothing -> ok Nothing
+        Just cs -> case lookupField field cs of
+          Nothing -> ok Nothing
+          Just vs -> ok $ primitiveType (vsType vs)
+
+-- | Infer the class name of an expression (if object type).
+inferClassName :: CheckCtx -> Expr -> Result (Maybe String)
+inferClassName ctx@CheckCtx{..} = \case
+  NullLit _ -> ok Nothing
+
+  This _ -> case lookupVar "this" ctxMethod of
+    Just vs -> ok $ typeClassName (vsType vs)
+    Nothing -> ok Nothing
+
+  Var name _ -> case lookupVar name ctxMethod of
+    Just vs -> ok $ typeClassName (vsType vs)
+    Nothing ->
+      -- Check if it's a field of 'this'
+      case lookupVar "this" ctxMethod of
+        Just thisVs -> case typeClassName (vsType thisVs) of
+          Just cn -> case lookupClass cn ctxSymbols of
+            Just cs -> case lookupField name cs of
+              Just vs -> ok $ typeClassName (vsType vs)
+              Nothing -> ok Nothing
+            Nothing -> ok Nothing
+          Nothing -> ok Nothing
+        Nothing -> ok Nothing
+
+  NewObject cn _ _ -> ok (Just cn)
+
+  InstanceCall target method _ _ -> do
+    targetCn <- inferClassName ctx target
+    case targetCn of
+      Nothing -> ok Nothing
+      Just cn -> case lookupProgramMethod cn method ctxSymbols of
+        Nothing -> ok Nothing
+        Just ms -> ok $ typeClassName =<< msReturnType ms
+
+  FieldAccess target field _ -> do
+    targetCn <- inferClassName ctx target
+    case targetCn of
+      Nothing -> ok Nothing
+      Just cn -> case lookupClass cn ctxSymbols of
+        Nothing -> ok Nothing
+        Just cs -> case lookupField field cs of
+          Nothing -> ok Nothing
+          Just vs -> ok $ typeClassName (vsType vs)
+
+  _ -> ok Nothing  -- primitives and operators don't have class names

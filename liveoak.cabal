@@ -1,0 +1,61 @@
+cabal-version:      3.0
+name:               liveoak
+version:            0.1.0.0
+synopsis:           LiveOak 3 compiler targeting SAM assembly
+description:        A compiler for the LiveOak 3 object-oriented language,
+                    generating code for the SAM (Stack Abstract Machine).
+license:            MIT
+author:             Dean
+maintainer:         dean@example.com
+category:           Compilers
+build-type:         Simple
+
+common warnings
+    ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates
+                 -Wincomplete-uni-patterns -Wmissing-export-lists
+                 -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints
+
+library
+    import:           warnings
+    exposed-modules:  LiveOak.Types
+                    , LiveOak.Ast
+                    , LiveOak.Symbol
+                    , LiveOak.Diag
+                    , LiveOak.Lexer
+                    , LiveOak.Parser
+                    , LiveOak.Semantic
+                    , LiveOak.Codegen
+                    , LiveOak.StringRuntime
+                    , LiveOak.Compiler
+    build-depends:    base >= 4.17 && < 5
+                    , text >= 2.0
+                    , megaparsec >= 9.0
+                    , containers >= 0.6
+                    , mtl >= 2.3
+                    , transformers >= 0.6
+    hs-source-dirs:   src
+    default-language: GHC2021
+
+executable liveoak
+    import:           warnings
+    main-is:          Main.hs
+    build-depends:    base >= 4.17 && < 5
+                    , liveoak
+                    , text >= 2.0
+    hs-source-dirs:   app
+    default-language: GHC2021
+
+test-suite liveoak-test
+    import:           warnings
+    type:             exitcode-stdio-1.0
+    main-is:          Main.hs
+    other-modules:    CompilerTest
+    build-depends:    base >= 4.17 && < 5
+                    , liveoak
+                    , text >= 2.0
+                    , tasty >= 1.4
+                    , tasty-hunit >= 0.10
+                    , directory >= 1.3
+                    , filepath >= 1.4
+    hs-source-dirs:   test
+    default-language: GHC2021

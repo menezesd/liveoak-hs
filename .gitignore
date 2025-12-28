@@ -1,0 +1,19 @@
+# Cabal build artifacts
+dist-newstyle/
+dist/
+cabal.project.local
+cabal.project.local~
+.cabal-sandbox/
+cabal.sandbox.config
+
+# GHC artifacts
+*.hi
+*.o
+*.dyn_hi
+*.dyn_o
+
+# Editor files
+*~
+*.swp
+.vscode/
+.idea/

@@ -1,0 +1,10 @@
+class car() {
+  int carPrice() { { return 10; } }
+}
+
+class Main() {
+  int main() {
+    car c;
+    { c = new car(); return c.carPrice(); }
+  }
+}
