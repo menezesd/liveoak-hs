@@ -223,22 +223,24 @@ emitStmt = \case
     emit "STOREIND\n"
 
   Return valueOpt _ -> do
+    currentClass <- asks cgClassName
     case valueOpt of
-      -- Check for tail call (to self or other method)
+      -- Check for tail call (to self or other method in same class)
       Just callExpr@(Call calledMethod args _) -> do
         canTCO <- canTailCallOptimize calledMethod (length args + 1)  -- +1 for 'this'
-        if canTCO
-          then emitTailCall calledMethod args Nothing  -- 'this' passed implicitly
-          else do
+        case (canTCO, currentClass) of
+          (True, Just cc) -> emitTailCall cc calledMethod args Nothing  -- 'this' passed implicitly
+          _ -> do
             emitExpr callExpr
             emitReturnJump
+      -- Check for tail call to instance method (possibly cross-class)
       Just callExpr@(InstanceCall target calledMethod args _pos) -> do
-        targetClass <- inferTargetClass target
-        case targetClass of
+        targetCls <- inferTargetClass target
+        case targetCls of
           Just cn -> do
             canTCO <- canTailCallOptimizeInstance cn calledMethod (length args + 1)
             if canTCO
-              then emitTailCall calledMethod args (Just target)
+              then emitTailCall cn calledMethod args (Just target)
               else do
                 emitExpr callExpr
                 emitReturnJump
@@ -778,7 +780,7 @@ emitStringConcat = do
 -- Returns True if:
 -- 1. We're in a method context
 -- 2. The target method exists in the current class
--- 3. The parameter counts match (including 'this')
+-- 3. The parameter counts match exactly (required for correct return slot offset)
 canTailCallOptimize :: String -> Int -> Codegen Bool
 canTailCallOptimize targetMethod _nArgsWithThis = do
   ms <- asks cgMethod
@@ -788,45 +790,39 @@ canTailCallOptimize targetMethod _nArgsWithThis = do
     (Just currentMs, Just className) ->
       case lookupProgramMethod className targetMethod syms of
         Just targetMs ->
-          -- Check if parameter counts match (both include 'this')
+          -- TCO requires exact param count match because:
+          -- 1. Parameter offsets are calculated from numParams
+          -- 2. Return slot offset is -(3 + numParams)
+          -- If counts differ, the return value goes to wrong location
           return $ numParams currentMs == numParams targetMs
         Nothing -> return False
     _ -> return False
 
 -- | Check if an instance call can be tail-call optimized.
--- For now, only allow TCO for calls to methods in the SAME class.
+-- Allows cross-class TCO when parameter counts match exactly.
 canTailCallOptimizeInstance :: String -> String -> Int -> Codegen Bool
 canTailCallOptimizeInstance targetClass targetMethod _nArgsWithThis = do
   ms <- asks cgMethod
-  cn <- asks cgClassName
   syms <- asks cgSymbols
-  case (ms, cn) of
-    (Just currentMs, Just currentClass)
-      -- Only allow TCO if target class is the same as current class
-      | targetClass == currentClass ->
-        case lookupProgramMethod targetClass targetMethod syms of
-          Just targetMs ->
-            -- Check if parameter counts match
-            return $ numParams currentMs == numParams targetMs
-          Nothing -> return False
-      | otherwise -> return False  -- Cross-class TCO not supported yet
-    _ -> return False
+  case ms of
+    Just currentMs ->
+      case lookupProgramMethod targetClass targetMethod syms of
+        Just targetMs ->
+          -- TCO requires exact param count match (see above)
+          return $ numParams currentMs == numParams targetMs
+        Nothing -> return False
+    Nothing -> return False
 
 -- | Emit a tail call (TCO).
 -- Updates parameters in place and jumps to target method's TCO entry point.
 -- If 'thisExpr' is Nothing, reuses current 'this'; otherwise evaluates the new 'this'.
-emitTailCall :: String -> [Expr] -> Maybe Expr -> Codegen ()
-emitTailCall targetMethod args thisExpr = do
+emitTailCall :: String -> String -> [Expr] -> Maybe Expr -> Codegen ()
+emitTailCall targetClass targetMethod args thisExpr = do
   ms <- asks cgMethod
-  cn <- asks cgClassName
   syms <- asks cgSymbols
-  case (ms, cn) of
-    (Nothing, _) -> throwError $ D.ResolveError "No method context for TCO" 0 0
-    (_, Nothing) -> throwError $ D.ResolveError "No class context for TCO" 0 0
-    (Just method, Just className) -> do
-      -- Determine target class
-      let targetClass = className  -- For now, only same-class TCO
-
+  case ms of
+    Nothing -> throwError $ D.ResolveError "No method context for TCO" 0 0
+    Just method -> do
       -- Get target method info
       targetMs <- case lookupProgramMethod targetClass targetMethod syms of
         Just tms -> return tms
@@ -844,10 +840,10 @@ emitTailCall targetMethod args thisExpr = do
 
       -- Now store them in reverse order into parameter slots
       -- Stack now has: [this'] [arg0] [arg1] ... [argN-1] (TOS = argN-1)
-      -- We need to store: this at -(2+nParams), arg0 at -(1+nParams), etc.
+      -- Since we require param counts to match, we can use either method's numParams
       let nParams = numParams method
           nArgs = length args
-          -- User param offsets: first user param at -(1+nParams), next at -(1+nParams)+1, etc.
+          -- User param offsets: first user param at -(1+nParams), etc.
           paramOffsets = [-(1 + nParams) + i | i <- [0..nArgs-1]]
           thisOffset = -(2 + nParams)
 

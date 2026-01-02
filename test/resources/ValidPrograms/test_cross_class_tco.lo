@@ -1,0 +1,47 @@
+// Test cross-class tail call optimization
+// Tests tail calls between methods in DIFFERENT classes with matching param counts
+class Main() {
+    int main() {
+        Ping p;
+        {
+            p = new Ping();
+            return p.ping(5);
+        }
+    }
+}
+
+class Ping() {
+    void Ping() { { ; } }
+
+    // Has 1 user param, calls Pong.pong which also has 1 user param
+    int ping(int n) {
+        Pong p;
+        {
+            if (n <= 0) {
+                return 0;
+            } else {
+                p = new Pong();
+                // Cross-class tail call - both methods have 1 user param
+                return p.pong(n - 1);
+            }
+        }
+    }
+}
+
+class Pong() {
+    void Pong() { { ; } }
+
+    // Has 1 user param, calls Ping.ping which also has 1 user param
+    int pong(int n) {
+        Ping p;
+        {
+            if (n <= 0) {
+                return 1;
+            } else {
+                p = new Ping();
+                // Cross-class tail call back
+                return p.ping(n - 1);
+            }
+        }
+    }
+}
