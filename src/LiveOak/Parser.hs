@@ -297,10 +297,11 @@ pBreak = do
   return $ Break pos
 
 -- | Parse an assignment statement.
+-- Uses pPostfix (not pExpr) for the target to avoid consuming '=' as comparison.
 pAssignment :: Parser Stmt
 pAssignment = do
   pos <- getLineNo
-  target <- pExpr
+  target <- pPostfix  -- Only parse variable or field access, not full expressions
   operator '='
   value <- pExpr
   semi

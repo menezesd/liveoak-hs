@@ -193,6 +193,9 @@ checkExpr ctx@CheckCtx{..} = \case
 
   Ternary cond thenE elseE _pos -> do
     checkExpr ctx cond
+    condT <- inferType ctx cond
+    unless (condT == Just TBool) $
+      typeErr "Ternary condition must be bool" (exprPos cond) 0
     checkExpr ctx thenE
     checkExpr ctx elseE
 
@@ -240,7 +243,11 @@ inferType ctx@CheckCtx{..} = \case
 
   This _ -> ok Nothing  -- 'this' is an object
 
-  Unary Neg _ _  -> ok (Just TInt)  -- negation returns int (or string for ~)
+  Unary Neg expr _  -> do
+    t <- inferType ctx expr
+    ok $ case t of
+      Just TString -> Just TString
+      _            -> Just TInt
   Unary Not _ _  -> ok (Just TBool)
 
   Binary op left right _ -> case op of
@@ -248,11 +255,16 @@ inferType ctx@CheckCtx{..} = \case
     Add -> do
       leftT <- inferType ctx left
       rightT <- inferType ctx right
-      if leftT == Just TString || rightT == Just TString
-        then ok (Just TString)
-        else ok (Just TInt)
+      ok $ if leftT == Just TString || rightT == Just TString
+             then Just TString
+             else Just TInt
     Sub -> ok (Just TInt)
-    Mul -> ok (Just TInt)
+    Mul -> do
+      leftT <- inferType ctx left
+      rightT <- inferType ctx right
+      ok $ if leftT == Just TString || rightT == Just TString
+             then Just TString
+             else Just TInt
     Div -> ok (Just TInt)
     Mod -> ok (Just TInt)
     And -> ok (Just TBool)
@@ -265,7 +277,10 @@ inferType ctx@CheckCtx{..} = \case
     Ge  -> ok (Just TBool)
     Concat -> ok (Just TString)
 
-  Ternary _ thenE _ _ -> inferType ctx thenE
+  Ternary _ thenE elseE _ -> do
+    thenT <- inferType ctx thenE
+    elseT <- inferType ctx elseE
+    ok $ if thenT == elseT then thenT else Nothing
 
   Call _name _ _ -> ok Nothing  -- would need to look up method return type
 
@@ -331,5 +346,14 @@ inferClassName ctx@CheckCtx{..} = \case
         Just cs -> case lookupField field cs of
           Nothing -> ok Nothing
           Just vs -> ok $ typeClassName (vsType vs)
+
+  Ternary _ thenE elseE _ -> do
+    thenCn <- inferClassName ctx thenE
+    elseCn <- inferClassName ctx elseE
+    ok $ case (thenCn, elseCn) of
+      (Just cn1, Just cn2) | cn1 == cn2 -> Just cn1
+      (Just cn, Nothing) -> Just cn
+      (Nothing, Just cn) -> Just cn
+      _ -> Nothing
 
   _ -> ok Nothing  -- primitives and operators don't have class names

@@ -53,19 +53,20 @@ data VarSymbol = VarSymbol
 -- | Calculate stack address for a variable.
 -- Parameters have negative offsets, locals have positive offsets.
 --
--- Stack frame layout (FBR at offset 0):
---   offset 0:  return value slot
---   offset -1: 'this' (param 0)
---   offset -2: arg1 (param 1)
---   ...
---   offset -(N+1): argN (param N)
---   offset 1: local0
---   offset 2: local1
---   ...
+-- Stack frame layout after LINK/JSR/LINK:
+--   [return_slot, this, args..., caller_FBR, return_addr, callee_FBR, locals...]
+--   FBR points to callee_FBR (at position 3 + totalParams)
+--
+-- From FBR:
+--   return_slot: -(3 + totalParams)
+--   this:        -(2 + totalParams)
+--   arg[i]:      -(2 + totalParams) + i
+--   local[i]:    1 + i
+--
 stackAddress :: Int -> VarSymbol -> Int
 stackAddress totalParams vs
-  | vsIsParam vs = -(totalParams - vsIndex vs)
-  | otherwise    = 2 + vsIndex vs
+  | vsIsParam vs = -(2 + totalParams) + vsIndex vs
+  | otherwise    = 1 + vsIndex vs
 
 -- | Method symbol: represents a method definition.
 data MethodSymbol = MethodSymbol

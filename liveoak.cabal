@@ -27,12 +27,14 @@ library
                     , LiveOak.Codegen
                     , LiveOak.StringRuntime
                     , LiveOak.Compiler
+                    , LiveOak.Sam
     build-depends:    base >= 4.17 && < 5
                     , text >= 2.0
                     , megaparsec >= 9.0
                     , containers >= 0.6
                     , mtl >= 2.3
                     , transformers >= 0.6
+                    , vector >= 0.13
     hs-source-dirs:   src
     default-language: GHC2021
 
@@ -50,6 +52,7 @@ test-suite liveoak-test
     type:             exitcode-stdio-1.0
     main-is:          Main.hs
     other-modules:    CompilerTest
+                    , SimulatorTest
     build-depends:    base >= 4.17 && < 5
                     , liveoak
                     , text >= 2.0
