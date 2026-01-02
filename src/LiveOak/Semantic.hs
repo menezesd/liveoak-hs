@@ -15,7 +15,7 @@ module LiveOak.Semantic
   , inferClassName
   ) where
 
-import Control.Monad (when, unless, forM_)
+import Control.Monad (when, unless, forM_, zipWithM_)
 
 import LiveOak.Types
 import LiveOak.Ast
@@ -55,15 +55,18 @@ checkMethod MethodDecl{..} syms = do
   checkStmt ctx methodBody
   -- Check return coverage for non-void methods
   when (methodReturnSig /= Void) $ do
-    unless (endsWithReturn methodBody) $
-      syntaxErr "Non-void method must end with return" (stmtPos methodBody) 0
+    unless (returnsOnAllPaths methodBody) $
+      syntaxErr "Non-void method must return on all paths" (stmtPos methodBody) 0
 
--- | Check if a statement ends with a return.
-endsWithReturn :: Stmt -> Bool
-endsWithReturn = \case
+-- | Conservative check whether a statement guarantees a return on all paths.
+returnsOnAllPaths :: Stmt -> Bool
+returnsOnAllPaths = \case
   Return _ _    -> True
-  Block stmts _ -> not (null stmts) && endsWithReturn (last stmts)
-  If _ th el _  -> endsWithReturn th && endsWithReturn el
+  Block stmts _ -> go stmts
+    where
+      go [] = False
+      go (s:ss) = returnsOnAllPaths s || go ss
+  If _ th el _  -> returnsOnAllPaths th && returnsOnAllPaths el
   _             -> False
 
 -- | Check a statement.
@@ -102,7 +105,15 @@ checkStmt ctx@CheckCtx{..} = \case
     checkExpr ctx value
     case target of
       NullLit _ -> syntaxErr ("Null dereference in field assignment: " ++ field) pos 0
-      _ -> ok ()
+      _ -> do
+        targetCn <- inferClassName ctx target
+        case targetCn of
+          Nothing -> resolveErr ("Field " ++ field ++ " not found") pos 0
+          Just cn -> case lookupClass cn ctxSymbols of
+            Nothing -> resolveErr ("Unknown class: " ++ cn) pos 0
+            Just cs -> case lookupField field cs of
+              Nothing -> resolveErr ("Field " ++ field ++ " not found in class " ++ cn) pos 0
+              Just fv -> checkAssignable ctx (vsType fv) value pos
 
   Return valueOpt pos -> do
     let retSig = getReturnSig ctxMethod
@@ -199,9 +210,12 @@ checkExpr ctx@CheckCtx{..} = \case
     checkExpr ctx thenE
     checkExpr ctx elseE
 
-  Call _ args _ -> mapM_ (checkExpr ctx) args
+  Call name args pos -> do
+    className <- currentThisClassName ctx pos
+    _ <- checkMethodCall ctx className name args pos
+    ok ()
 
-  InstanceCall target _method args pos -> do
+  InstanceCall target method args pos -> do
     case target of
       This _ -> syntaxErr "Explicit this.method() is not allowed" pos 0
       NullLit _ -> syntaxErr "Null dereference in instance call" pos 0
@@ -209,7 +223,12 @@ checkExpr ctx@CheckCtx{..} = \case
       FieldAccess _ _ _ -> syntaxErr "Method chaining is not allowed" pos 0
       _ -> ok ()
     checkExpr ctx target
-    mapM_ (checkExpr ctx) args
+    targetCn <- inferClassName ctx target
+    case targetCn of
+      Nothing -> resolveErr "Cannot determine class for instance method call" pos 0
+      Just cn -> do
+        _ <- checkMethodCall ctx cn method args pos
+        ok ()
 
   NewObject _ args _ -> mapM_ (checkExpr ctx) args
 
@@ -218,6 +237,14 @@ checkExpr ctx@CheckCtx{..} = \case
       NullLit _ -> syntaxErr ("Null dereference in field access: " ++ field) pos 0
       _ -> ok ()
     checkExpr ctx target
+    targetCn <- inferClassName ctx target
+    case targetCn of
+      Nothing -> resolveErr ("Unknown field: " ++ field) pos 0
+      Just cn -> case lookupClass cn ctxSymbols of
+        Nothing -> resolveErr ("Unknown class: " ++ cn) pos 0
+        Just cs -> case lookupField field cs of
+          Nothing -> resolveErr ("Field " ++ field ++ " not found in class " ++ cn) pos 0
+          Just _ -> ok ()
 
 -- | Infer the primitive type of an expression (if primitive).
 inferType :: CheckCtx -> Expr -> Result (Maybe Type)
@@ -282,7 +309,11 @@ inferType ctx@CheckCtx{..} = \case
     elseT <- inferType ctx elseE
     ok $ if thenT == elseT then thenT else Nothing
 
-  Call _name _ _ -> ok Nothing  -- would need to look up method return type
+  Call name _ pos -> do
+    className <- currentThisClassName ctx pos
+    case lookupProgramMethod className name ctxSymbols of
+      Nothing -> ok Nothing
+      Just ms -> ok $ primitiveType =<< msReturnType ms
 
   InstanceCall target method _ _ -> do
     targetCn <- inferClassName ctx target
@@ -329,6 +360,12 @@ inferClassName ctx@CheckCtx{..} = \case
 
   NewObject cn _ _ -> ok (Just cn)
 
+  Call name _ pos -> do
+    className <- currentThisClassName ctx pos
+    case lookupProgramMethod className name ctxSymbols of
+      Nothing -> ok Nothing
+      Just ms -> ok $ typeClassName =<< msReturnType ms
+
   InstanceCall target method _ _ -> do
     targetCn <- inferClassName ctx target
     case targetCn of
@@ -357,3 +394,26 @@ inferClassName ctx@CheckCtx{..} = \case
       _ -> Nothing
 
   _ -> ok Nothing  -- primitives and operators don't have class names
+
+-- | Get the class name of 'this' for the current method context.
+currentThisClassName :: CheckCtx -> Int -> Result String
+currentThisClassName CheckCtx{..} pos = case lookupVar "this" ctxMethod of
+  Just vs -> case typeClassName (vsType vs) of
+    Just cn -> ok cn
+    Nothing -> resolveErr "Cannot resolve 'this' type" pos 0
+  Nothing -> resolveErr "Cannot resolve 'this' type" pos 0
+
+-- | Resolve a method call and validate argument compatibility.
+checkMethodCall :: CheckCtx -> String -> String -> [Expr] -> Int -> Result MethodSymbol
+checkMethodCall ctx@CheckCtx{..} className methodName args pos = do
+  mapM_ (checkExpr ctx) args
+  cs <- fromMaybe (ResolveError ("Unknown class: " ++ className) pos 0)
+          (lookupClass className ctxSymbols)
+  ms <- fromMaybe (ResolveError ("Unknown method: " ++ className ++ "." ++ methodName) pos 0)
+          (lookupMethod methodName cs)
+  let expected = expectedUserArgs ms
+  when (length args /= expected) $
+    syntaxErr (className ++ "." ++ methodName ++ " expects " ++ show expected ++ " arguments") pos 0
+  let params = drop 1 (msParams ms)  -- drop implicit 'this'
+  zipWithM_ (\p a -> checkAssignable ctx (vsType p) a pos) params args
+  ok ms

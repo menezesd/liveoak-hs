@@ -62,6 +62,8 @@ buildSymbols classes = do
       duplicates = findDuplicates classNames
   when (not (null duplicates)) $
     fail $ "Duplicate class definition: " ++ head duplicates
+  -- Check for duplicate fields/methods within each class
+  mapM_ checkClassDuplicates classes
   let classSyms = map buildClassSymbol classes
   return $ ProgramSymbols $ Map.fromList [(csName cs, cs) | cs <- classSyms]
   where
@@ -69,6 +71,16 @@ buildSymbols classes = do
     findDuplicates names = [n | (n, cnt) <- Map.toList (countNames names), cnt > 1]
     countNames :: [String] -> Map String Int
     countNames = foldr (\n m -> Map.insertWith (+) n 1 m) Map.empty
+    checkClassDuplicates :: ClassDecl -> Parser ()
+    checkClassDuplicates ClassDecl{..} = do
+      let fieldNames = map fst classFields
+          fieldDups = findDuplicates fieldNames
+      when (not (null fieldDups)) $
+        fail $ "Duplicate field in class " ++ className ++ ": " ++ head fieldDups
+      let methodNames = map methodName classMethods
+          methodDups = findDuplicates methodNames
+      when (not (null methodDups)) $
+        fail $ "Duplicate method in class " ++ className ++ ": " ++ head methodDups
 
 -- | Build a class symbol from a class declaration.
 buildClassSymbol :: ClassDecl -> ClassSymbol
@@ -165,6 +177,8 @@ pFieldGroup = do
 pValueType :: Parser ValueType
 pValueType = do
   name <- pTypeName
+  when (name == "void") $
+    fail "void is not allowed for fields, parameters, or local variables"
   return $ case parseType name of
     Just t  -> PrimitiveType t
     Nothing -> ObjectRefType (ObjectType name)
@@ -227,7 +241,6 @@ pLocalDecl :: Parser [Stmt]
 pLocalDecl = do
   pos <- getLineNo
   vt <- pValueType
-  when (vt == PrimitiveType TInt && False) $ fail "void not allowed"  -- placeholder
   names <- identifier `sepBy1` comma
   semi
   return [VarDecl name (Just vt) Nothing pos | name <- names]

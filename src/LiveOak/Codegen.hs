@@ -52,6 +52,7 @@ data CodegenCtx = CodegenCtx
   , cgMethod      :: !(Maybe MethodSymbol)  -- ^ Current method (if any)
   , cgLoopLabels  :: ![Label]          -- ^ Stack of loop end labels for break
   , cgReturnLabel :: !(Maybe Label)    -- ^ Return epilogue label
+  , cgClassName   :: !(Maybe String)   -- ^ Current class name
   }
 
 -- | Code generation monad.
@@ -65,6 +66,7 @@ runCodegen syms action = do
         , cgMethod = Nothing
         , cgLoopLabels = []
         , cgReturnLabel = Nothing
+        , cgClassName = Nothing
         }
       st = CodegenState
         { cgLabelCounter = 0
@@ -138,7 +140,10 @@ emitMethod cls MethodDecl{..} = do
   retLabel <- freshLabel "return"
 
   -- Emit body with updated context
-  let ctx' c = c { cgMethod = Just ms, cgReturnLabel = Just retLabel }
+  let ctx' c = c { cgMethod = Just ms
+                 , cgReturnLabel = Just retLabel
+                 , cgClassName = Just (className cls)
+                 }
   local ctx' $ emitStmt methodBody
 
   -- For void methods, ensure return value
@@ -189,8 +194,17 @@ emitStmt = \case
         emitExpr value
         emit "STOREIND\n"
 
-  FieldAssign target _field offset value _ -> do
+  FieldAssign target field _ value pos -> do
     emitExpr target    -- push target address
+    syms <- asks cgSymbols
+    targetClass <- inferTargetClass target
+    offset <- case targetClass of
+      Just cn -> case lookupClass cn syms of
+        Just cs -> case fieldOffset field cs of
+          Just off -> return off
+          Nothing  -> throwError $ D.ResolveError ("Unknown field: " ++ field) pos 0
+        Nothing -> throwError $ D.ResolveError ("Unknown class: " ++ cn) pos 0
+      Nothing -> throwError $ D.ResolveError ("Cannot determine field offset for: " ++ field) pos 0
     emit $ "PUSHIMM " <> tshow offset <> "\n"
     emit "ADD\n"       -- target + offset
     emitExpr value
@@ -312,7 +326,7 @@ emitExpr = \case
     emitExpr elseExpr
     emit $ labelName endLabel <> ":\n"
 
-  Call method args _ -> do
+  Call method args pos -> do
     -- Push return slot
     emit "PUSHIMM 0\n"
     -- Push this (current method's this)
@@ -322,13 +336,20 @@ emitExpr = \case
     forM_ args emitExpr
     -- Call
     let nArgs = length args + 1  -- +1 for 'this'
+    className <- asks cgClassName
+    syms <- asks cgSymbols
+    label <- case className of
+      Just cn -> case lookupProgramMethod cn method syms of
+        Just _  -> return $ methodLabel cn method
+        Nothing -> throwError $ D.ResolveError ("Unknown method: " ++ cn ++ "." ++ method) pos 0
+      Nothing -> throwError $ D.ResolveError "No current class context for method call" pos 0
     emit "LINK\n"
-    emit $ "JSR " <> T.pack method <> "\n"
+    emit $ "JSR " <> labelName label <> "\n"
     emit "UNLINK\n"
     emit $ "ADDSP " <> tshow (-nArgs) <> "\n"
     -- Result is now on TOS (return slot)
 
-  InstanceCall target method args _ -> do
+  InstanceCall target method args pos -> do
     -- Push return slot
     emit "PUSHIMM 0\n"
     -- Push target (becomes 'this' for callee)
@@ -337,12 +358,16 @@ emitExpr = \case
     forM_ args emitExpr
     -- Determine the class of target to find method label
     targetClass <- inferTargetClass target
-    let fullMethod = case targetClass of
-          Just cn -> methodLabel cn method
-          Nothing -> Label (T.pack method)
+    label <- case targetClass of
+      Just cn -> do
+        syms <- asks cgSymbols
+        case lookupProgramMethod cn method syms of
+          Just _  -> return $ methodLabel cn method
+          Nothing -> throwError $ D.ResolveError ("Unknown method: " ++ cn ++ "." ++ method) pos 0
+      Nothing -> throwError $ D.ResolveError "Cannot resolve target class for method call" pos 0
     let nArgs = length args + 1
     emit "LINK\n"
-    emit $ "JSR " <> labelName fullMethod <> "\n"
+    emit $ "JSR " <> labelName label <> "\n"
     emit "UNLINK\n"
     emit $ "ADDSP " <> tshow (-nArgs) <> "\n"
 
@@ -374,18 +399,18 @@ emitExpr = \case
       emit $ "ADDSP " <> tshow (-nArgs) <> "\n"
       emit "ADDSP -1\n"         -- pop return slot
 
-  FieldAccess target field _ -> do
+  FieldAccess target field pos -> do
     emitExpr target
     -- Look up field offset
     syms <- asks cgSymbols
     targetClass <- inferTargetClass target
-    let offset = case targetClass of
-          Just cn -> case lookupClass cn syms of
-            Just cs -> case fieldOffset field cs of
-              Just off -> off
-              Nothing  -> 0
-            Nothing -> 0
-          Nothing -> 0
+    offset <- case targetClass of
+      Just cn -> case lookupClass cn syms of
+        Just cs -> case fieldOffset field cs of
+          Just off -> return off
+          Nothing  -> throwError $ D.ResolveError ("Unknown field: " ++ field) pos 0
+        Nothing -> throwError $ D.ResolveError ("Unknown class: " ++ cn) pos 0
+      Nothing -> throwError $ D.ResolveError ("Cannot resolve target class for field access: " ++ field) pos 0
     emit $ "PUSHIMM " <> tshow offset <> "\n"
     emit "ADD\n"
     emit "PUSHIND\n"
