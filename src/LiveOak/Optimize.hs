@@ -2,7 +2,7 @@
 {-# LANGUAGE RecordWildCards #-}
 
 -- | Optimization passes for LiveOak.
--- Includes constant folding and dead code elimination.
+-- Includes constant folding, dead code elimination, and dataflow optimizations.
 module LiveOak.Optimize
   ( -- * Optimization Passes
     optimize
@@ -18,10 +18,45 @@ module LiveOak.Optimize
   ) where
 
 import LiveOak.Ast
+import qualified LiveOak.DataFlow as DF
 
 -- | Apply all optimizations to a program.
+-- Runs multiple passes until the program stabilizes or max iterations reached.
 optimize :: Program -> Program
-optimize = eliminateDeadCode . constantFold
+optimize = go (10 :: Int)
+  where
+    go 0 prog = prog  -- Max iterations reached
+    go n prog =
+      let optimized = optimizeOnce prog
+      in if optimized == prog
+         then prog
+         else go (n - 1) optimized
+
+-- | Single pass of all optimizations.
+optimizeOnce :: Program -> Program
+optimizeOnce =
+    eliminateDeadCode
+  -- Dataflow optimizations
+  . DF.eliminateNullChecks
+  . DF.eliminateCommonSubexpressions
+  . DF.globalValueNumbering
+  . DF.copyPropagate
+  . DF.loadStoreForwarding
+  . DF.hoistLoopInvariants
+  . DF.inlineSmallMethods
+  -- Advanced optimizations
+  . DF.sinkCode
+  . DF.hoistCommonCode
+  . DF.sparseCondConstProp
+  . DF.eliminateDeadParams
+  . DF.escapeAnalysis
+  . DF.promoteMemToReg
+  -- Tail call optimization (converts self-recursive calls to loops)
+  . DF.tailCallOptimize
+  -- String optimizations
+  . DF.optimizeStringConcat
+  . DF.internStrings
+  . constantFold
 
 -- | Constant folding: evaluate constant expressions at compile time.
 constantFold :: Program -> Program
@@ -78,9 +113,13 @@ foldExpr expr = case expr of
   Unary op e pos ->
     let e' = foldExpr e
     in case (op, e') of
+      -- Fold constants
       (Neg, IntLit n _)  -> IntLit (-n) pos
       (Not, BoolLit b _) -> BoolLit (not b) pos
-      _                  -> Unary op e' pos
+      -- Double negation elimination: --x = x, !!x = x
+      (Neg, Unary Neg inner _) -> inner
+      (Not, Unary Not inner _) -> inner
+      _                        -> Unary op e' pos
 
   -- Binary operations
   Binary op l r pos ->
@@ -114,14 +153,51 @@ foldExpr expr = case expr of
 -- | Fold binary operations on constants.
 foldBinary :: BinaryOp -> Expr -> Expr -> Int -> Expr
 foldBinary op l r pos = case (op, l, r) of
-  -- Integer arithmetic
+  -- Algebraic reassociation: (x op c1) op c2 = x op (c1 op c2)
+  -- Addition: (x + c1) + c2 = x + (c1 + c2)
+  (Add, Binary Add x (IntLit c1 _) _, IntLit c2 _) ->
+    foldBinary Add x (IntLit (c1 + c2) pos) pos
+  (Add, Binary Add (IntLit c1 _) x _, IntLit c2 _) ->
+    foldBinary Add x (IntLit (c1 + c2) pos) pos
+
+  -- Subtraction: (x - c1) - c2 = x - (c1 + c2)
+  (Sub, Binary Sub x (IntLit c1 _) _, IntLit c2 _) ->
+    foldBinary Sub x (IntLit (c1 + c2) pos) pos
+  -- (x + c1) - c2 = x + (c1 - c2)
+  (Sub, Binary Add x (IntLit c1 _) _, IntLit c2 _) ->
+    foldBinary Add x (IntLit (c1 - c2) pos) pos
+  -- (x - c1) + c2 = x - (c1 - c2) = x + (c2 - c1)
+  (Add, Binary Sub x (IntLit c1 _) _, IntLit c2 _) ->
+    foldBinary Add x (IntLit (c2 - c1) pos) pos
+
+  -- Multiplication: (x * c1) * c2 = x * (c1 * c2)
+  (Mul, Binary Mul x (IntLit c1 _) _, IntLit c2 _) ->
+    foldBinary Mul x (IntLit (c1 * c2) pos) pos
+  (Mul, Binary Mul (IntLit c1 _) x _, IntLit c2 _) ->
+    foldBinary Mul x (IntLit (c1 * c2) pos) pos
+
+  -- Division: (x / c1) / c2 = x / (c1 * c2) (when c1*c2 != 0)
+  (Div, Binary Div x (IntLit c1 _) _, IntLit c2 _) | c1 * c2 /= 0 ->
+    foldBinary Div x (IntLit (c1 * c2) pos) pos
+
+  -- Boolean reassociation: (x && c1) && c2 = x && (c1 && c2)
+  (And, Binary And x (BoolLit c1 _) _, BoolLit c2 _) ->
+    foldBinary And x (BoolLit (c1 && c2) pos) pos
+  (Or, Binary Or x (BoolLit c1 _) _, BoolLit c2 _) ->
+    foldBinary Or x (BoolLit (c1 || c2) pos) pos
+
+  -- String concatenation reassociation: (x + "a") + "b" = x + "ab"
+  (Add, Binary Add x (StrLit s1 _) _, StrLit s2 _) ->
+    foldBinary Add x (StrLit (s1 ++ s2) pos) pos
+
+  -- Integer arithmetic on literals
   (Add, IntLit a _, IntLit b _) -> IntLit (a + b) pos
   (Sub, IntLit a _, IntLit b _) -> IntLit (a - b) pos
   (Mul, IntLit a _, IntLit b _) -> IntLit (a * b) pos
   (Div, IntLit a _, IntLit b _) | b /= 0 -> IntLit (a `div` b) pos
   (Mod, IntLit a _, IntLit b _) | b /= 0 -> IntLit (a `mod` b) pos
 
-  -- Integer comparisons
+  -- Integer comparisons on literals
   (Eq, IntLit a _, IntLit b _)  -> BoolLit (a == b) pos
   (Ne, IntLit a _, IntLit b _)  -> BoolLit (a /= b) pos
   (Lt, IntLit a _, IntLit b _)  -> BoolLit (a < b) pos
@@ -129,16 +205,17 @@ foldBinary op l r pos = case (op, l, r) of
   (Gt, IntLit a _, IntLit b _)  -> BoolLit (a > b) pos
   (Ge, IntLit a _, IntLit b _)  -> BoolLit (a >= b) pos
 
-  -- Boolean operations
+  -- Boolean operations on literals
   (And, BoolLit a _, BoolLit b _) -> BoolLit (a && b) pos
   (Or,  BoolLit a _, BoolLit b _) -> BoolLit (a || b) pos
 
-  -- Short-circuit optimizations
+  -- Short-circuit optimizations for And
   (And, BoolLit False _, _) -> BoolLit False pos
   (And, BoolLit True _, r') -> r'
   (And, _, BoolLit False _) -> BoolLit False pos
   (And, l', BoolLit True _) -> l'
 
+  -- Short-circuit optimizations for Or
   (Or, BoolLit True _, _)   -> BoolLit True pos
   (Or, BoolLit False _, r') -> r'
   (Or, _, BoolLit True _)   -> BoolLit True pos
@@ -147,15 +224,53 @@ foldBinary op l r pos = case (op, l, r) of
   -- String concatenation of literals
   (Add, StrLit a _, StrLit b _) -> StrLit (a ++ b) pos
 
-  -- Identity operations: x + 0 = x, x * 1 = x, etc.
+  -- String repetition: "" * n = "", s * 0 = "", s * 1 = s
+  (Mul, StrLit "" _, _) -> StrLit "" pos
+  (Mul, StrLit _ _, IntLit 0 _) -> StrLit "" pos
+  (Mul, s@(StrLit _ _), IntLit 1 _) -> s
+
+  -- Additive identity: x + 0 = x, 0 + x = x, x - 0 = x
   (Add, e, IntLit 0 _) -> e
   (Add, IntLit 0 _, e) -> e
   (Sub, e, IntLit 0 _) -> e
+
+  -- Subtraction from zero: 0 - x = -x
+  (Sub, IntLit 0 _, e) -> Unary Neg e pos
+
+  -- Multiplicative identity: x * 1 = x, 1 * x = x (for integers)
   (Mul, e, IntLit 1 _) -> e
   (Mul, IntLit 1 _, e) -> e
-  (Mul, _, IntLit 0 _) -> IntLit 0 pos
-  (Mul, IntLit 0 _, _) -> IntLit 0 pos
+
+  -- Multiplicative zero: x * 0 = 0, 0 * x = 0 (for integers, not strings)
+  -- Note: literal * literal cases are handled by constant folding above
+  (Mul, Var _ _, IntLit 0 _) -> IntLit 0 pos     -- var * 0
+  (Mul, IntLit 0 _, Var _ _) -> IntLit 0 pos     -- 0 * var
+
+  -- Division by 1: x / 1 = x
   (Div, e, IntLit 1 _) -> e
+
+  -- Modulo by 1: x % 1 = 0
+  (Mod, _, IntLit 1 _) -> IntLit 0 pos
+
+  -- Strength reduction: x * 2 = x + x
+  (Mul, e, IntLit 2 _) -> Binary Add e e pos
+  (Mul, IntLit 2 _, e) -> Binary Add e e pos
+
+  -- Self-comparison: x = x is always true, x != x is always false
+  -- (Only safe for variables, not expressions with side effects)
+  (Eq, Var n1 _, Var n2 _) | n1 == n2 -> BoolLit True pos
+  (Ne, Var n1 _, Var n2 _) | n1 == n2 -> BoolLit False pos
+  (Le, Var n1 _, Var n2 _) | n1 == n2 -> BoolLit True pos   -- x <= x
+  (Ge, Var n1 _, Var n2 _) | n1 == n2 -> BoolLit True pos   -- x >= x
+  (Lt, Var n1 _, Var n2 _) | n1 == n2 -> BoolLit False pos  -- x < x
+  (Gt, Var n1 _, Var n2 _) | n1 == n2 -> BoolLit False pos  -- x > x
+
+  -- Self-subtraction: x - x = 0 (safe for variables)
+  (Sub, Var n1 _, Var n2 _) | n1 == n2 -> IntLit 0 pos
+
+  -- Idempotent boolean: x & x = x, x | x = x
+  (And, e1@(Var n1 _), Var n2 _) | n1 == n2 -> e1
+  (Or, e1@(Var n1 _), Var n2 _) | n1 == n2 -> e1
 
   -- No optimization possible
   _ -> Binary op l r pos

@@ -261,7 +261,23 @@ runSamText :: Text -> Either SamError SamValue
 runSamText code = do
   (instrs, labels) <- parseSam code
   let st0 = initState instrs labels
-  execLoop st0
+  execLoopLimited 0 st0
+
+-- | Maximum number of execution steps (prevents infinite loops).
+maxSteps :: Int
+maxSteps = 1000000
+
+-- | Execution loop with step limit.
+execLoopLimited :: Int -> SamState -> Either SamError SamValue
+execLoopLimited steps st
+  | steps > maxSteps = Left $ RuntimeError $ "Exceeded " ++ show maxSteps ++ " steps (infinite loop?)"
+  | otherwise = case samCode st !? samPC st of
+      Nothing -> Left $ PCOutOfBounds (samPC st)
+      Just STOP -> stackTop st
+      Just NOP  -> execLoopLimited (steps + 1) st { samPC = samPC st + 1 }
+      Just instr -> do
+        st' <- execInstr instr st
+        execLoopLimited (steps + 1) st'
 
 -- | Run SAM with debug trace output.
 runSamDebug :: Text -> IO (Either SamError SamValue)

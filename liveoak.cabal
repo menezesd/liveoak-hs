@@ -28,6 +28,8 @@ library
                     , LiveOak.Optimize
                     , LiveOak.Codegen
                     , LiveOak.Peephole
+                    , LiveOak.DataFlow
+                    , LiveOak.SSA
                     , LiveOak.StringRuntime
                     , LiveOak.Compiler
                     , LiveOak.Sam

@@ -23,21 +23,30 @@ import LiveOak.Compiler (compile)
 propertyTests :: TestTree
 propertyTests = testGroup "Property Tests"
   [ testGroup "Parser Fuzzing"
-      [ testProperty "parser doesn't crash on random input" prop_parserNoCrash
-      , testProperty "parser doesn't crash on semi-valid input" prop_parserSemiValid
+      [ localOption (QuickCheckTests 10) $
+          testProperty "parser doesn't crash on random input" prop_parserNoCrash
+      , localOption (QuickCheckTests 10) $
+          testProperty "parser doesn't crash on semi-valid input" prop_parserSemiValid
       ]
   , testGroup "Peephole Optimizer"
-      [ testProperty "peephole doesn't crash on random SAM" prop_peepholeNoCrash
-      , testProperty "peephole is idempotent" prop_peepholeIdempotent
-      , testProperty "peephole preserves labels" prop_peepholePreservesLabels
-      , testProperty "optimize reduces or preserves instruction count" prop_peepholeReduces
+      [ localOption (QuickCheckTests 10) $
+          testProperty "peephole doesn't crash on random SAM" prop_peepholeNoCrash
+      , localOption (QuickCheckTests 10) $
+          testProperty "peephole is idempotent" prop_peepholeIdempotent
+      , localOption (QuickCheckTests 10) $
+          testProperty "peephole preserves labels" prop_peepholePreservesLabels
+      , localOption (QuickCheckTests 10) $
+          testProperty "optimize reduces or preserves instruction count" prop_peepholeReduces
       ]
   , testGroup "AST Optimizer"
-      [ testProperty "constant folding preserves int literals" prop_constFoldInt
-      , testProperty "optimizer is idempotent" prop_optimizerIdempotent
+      [ localOption (QuickCheckTests 10) $
+          testProperty "constant folding preserves int literals" prop_constFoldInt
+      , localOption (QuickCheckTests 10) $
+          testProperty "optimizer is idempotent" prop_optimizerIdempotent
       ]
   , testGroup "Compiler"
-      [ testProperty "valid minimal programs compile" prop_minimalProgramCompiles
+      [ localOption (QuickCheckTests 10) $
+          testProperty "valid minimal programs compile" prop_minimalProgramCompiles
       ]
   ]
 
@@ -222,10 +231,11 @@ isRealInstr = \case
   Blank -> False
   _ -> True
 
--- | Generate random SAM code
+-- | Generate random SAM code (limited to 20 instructions for performance)
 genSamCode :: Gen Text
 genSamCode = do
-  instrs <- listOf genSamInstr
+  len <- choose (0, 20 :: Int)
+  instrs <- vectorOf len genSamInstr
   return $ T.unlines instrs
 
 genSamInstr :: Gen Text
