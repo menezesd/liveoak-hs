@@ -12,6 +12,11 @@ module LiveOak.Diag
   , formatDiag
   , formatDiagWithSource
 
+    -- * Warning Types
+  , Warning (..)
+  , formatWarning
+  , formatWarningWithSource
+
     -- * Result Type
   , Result
   , ok
@@ -95,6 +100,55 @@ formatDiagWithSource source d = unlines $ filter (not . null)
           "   | " ++ replicate (col - 1) ' ' ++ "^"
       | line > 0 && line <= length sourceLines =
           "   | " ++ "^"  -- Point to start if no column info
+      | otherwise = ""
+
+-- | Warning types (non-fatal issues).
+data Warning
+  = UnusedVariable { _warnVar :: String, _warnLine :: Int, _warnCol :: Int }
+  | UnusedField    { _warnVar :: String, _warnLine :: Int, _warnCol :: Int }
+  deriving (Eq, Show)
+
+-- | Format a warning for display (simple format).
+formatWarning :: Warning -> String
+formatWarning w = case w of
+  UnusedVariable var line _ ->
+    "Warning: unused variable '" ++ var ++ "'" ++ locationStr line
+  UnusedField var line _ ->
+    "Warning: unused field '" ++ var ++ "'" ++ locationStr line
+  where
+    locationStr line
+      | line > 0  = " (line " ++ show line ++ ")"
+      | otherwise = ""
+
+-- | Format a warning with source context.
+formatWarningWithSource :: Text -> Warning -> String
+formatWarningWithSource source w = unlines $ filter (not . null)
+  [ warningMsg
+  , locationLine
+  , sourceLine
+  , caretLine
+  ]
+  where
+    (warningMsg, line, col) = case w of
+      UnusedVariable var ln c -> ("Warning: unused variable '" ++ var ++ "'", ln, c)
+      UnusedField var ln c    -> ("Warning: unused field '" ++ var ++ "'", ln, c)
+
+    locationLine
+      | line > 0  = "  --> line " ++ show line ++ (if col > 0 then ":" ++ show col else "")
+      | otherwise = ""
+
+    sourceLines = T.lines source
+
+    sourceLine
+      | line > 0 && line <= length sourceLines =
+          "   | " ++ T.unpack (sourceLines !! (line - 1))
+      | otherwise = ""
+
+    caretLine
+      | line > 0 && line <= length sourceLines && col > 0 =
+          "   | " ++ replicate (col - 1) ' ' ++ "^"
+      | line > 0 && line <= length sourceLines =
+          "   | " ++ "^"
       | otherwise = ""
 
 -- | Result type: Either a diagnostic or a successful value.

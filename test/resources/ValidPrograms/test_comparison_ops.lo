@@ -1,0 +1,45 @@
+// Test new comparison operators: !=, <=, >=
+class Main() {
+    int main() {
+        int result;
+        result = 0;
+
+        // Test !=
+        if (5 != 3) {
+            result = result + 1;
+        } else {
+            result = result + 0;
+        }
+
+        // Test <= (less than)
+        if (3 <= 5) {
+            result = result + 10;
+        } else {
+            result = result + 0;
+        }
+
+        // Test <= (equal)
+        if (5 <= 5) {
+            result = result + 100;
+        } else {
+            result = result + 0;
+        }
+
+        // Test >= (greater than)
+        if (5 >= 3) {
+            result = result + 1000;
+        } else {
+            result = result + 0;
+        }
+
+        // Test >= (equal)
+        if (5 >= 5) {
+            result = result + 10000;
+        } else {
+            result = result + 0;
+        }
+
+        // Should be 11111
+        return result;
+    }
+}

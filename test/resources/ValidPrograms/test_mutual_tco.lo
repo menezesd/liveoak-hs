@@ -1,0 +1,26 @@
+// Test mutual tail call optimization
+// Tests tail calls between different methods with same parameter count
+class Main() {
+    int main() {
+        // isEven and isOdd call each other in tail position
+        return isEven(10);  // 10 is even, should return 1
+    }
+
+    // Tail-calls isOdd for n > 0
+    int isEven(int n) {
+        if (n = 0) {
+            return 1;  // 0 is even
+        } else {
+            return isOdd(n - 1);  // tail call to isOdd
+        }
+    }
+
+    // Tail-calls isEven for n > 0
+    int isOdd(int n) {
+        if (n = 0) {
+            return 0;  // 0 is not odd
+        } else {
+            return isEven(n - 1);  // tail call to isEven
+        }
+    }
+}

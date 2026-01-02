@@ -1,0 +1,16 @@
+// Test dead code elimination
+class Main() {
+    int main() {
+        int x;
+        x = 42;
+
+        // Code after return should be eliminated
+        if (true) {
+            return x;
+            x = 999;  // Dead code - should be eliminated
+        } else {
+            return 0;
+            x = 888;  // Dead code - should be eliminated
+        }
+    }
+}

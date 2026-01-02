@@ -17,6 +17,7 @@ module LiveOak.Codegen
   , Label (..)
   , freshLabel
   , methodLabel
+  , methodTCOLabel
   ) where
 
 import Control.Monad (forM_, when)
@@ -53,6 +54,8 @@ data CodegenCtx = CodegenCtx
   , cgLoopLabels  :: ![Label]          -- ^ Stack of loop end labels for break
   , cgReturnLabel :: !(Maybe Label)    -- ^ Return epilogue label
   , cgClassName   :: !(Maybe String)   -- ^ Current class name
+  , cgMethodName  :: !(Maybe String)   -- ^ Current method name (for TCO)
+  , cgTCOLabel    :: !(Maybe Label)    -- ^ Label for tail call optimization jumps
   }
 
 -- | Code generation monad.
@@ -67,6 +70,8 @@ runCodegen syms action = do
         , cgLoopLabels = []
         , cgReturnLabel = Nothing
         , cgClassName = Nothing
+        , cgMethodName = Nothing
+        , cgTCOLabel = Nothing
         }
       st = CodegenState
         { cgLabelCounter = 0
@@ -136,13 +141,20 @@ emitMethod cls MethodDecl{..} = do
   when (nLocals > 0) $
     emit $ "ADDSP " <> tshow nLocals <> "\n"
 
-  -- Generate return label
+  -- Generate labels for return and TCO
   retLabel <- freshLabel "return"
+  -- Use a predictable TCO label that can be referenced from other methods
+  let tcoLabel = methodTCOLabel (className cls) methodName
 
-  -- Emit body with updated context
+  -- TCO entry point (after prologue, for tail-call jumps from any method)
+  emit $ labelName tcoLabel <> ":\n"
+
+  -- Emit body with updated context (including TCO info)
   let ctx' c = c { cgMethod = Just ms
                  , cgReturnLabel = Just retLabel
                  , cgClassName = Just (className cls)
+                 , cgMethodName = Just methodName
+                 , cgTCOLabel = Just tcoLabel
                  }
   local ctx' $ emitStmt methodBody
 
@@ -212,12 +224,40 @@ emitStmt = \case
 
   Return valueOpt _ -> do
     case valueOpt of
-      Nothing   -> emit "PUSHIMM 0\n"
-      Just expr -> emitExpr expr
-    retLabel <- asks cgReturnLabel
-    case retLabel of
-      Just lbl -> emit $ "JUMP " <> labelName lbl <> "\n"
-      Nothing  -> throwError $ D.ResolveError "Return outside method" 0 0
+      -- Check for tail call (to self or other method)
+      Just callExpr@(Call calledMethod args _) -> do
+        canTCO <- canTailCallOptimize calledMethod (length args + 1)  -- +1 for 'this'
+        if canTCO
+          then emitTailCall calledMethod args Nothing  -- 'this' passed implicitly
+          else do
+            emitExpr callExpr
+            emitReturnJump
+      Just callExpr@(InstanceCall target calledMethod args _pos) -> do
+        targetClass <- inferTargetClass target
+        case targetClass of
+          Just cn -> do
+            canTCO <- canTailCallOptimizeInstance cn calledMethod (length args + 1)
+            if canTCO
+              then emitTailCall calledMethod args (Just target)
+              else do
+                emitExpr callExpr
+                emitReturnJump
+          Nothing -> do
+            emitExpr callExpr
+            emitReturnJump
+      -- Normal return
+      Nothing   -> do
+        emit "PUSHIMM 0\n"
+        emitReturnJump
+      Just expr -> do
+        emitExpr expr
+        emitReturnJump
+    where
+      emitReturnJump = do
+        retLabel <- asks cgReturnLabel
+        case retLabel of
+          Just lbl -> emit $ "JUMP " <> labelName lbl <> "\n"
+          Nothing  -> throwError $ D.ResolveError "Return outside method" 0 0
 
   If cond thenBranch elseBranch _ -> do
     elseLabel <- freshLabel "else"
@@ -734,10 +774,112 @@ emitStringConcat = do
   emit "ADDSP -1\n"          -- drop str2 (str1 replaced with result)
   -- Stack: [result] - new concatenated string address
 
+-- | Check if a tail call can be optimized.
+-- Returns True if:
+-- 1. We're in a method context
+-- 2. The target method exists in the current class
+-- 3. The parameter counts match (including 'this')
+canTailCallOptimize :: String -> Int -> Codegen Bool
+canTailCallOptimize targetMethod _nArgsWithThis = do
+  ms <- asks cgMethod
+  cn <- asks cgClassName
+  syms <- asks cgSymbols
+  case (ms, cn) of
+    (Just currentMs, Just className) ->
+      case lookupProgramMethod className targetMethod syms of
+        Just targetMs ->
+          -- Check if parameter counts match (both include 'this')
+          return $ numParams currentMs == numParams targetMs
+        Nothing -> return False
+    _ -> return False
+
+-- | Check if an instance call can be tail-call optimized.
+-- For now, only allow TCO for calls to methods in the SAME class.
+canTailCallOptimizeInstance :: String -> String -> Int -> Codegen Bool
+canTailCallOptimizeInstance targetClass targetMethod _nArgsWithThis = do
+  ms <- asks cgMethod
+  cn <- asks cgClassName
+  syms <- asks cgSymbols
+  case (ms, cn) of
+    (Just currentMs, Just currentClass)
+      -- Only allow TCO if target class is the same as current class
+      | targetClass == currentClass ->
+        case lookupProgramMethod targetClass targetMethod syms of
+          Just targetMs ->
+            -- Check if parameter counts match
+            return $ numParams currentMs == numParams targetMs
+          Nothing -> return False
+      | otherwise -> return False  -- Cross-class TCO not supported yet
+    _ -> return False
+
+-- | Emit a tail call (TCO).
+-- Updates parameters in place and jumps to target method's TCO entry point.
+-- If 'thisExpr' is Nothing, reuses current 'this'; otherwise evaluates the new 'this'.
+emitTailCall :: String -> [Expr] -> Maybe Expr -> Codegen ()
+emitTailCall targetMethod args thisExpr = do
+  ms <- asks cgMethod
+  cn <- asks cgClassName
+  syms <- asks cgSymbols
+  case (ms, cn) of
+    (Nothing, _) -> throwError $ D.ResolveError "No method context for TCO" 0 0
+    (_, Nothing) -> throwError $ D.ResolveError "No class context for TCO" 0 0
+    (Just method, Just className) -> do
+      -- Determine target class
+      let targetClass = className  -- For now, only same-class TCO
+
+      -- Get target method info
+      targetMs <- case lookupProgramMethod targetClass targetMethod syms of
+        Just tms -> return tms
+        Nothing -> throwError $ D.ResolveError ("Unknown method for TCO: " ++ targetMethod) 0 0
+
+      -- Evaluate new 'this' if provided, otherwise reuse current 'this'
+      case thisExpr of
+        Just expr -> emitExpr expr
+        Nothing -> do
+          thisAddr <- getVarAddress "this"
+          emit $ "PUSHOFF " <> tshow thisAddr <> "\n"
+
+      -- Evaluate all user arguments onto the stack
+      forM_ args emitExpr
+
+      -- Now store them in reverse order into parameter slots
+      -- Stack now has: [this'] [arg0] [arg1] ... [argN-1] (TOS = argN-1)
+      -- We need to store: this at -(2+nParams), arg0 at -(1+nParams), etc.
+      let nParams = numParams method
+          nArgs = length args
+          -- User param offsets: first user param at -(1+nParams), next at -(1+nParams)+1, etc.
+          paramOffsets = [-(1 + nParams) + i | i <- [0..nArgs-1]]
+          thisOffset = -(2 + nParams)
+
+      -- Pop args in reverse order (last pushed = first popped)
+      forM_ (reverse paramOffsets) $ \offset -> do
+        emit $ "STOREOFF " <> tshow offset <> "\n"
+
+      -- Store new 'this'
+      emit $ "STOREOFF " <> tshow thisOffset <> "\n"
+
+      -- Adjust stack for difference in local variable counts
+      -- Current method allocated currentNLocals, target expects targetNLocals
+      let currentNLocals = numLocals method
+          targetNLocals = numLocals targetMs
+          localDiff = targetNLocals - currentNLocals
+      when (localDiff /= 0) $
+        emit $ "ADDSP " <> tshow localDiff <> "\n"
+
+      -- Jump to target's TCO entry point
+      let targetTCO = methodTCOLabel targetClass targetMethod
+      emit $ "JUMP " <> labelName targetTCO <> "\n"
+
 -- | Generate a method label.
 methodLabel :: String -> String -> Label
-methodLabel className methodName =
-  Label $ T.pack className <> "_" <> T.pack methodName
+methodLabel clsName methName =
+  Label $ T.pack clsName <> "_" <> T.pack methName
+
+-- | Generate a predictable TCO entry label for a method.
+-- This allows cross-method tail calls to jump directly to the TCO entry point.
+methodTCOLabel :: String -> String -> Label
+methodTCOLabel clsName methName =
+  Label $ T.pack clsName <> "_" <> T.pack methName <> "_tco"
 
 -- | Emit code to the output.
 emit :: Text -> Codegen ()

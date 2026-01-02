@@ -6,6 +6,7 @@
 module LiveOak.Semantic
   ( -- * Semantic Checking
     checkProgram
+  , checkProgramCollectErrors
   , checkMethod
   , checkStmt
   , checkExpr
@@ -28,7 +29,7 @@ data CheckCtx = CheckCtx
   , ctxSymbols :: ProgramSymbols
   }
 
--- | Check an entire program.
+-- | Check an entire program (stops at first error).
 checkProgram :: Program -> ProgramSymbols -> Result ()
 checkProgram (Program classes) syms = do
   -- Check entry point exists
@@ -41,6 +42,31 @@ checkProgram (Program classes) syms = do
   forM_ classes $ \cls ->
     forM_ (classMethods cls) $ \method ->
       checkMethod method syms
+
+-- | Check an entire program, collecting all errors instead of stopping at first.
+checkProgramCollectErrors :: Program -> ProgramSymbols -> [Diag]
+checkProgramCollectErrors (Program classes) syms =
+  entryPointErrors ++ methodErrors
+  where
+    -- Check entry point
+    entryPointErrors = case getEntrypoint syms of
+      Nothing -> [ResolveError "Missing Main.main entry point" 0 0]
+      Just ms ->
+        if expectedUserArgs ms > 0
+          then [SyntaxError "Main.main must not have parameters" 0 0]
+          else []
+
+    -- Check all methods and collect errors
+    methodErrors = concatMap checkClass classes
+
+    checkClass cls = concatMap (checkMethodErrors syms) (classMethods cls)
+
+-- | Check a method and return list of errors (empty if valid).
+checkMethodErrors :: ProgramSymbols -> MethodDecl -> [Diag]
+checkMethodErrors syms method@MethodDecl{..} =
+  case checkMethod method syms of
+    Left diag -> [diag]
+    Right ()  -> []
 
 -- | Check a single method.
 checkMethod :: MethodDecl -> ProgramSymbols -> Result ()

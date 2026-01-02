@@ -1,0 +1,34 @@
+// Test constant folding optimization
+class Main() {
+    int main() {
+        int result;
+        result = 0;
+
+        // Arithmetic folding: 10 + 20 + 30 should fold to 60
+        result = result + (10 + 20 + 30);
+
+        // Multiplication: 3 * 4 should fold to 12
+        result = result + (3 * 4);
+
+        // Subtraction: 100 - 50 should fold to 50
+        result = result + (100 - 50);
+
+        // Division: 20 / 4 should fold to 5
+        result = result + (20 / 4);
+
+        // Modulo: 17 % 5 should fold to 2
+        result = result + (17 % 5);
+
+        // Negation: ~(~10) should fold to 10
+        result = result + (~(~10));
+
+        // Boolean in ternary: true ? 1 : 0 should fold to 1
+        result = result + (true ? 1 : 0);
+
+        // Boolean in ternary: false ? 0 : 100 should fold to 100
+        result = result + (false ? 0 : 100);
+
+        // 60 + 12 + 50 + 5 + 2 + 10 + 1 + 100 = 240
+        return result;
+    }
+}

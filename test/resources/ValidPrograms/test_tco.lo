@@ -1,0 +1,18 @@
+// Test tail call optimization
+// This tests self-recursive tail calls with single parameter
+class Main() {
+    int main() {
+        // Count down from 5, returns 0 when done
+        return countdown(5);
+    }
+
+    // Simple tail-recursive countdown
+    int countdown(int n) {
+        if (n <= 0) {
+            return 0;
+        } else {
+            // This is a tail call - should be optimized
+            return countdown(n - 1);
+        }
+    }
+}
