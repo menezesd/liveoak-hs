@@ -3,6 +3,7 @@
 
 -- | Optimization passes for LiveOak.
 -- Includes constant folding, dead code elimination, and dataflow optimizations.
+-- Uses SSA form for copy propagation, CSE, constant propagation, and PRE.
 module LiveOak.Optimize
   ( -- * Optimization Passes
     optimize
@@ -19,6 +20,7 @@ module LiveOak.Optimize
 
 import LiveOak.Ast
 import qualified LiveOak.DataFlow as DF
+import qualified LiveOak.SSA as SSA
 
 -- | Apply all optimizations to a program.
 -- Runs multiple passes until the program stabilizes or max iterations reached.
@@ -36,27 +38,44 @@ optimize = go (10 :: Int)
 optimizeOnce :: Program -> Program
 optimizeOnce =
     eliminateDeadCode
-  -- Dataflow optimizations
+  -- Dataflow optimizations (non-SSA)
   . DF.eliminateNullChecks
   . DF.eliminateCommonSubexpressions
   . DF.globalValueNumbering
-  . DF.copyPropagate
   . DF.loadStoreForwarding
   . DF.hoistLoopInvariants
   . DF.inlineSmallMethods
   -- Advanced optimizations
   . DF.sinkCode
   . DF.hoistCommonCode
-  . DF.sparseCondConstProp
   . DF.eliminateDeadParams
   . DF.escapeAnalysis
   . DF.promoteMemToReg
-  -- Tail call optimization (converts self-recursive calls to loops)
+  -- Tail call optimization (control flow transformation)
   . DF.tailCallOptimize
-  -- String optimizations
+  -- String optimizations (domain-specific)
   . DF.optimizeStringConcat
   . DF.internStrings
+  -- Structured SSA optimization (constant/copy propagation)
+  -- Replaces: DF.copyPropagate, DF.sparseCondConstProp
+  . SSA.structuredSSAOpt
+  -- Basic constant folding (algebraic simplifications)
   . constantFold
+
+-- | Optimize via full SSA form (CFG-based).
+-- Handles: copy propagation, constant propagation, dead code elimination, PRE.
+-- NOTE: Currently disabled because fromSSA doesn't properly reconstruct
+-- structured control flow from the CFG representation.
+-- Use structuredSSAOpt instead which preserves the original AST structure.
+_optimizeViaCFGSSA :: Program -> Program
+_optimizeViaCFGSSA prog =
+  let ssa = SSA.toSSA prog
+      optimized = SSA.partialRedundancyElim
+                . SSA.ssaDeadCodeElim
+                . SSA.ssaCopyProp
+                . SSA.ssaConstantProp
+                $ ssa
+  in SSA.fromSSA optimized
 
 -- | Constant folding: evaluate constant expressions at compile time.
 constantFold :: Program -> Program

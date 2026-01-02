@@ -2,28 +2,31 @@
 {-# LANGUAGE RecordWildCards #-}
 
 -- | Dataflow-based optimizations for LiveOak.
--- Includes copy propagation, CSE, LICM, inlining, and null check elimination.
+-- Includes CSE, GVN, LICM, inlining, and null check elimination.
+--
+-- Note: Copy propagation and constant propagation are handled by
+-- SSA.structuredSSAOpt which provides SSA-style value tracking.
 module LiveOak.DataFlow
-  ( -- * Optimization Passes
-    copyPropagate
-  , eliminateCommonSubexpressions
+  ( -- * Core Dataflow Optimizations
+    eliminateCommonSubexpressions
+  , globalValueNumbering
   , hoistLoopInvariants
+  , loadStoreForwarding
+    -- * Method Optimizations
   , inlineSmallMethods
-  , eliminateNullChecks
-    -- * Advanced Optimizations
-  , sparseCondConstProp
   , eliminateDeadParams
+  , tailCallOptimize
+    -- * Code Motion
   , hoistCommonCode
   , sinkCode
+    -- * Memory Optimizations
   , escapeAnalysis
-    -- * More Advanced Optimizations
-  , globalValueNumbering
-  , loadStoreForwarding
   , promoteMemToReg
+    -- * Null Check Elimination
+  , eliminateNullChecks
+    -- * String Optimizations
   , internStrings
   , optimizeStringConcat
-    -- * Tail Call Optimization
-  , tailCallOptimize
   ) where
 
 import LiveOak.Ast
@@ -31,119 +34,6 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
-
---------------------------------------------------------------------------------
--- Copy Propagation
---------------------------------------------------------------------------------
-
--- | Copy propagation: when we have x = y, replace uses of x with y.
-copyPropagate :: Program -> Program
-copyPropagate (Program classes) = Program (map cpClass classes)
-
-cpClass :: ClassDecl -> ClassDecl
-cpClass cls@ClassDecl{..} = cls { classMethods = map cpMethod classMethods }
-
-cpMethod :: MethodDecl -> MethodDecl
-cpMethod m@MethodDecl{..} =
-  let (body', _) = cpStmt Map.empty methodBody
-  in m { methodBody = body' }
-
--- | Copy propagation state: maps variable names to their copy sources.
-type CopyMap = Map String String
-
--- | Propagate copies through a statement.
-cpStmt :: CopyMap -> Stmt -> (Stmt, CopyMap)
-cpStmt copies = \case
-  Block stmts pos ->
-    let (stmts', copies') = cpStmts copies stmts
-    in (Block stmts' pos, copies')
-
-  VarDecl name vt initOpt pos ->
-    let initOpt' = cpExpr copies <$> initOpt
-        -- If initializing with a variable, record the copy
-        copies' = case initOpt' of
-          Just (Var src _) -> Map.insert name src copies
-          _ -> Map.delete name copies  -- Kill any existing copy
-    in (VarDecl name vt initOpt' pos, copies')
-
-  Assign name value pos ->
-    let value' = cpExpr copies value
-        -- If assigning a variable, record the copy
-        copies' = case value' of
-          Var src _ | src /= name -> Map.insert name src (killCopiesOf name copies)
-          _ -> killCopiesOf name copies  -- Kill any copy of or to this variable
-    in (Assign name value' pos, copies')
-
-  FieldAssign target field offset value pos ->
-    (FieldAssign (cpExpr copies target) field offset (cpExpr copies value) pos, copies)
-
-  Return valueOpt pos ->
-    (Return (cpExpr copies <$> valueOpt) pos, copies)
-
-  If cond th el pos ->
-    let cond' = cpExpr copies cond
-        (th', _) = cpStmt copies th
-        (el', _) = cpStmt copies el
-        -- After if, we don't know which branch was taken, so be conservative
-    in (If cond' th' el' pos, Map.empty)
-
-  While cond body pos ->
-    -- Be conservative: don't propagate copies into or out of loops
-    -- IMPORTANT: Don't propagate into condition either, as loop body modifies variables
-    let (body', _) = cpStmt Map.empty body
-    in (While cond body' pos, Map.empty)
-
-  Break pos -> (Break pos, copies)
-
-  ExprStmt expr pos ->
-    (ExprStmt (cpExpr copies expr) pos, copies)
-
--- | Process a list of statements, threading the copy map.
-cpStmts :: CopyMap -> [Stmt] -> ([Stmt], CopyMap)
-cpStmts copies [] = ([], copies)
-cpStmts copies (s:ss) =
-  let (s', copies') = cpStmt copies s
-      (ss', copies'') = cpStmts copies' ss
-  in (s':ss', copies'')
-
--- | Remove all copies involving a variable (as source or target).
-killCopiesOf :: String -> CopyMap -> CopyMap
-killCopiesOf name = Map.filterWithKey (\k v -> k /= name && v /= name)
-
--- | Apply copy propagation to an expression.
-cpExpr :: CopyMap -> Expr -> Expr
-cpExpr copies = \case
-  Var name pos ->
-    -- Follow the copy chain to the original source
-    case resolveCopy copies name of
-      name' | name' /= name -> Var name' pos
-      _ -> Var name pos
-
-  IntLit n pos -> IntLit n pos
-  BoolLit b pos -> BoolLit b pos
-  StrLit s pos -> StrLit s pos
-  NullLit pos -> NullLit pos
-  This pos -> This pos
-
-  Unary op e pos -> Unary op (cpExpr copies e) pos
-  Binary op l r pos -> Binary op (cpExpr copies l) (cpExpr copies r) pos
-  Ternary c t e pos -> Ternary (cpExpr copies c) (cpExpr copies t) (cpExpr copies e) pos
-
-  Call name args pos -> Call name (map (cpExpr copies) args) pos
-  InstanceCall target method args pos ->
-    InstanceCall (cpExpr copies target) method (map (cpExpr copies) args) pos
-  NewObject cn args pos -> NewObject cn (map (cpExpr copies) args) pos
-  FieldAccess target field pos -> FieldAccess (cpExpr copies target) field pos
-
--- | Resolve a variable through the copy chain (with cycle detection).
-resolveCopy :: CopyMap -> String -> String
-resolveCopy copies = go Set.empty
-  where
-    go seen name
-      | name `Set.member` seen = name  -- Cycle detected
-      | otherwise = case Map.lookup name copies of
-          Just src -> go (Set.insert name seen) src
-          Nothing -> name
 
 --------------------------------------------------------------------------------
 -- Common Subexpression Elimination
@@ -599,187 +489,6 @@ isKnownNonNull = \case
   This _ -> True
   NewObject _ _ _ -> True  -- new objects are never null
   _ -> False
-
---------------------------------------------------------------------------------
--- Sparse Conditional Constant Propagation (SCCP)
---------------------------------------------------------------------------------
-
--- | SCCP: More powerful than simple constant folding.
--- Tracks constant values through conditional branches and eliminates
--- unreachable code based on constant conditions.
-sparseCondConstProp :: Program -> Program
-sparseCondConstProp (Program classes) = Program (map sccpClass classes)
-
-sccpClass :: ClassDecl -> ClassDecl
-sccpClass cls@ClassDecl{..} = cls { classMethods = map sccpMethod classMethods }
-
-sccpMethod :: MethodDecl -> MethodDecl
-sccpMethod m@MethodDecl{..} =
-  let (body', _) = sccpStmt Map.empty methodBody
-  in m { methodBody = body' }
-
--- | Lattice value for SCCP: Top (unknown), Constant, or Bottom (overdefined)
-data LatticeVal
-  = Top           -- Not yet analyzed
-  | Const Expr    -- Known constant value
-  | Bottom        -- Multiple possible values (overdefined)
-  deriving (Eq, Show)
-
--- | Meet operation for the lattice
-meetLattice :: LatticeVal -> LatticeVal -> LatticeVal
-meetLattice Top x = x
-meetLattice x Top = x
-meetLattice Bottom _ = Bottom
-meetLattice _ Bottom = Bottom
-meetLattice (Const e1) (Const e2)
-  | exprEqual e1 e2 = Const e1
-  | otherwise = Bottom
-
--- | Check if two expressions are equal (for constants)
-exprEqual :: Expr -> Expr -> Bool
-exprEqual (IntLit a _) (IntLit b _) = a == b
-exprEqual (BoolLit a _) (BoolLit b _) = a == b
-exprEqual (StrLit a _) (StrLit b _) = a == b
-exprEqual (NullLit _) (NullLit _) = True
-exprEqual _ _ = False
-
--- | SCCP state: maps variables to their lattice values
-type SCCPMap = Map String LatticeVal
-
--- | Apply SCCP to a statement
-sccpStmt :: SCCPMap -> Stmt -> (Stmt, SCCPMap)
-sccpStmt vals = \case
-  Block stmts pos ->
-    let (stmts', vals') = sccpStmts vals stmts
-    in (Block stmts' pos, vals')
-
-  VarDecl name vt initOpt pos ->
-    let initOpt' = sccpExpr vals <$> initOpt
-        vals' = case initOpt' of
-          Just e | isConstant e -> Map.insert name (Const e) vals
-          _ -> Map.insert name Bottom vals
-    in (VarDecl name vt initOpt' pos, vals')
-
-  Assign name value pos ->
-    let value' = sccpExpr vals value
-        vals' = case value' of
-          e | isConstant e -> Map.insert name (Const e) vals
-          _ -> Map.insert name Bottom vals
-    in (Assign name value' pos, vals')
-
-  FieldAssign target field offset value pos ->
-    (FieldAssign (sccpExpr vals target) field offset (sccpExpr vals value) pos, vals)
-
-  Return valueOpt pos ->
-    (Return (sccpExpr vals <$> valueOpt) pos, vals)
-
-  If cond th el pos ->
-    let cond' = sccpExpr vals cond
-    in case cond' of
-      -- If condition is constant true, only analyze then branch
-      BoolLit True _ ->
-        let (th', vals') = sccpStmt vals th
-        in (th', vals')
-      -- If condition is constant false, only analyze else branch
-      BoolLit False _ ->
-        let (el', vals') = sccpStmt vals el
-        in (el', vals')
-      -- Otherwise, analyze both and merge
-      _ ->
-        let (th', valsT) = sccpStmt vals th
-            (el', valsE) = sccpStmt vals el
-            vals' = Map.unionWith meetLattice valsT valsE
-        in (If cond' th' el' pos, vals')
-
-  While cond body pos ->
-    -- For loops, be conservative - assume variables modified in loop are Bottom
-    let modified = modifiedInStmt body
-        vals' = foldr (\v m -> Map.insert v Bottom m) vals (Set.toList modified)
-        (body'', _) = sccpStmt vals' body
-        cond' = sccpExpr vals' cond
-    in case cond' of
-      BoolLit False _ -> (Block [] pos, vals)  -- Loop never executes
-      _ -> (While cond' body'' pos, vals')
-
-  Break pos -> (Break pos, vals)
-  ExprStmt expr pos -> (ExprStmt (sccpExpr vals expr) pos, vals)
-
-sccpStmts :: SCCPMap -> [Stmt] -> ([Stmt], SCCPMap)
-sccpStmts vals [] = ([], vals)
-sccpStmts vals (s:ss) =
-  let (s', vals') = sccpStmt vals s
-      (ss', vals'') = sccpStmts vals' ss
-  in (s':ss', vals'')
-
--- | Apply SCCP to an expression, substituting known constants
-sccpExpr :: SCCPMap -> Expr -> Expr
-sccpExpr vals = \case
-  Var name pos ->
-    case Map.lookup name vals of
-      Just (Const e) -> e
-      _ -> Var name pos
-
-  -- Fold binary operations if both operands are constant
-  Binary op l r pos ->
-    let l' = sccpExpr vals l
-        r' = sccpExpr vals r
-    in foldBinaryOp op l' r' pos
-
-  Unary op e pos ->
-    let e' = sccpExpr vals e
-    in foldUnaryOp op e' pos
-
-  Ternary cond th el pos ->
-    let cond' = sccpExpr vals cond
-        th' = sccpExpr vals th
-        el' = sccpExpr vals el
-    in case cond' of
-      BoolLit True _ -> th'
-      BoolLit False _ -> el'
-      _ -> Ternary cond' th' el' pos
-
-  Call name args pos -> Call name (map (sccpExpr vals) args) pos
-  InstanceCall target method args pos ->
-    InstanceCall (sccpExpr vals target) method (map (sccpExpr vals) args) pos
-  NewObject cn args pos -> NewObject cn (map (sccpExpr vals) args) pos
-  FieldAccess target field pos -> FieldAccess (sccpExpr vals target) field pos
-
-  e -> e
-
--- | Check if an expression is a constant
-isConstant :: Expr -> Bool
-isConstant = \case
-  IntLit _ _ -> True
-  BoolLit _ _ -> True
-  StrLit _ _ -> True
-  NullLit _ -> True
-  _ -> False
-
--- | Fold a binary operation if possible
-foldBinaryOp :: BinaryOp -> Expr -> Expr -> Int -> Expr
-foldBinaryOp op l r pos = case (op, l, r) of
-  (Add, IntLit a _, IntLit b _) -> IntLit (a + b) pos
-  (Sub, IntLit a _, IntLit b _) -> IntLit (a - b) pos
-  (Mul, IntLit a _, IntLit b _) -> IntLit (a * b) pos
-  (Div, IntLit a _, IntLit b _) | b /= 0 -> IntLit (a `div` b) pos
-  (Mod, IntLit a _, IntLit b _) | b /= 0 -> IntLit (a `mod` b) pos
-  (Eq, IntLit a _, IntLit b _) -> BoolLit (a == b) pos
-  (Ne, IntLit a _, IntLit b _) -> BoolLit (a /= b) pos
-  (Lt, IntLit a _, IntLit b _) -> BoolLit (a < b) pos
-  (Le, IntLit a _, IntLit b _) -> BoolLit (a <= b) pos
-  (Gt, IntLit a _, IntLit b _) -> BoolLit (a > b) pos
-  (Ge, IntLit a _, IntLit b _) -> BoolLit (a >= b) pos
-  (And, BoolLit a _, BoolLit b _) -> BoolLit (a && b) pos
-  (Or, BoolLit a _, BoolLit b _) -> BoolLit (a || b) pos
-  (Add, StrLit a _, StrLit b _) -> StrLit (a ++ b) pos
-  _ -> Binary op l r pos
-
--- | Fold a unary operation if possible
-foldUnaryOp :: UnaryOp -> Expr -> Int -> Expr
-foldUnaryOp op e pos = case (op, e) of
-  (Neg, IntLit n _) -> IntLit (-n) pos
-  (Not, BoolLit b _) -> BoolLit (not b) pos
-  _ -> Unary op e pos
 
 --------------------------------------------------------------------------------
 -- Dead Parameter Elimination

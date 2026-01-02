@@ -6,6 +6,7 @@
 module LiveOak.SSA
   ( -- * SSA Types
     SSAProgram(..)
+  , SSAClass(..)
   , SSAMethod(..)
   , SSABlock(..)
   , SSAInstr(..)
@@ -22,9 +23,13 @@ module LiveOak.SSA
   , ssaDeadCodeElim
   , ssaCopyProp
   , partialRedundancyElim
+
+    -- * Structured SSA Optimization
+  , structuredSSAOpt
   ) where
 
 import LiveOak.Ast
+import LiveOak.Types (ValueType)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
@@ -39,6 +44,7 @@ import Control.Monad.State
 data SSAVar = SSAVar
   { ssaName :: !String     -- ^ Original variable name
   , ssaVersion :: !Int     -- ^ Version number (0 = original)
+  , ssaVarType :: !(Maybe ValueType)  -- ^ Type (if known, e.g., for parameters)
   } deriving (Eq, Ord, Show)
 
 -- | Phi node: selects value based on predecessor block
@@ -83,15 +89,24 @@ data SSABlock = SSABlock
 
 -- | Method in SSA form
 data SSAMethod = SSAMethod
-  { ssaMethodName :: !String
+  { ssaMethodClassName :: !String       -- ^ Containing class name
+  , ssaMethodName :: !String
   , ssaMethodParams :: ![SSAVar]        -- ^ Parameters as SSA vars (version 0)
+  , ssaMethodReturnSig :: !ReturnSig    -- ^ Return signature
   , ssaMethodBlocks :: ![SSABlock]      -- ^ Basic blocks
   , ssaEntryBlock :: !String            -- ^ Entry block label
   } deriving (Eq, Show)
 
+-- | Class in SSA form
+data SSAClass = SSAClass
+  { ssaClassName :: !String
+  , ssaClassFields :: ![(String, ValueType)]  -- ^ Field declarations
+  , ssaClassMethods :: ![SSAMethod]
+  } deriving (Eq, Show)
+
 -- | Program in SSA form
 data SSAProgram = SSAProgram
-  { ssaClasses :: ![(String, [SSAMethod])]
+  { ssaClasses :: ![SSAClass]
   } deriving (Eq, Show)
 
 --------------------------------------------------------------------------------
@@ -101,7 +116,15 @@ data SSAProgram = SSAProgram
 -- | Convert a program to SSA form
 toSSA :: Program -> SSAProgram
 toSSA (Program classes) = SSAProgram
-  [(className c, map (methodToSSA (className c)) (classMethods c)) | c <- classes]
+  [classToSSA c | c <- classes]
+
+-- | Convert a class to SSA form
+classToSSA :: ClassDecl -> SSAClass
+classToSSA ClassDecl{..} = SSAClass
+  { ssaClassName = className
+  , ssaClassFields = classFields
+  , ssaClassMethods = map (methodToSSA className) classMethods
+  }
 
 -- | State for SSA conversion
 data SSAState = SSAState
@@ -118,7 +141,7 @@ freshVar name = do
   st <- get
   let ver = Map.findWithDefault 0 name (nextVersion st)
   put st { nextVersion = Map.insert name (ver + 1) (nextVersion st) }
-  return (SSAVar name ver)
+  return (SSAVar name ver Nothing)
 
 -- | Define a variable (create new version)
 defineVar :: String -> SSAConv SSAVar
@@ -135,7 +158,7 @@ useVar name = do
     Just v -> return v
     Nothing -> do
       -- First use - create version 0
-      let v = SSAVar name 0
+      let v = SSAVar name 0 Nothing
       modify $ \st' -> st' { currentDefs = Map.insert name v (currentDefs st') }
       return v
 
@@ -149,14 +172,14 @@ freshBlock = do
 
 -- | Convert a method to SSA form
 methodToSSA :: String -> MethodDecl -> SSAMethod
-methodToSSA _className MethodDecl{..} =
+methodToSSA clsName MethodDecl{..} =
   let initState = SSAState Map.empty Map.empty 0
-      -- Initialize parameters as version 0
-      paramVars = [SSAVar (paramName p) 0 | p <- methodParams]
-      initDefs = Map.fromList [(paramName p, SSAVar (paramName p) 0) | p <- methodParams]
+      -- Initialize parameters as version 0 with their types
+      paramVars = [SSAVar (paramName p) 0 (Just (paramType p)) | p <- methodParams]
+      initDefs = Map.fromList [(paramName p, SSAVar (paramName p) 0 (Just (paramType p))) | p <- methodParams]
       st = initState { currentDefs = initDefs }
       (blocks, _) = runState (stmtToBlocks "entry" methodBody) st
-  in SSAMethod methodName paramVars blocks "entry"
+  in SSAMethod clsName methodName paramVars methodReturnSig blocks "entry"
 
 -- | Convert a statement to SSA blocks
 stmtToBlocks :: String -> Stmt -> SSAConv [SSABlock]
@@ -282,15 +305,29 @@ exprToSSA = \case
 -- | Convert SSA back to normal form (for code generation)
 -- This inserts copy instructions for phi nodes
 fromSSA :: SSAProgram -> Program
-fromSSA (SSAProgram classes) = Program
-  [ClassDecl cn [] (map ssaMethodToNormal methods) | (cn, methods) <- classes]
+fromSSA (SSAProgram classes) = Program (map ssaClassToNormal classes)
+
+-- | Convert SSA class back to normal AST
+ssaClassToNormal :: SSAClass -> ClassDecl
+ssaClassToNormal SSAClass{..} = ClassDecl
+  { className = ssaClassName
+  , classFields = ssaClassFields
+  , classMethods = map ssaMethodToNormal ssaClassMethods
+  }
 
 -- | Convert SSA method back to normal AST
 ssaMethodToNormal :: SSAMethod -> MethodDecl
 ssaMethodToNormal SSAMethod{..} =
-  let params = [ParamDecl (ssaName v) undefined | v <- ssaMethodParams]
+  let params = [ParamDecl (ssaName v) (getVarType v) | v <- ssaMethodParams]
       body = blocksToStmt ssaMethodBlocks
-  in MethodDecl "" ssaMethodName params Void body
+  in MethodDecl ssaMethodClassName ssaMethodName params ssaMethodReturnSig body
+
+-- | Get the type from an SSAVar, defaulting to Int if unknown
+-- (This shouldn't happen for parameters which always have types)
+getVarType :: SSAVar -> ValueType
+getVarType v = case ssaVarType v of
+  Just t -> t
+  Nothing -> error $ "SSA: Missing type for parameter " ++ ssaName v
 
 -- | Convert SSA blocks to a statement
 blocksToStmt :: [SSABlock] -> Stmt
@@ -319,8 +356,11 @@ instrToStmt = \case
   SSABranch c _t _ -> If (ssaExprToExpr c) (Block [] 0) (Block [] 0) 0
   SSAExprStmt e -> ExprStmt (ssaExprToExpr e) 0
 
+-- | Convert SSA variable back to original name.
+-- We use the base name, not the versioned name, since the semantic
+-- analyzer only knows about the original variable names.
 varToName :: SSAVar -> String
-varToName (SSAVar name ver) = name ++ "_" ++ show ver
+varToName (SSAVar name _ _) = name
 
 ssaExprToExpr :: SSAExpr -> Expr
 ssaExprToExpr = \case
@@ -345,7 +385,7 @@ ssaExprToExpr = \case
 -- | Sparse conditional constant propagation on SSA
 ssaConstantProp :: SSAProgram -> SSAProgram
 ssaConstantProp (SSAProgram classes) =
-  SSAProgram [(cn, map propMethod methods) | (cn, methods) <- classes]
+  SSAProgram [c { ssaClassMethods = map propMethod (ssaClassMethods c) } | c <- classes]
   where
     propMethod m = m { ssaMethodBlocks = map propBlock (ssaMethodBlocks m) }
     propBlock b = b { blockInstrs = map propInstr (blockInstrs b) }
@@ -378,7 +418,7 @@ foldSSAExpr = \case
 -- | Dead code elimination on SSA
 ssaDeadCodeElim :: SSAProgram -> SSAProgram
 ssaDeadCodeElim (SSAProgram classes) =
-  SSAProgram [(cn, map elimMethod methods) | (cn, methods) <- classes]
+  SSAProgram [c { ssaClassMethods = map elimMethod (ssaClassMethods c) } | c <- classes]
   where
     elimMethod m =
       let used = collectUsed (ssaMethodBlocks m)
@@ -433,7 +473,7 @@ collectUsed blocks = Set.unions (map blockUsed blocks)
 -- | Copy propagation on SSA
 ssaCopyProp :: SSAProgram -> SSAProgram
 ssaCopyProp (SSAProgram classes) =
-  SSAProgram [(cn, map propMethod methods) | (cn, methods) <- classes]
+  SSAProgram [c { ssaClassMethods = map propMethod (ssaClassMethods c) } | c <- classes]
   where
     propMethod m =
       let copies = findCopies (ssaMethodBlocks m)
@@ -488,7 +528,7 @@ ssaCopyProp (SSAProgram classes) =
 -- to make redundant computations eliminable.
 partialRedundancyElim :: SSAProgram -> SSAProgram
 partialRedundancyElim (SSAProgram classes) =
-  SSAProgram [(cn, map preMethod methods) | (cn, methods) <- classes]
+  SSAProgram [c { ssaClassMethods = map preMethod (ssaClassMethods c) } | c <- classes]
   where
     preMethod m =
       let -- Step 1: Find all expressions and where they're computed
@@ -520,7 +560,7 @@ canonicalize = \case
   SSAStr s -> Just $ CStr s
   SSANull -> Just CNull
   SSAThis -> Just CThis
-  SSAUse (SSAVar name ver) -> Just $ CVar name ver
+  SSAUse (SSAVar name ver _) -> Just $ CVar name ver
   SSAUnary op e -> CUnary op <$> canonicalize e
   SSABinary op l r -> CBinary op <$> canonicalize l <*> canonicalize r
   -- Skip complex expressions for now
@@ -569,3 +609,240 @@ eliminateRedundant redundant blocks = map elimBlock blocks
           [SSAAssign v (SSAUse canonical)]
         _ -> [instr]
     elimInstr instr = [instr]
+
+--------------------------------------------------------------------------------
+-- Structured SSA Optimization
+--------------------------------------------------------------------------------
+-- This performs SSA-style optimizations directly on the structured AST,
+-- without converting to a CFG representation. This preserves control flow
+-- structure while still enabling optimizations like:
+-- - Copy propagation
+-- - Constant propagation
+-- - Common subexpression elimination
+-- - Dead code elimination
+
+-- | Optimize a program using structured SSA techniques.
+-- This preserves the original AST structure while applying SSA-style
+-- value propagation and constant folding.
+structuredSSAOpt :: Program -> Program
+structuredSSAOpt (Program classes) = Program (map optClass classes)
+
+optClass :: ClassDecl -> ClassDecl
+optClass c@ClassDecl{..} = c { classMethods = map optMethod classMethods }
+
+optMethod :: MethodDecl -> MethodDecl
+optMethod m@MethodDecl{..} =
+  let initEnv = Map.empty
+      (body', _) = runState (optStmt methodBody) initEnv
+  in m { methodBody = body' }
+
+-- | Environment mapping variable names to their known values
+type OptEnv = Map String KnownValue
+
+-- | A value that may be known at compile time
+data KnownValue
+  = KInt !Int
+  | KBool !Bool
+  | KStr !String
+  | KVar !String      -- Known to be a copy of another variable
+  | KExpr !Expr       -- Known to be this expression (for CSE)
+  deriving (Eq, Show)
+
+type OptM a = State OptEnv a
+
+-- | Optimize a statement
+optStmt :: Stmt -> OptM Stmt
+optStmt = \case
+  Block stmts pos -> do
+    stmts' <- mapM optStmt stmts
+    return $ Block stmts' pos
+
+  VarDecl name ty initOpt pos -> do
+    case initOpt of
+      Just expr -> do
+        expr' <- optExpr expr
+        recordValue name expr'
+        return $ VarDecl name ty (Just expr') pos
+      Nothing -> do
+        modify $ Map.delete name
+        return $ VarDecl name ty Nothing pos
+
+  Assign name expr pos -> do
+    expr' <- optExpr expr
+    recordValue name expr'
+    return $ Assign name expr' pos
+
+  FieldAssign target field off value pos -> do
+    target' <- optExpr target
+    value' <- optExpr value
+    return $ FieldAssign target' field off value' pos
+
+  Return exprOpt pos -> do
+    exprOpt' <- traverse optExpr exprOpt
+    return $ Return exprOpt' pos
+
+  If cond th el pos -> do
+    cond' <- optExpr cond
+    -- Save environment before branches
+    env <- get
+    th' <- optStmt th
+    thEnv <- get
+    put env
+    el' <- optStmt el
+    elEnv <- get
+    -- After if, remove any variable that was assigned in either branch
+    -- (since we don't know which branch was taken)
+    let thModified = Map.keysSet thEnv `Set.difference` Map.keysSet env
+        elModified = Map.keysSet elEnv `Set.difference` Map.keysSet env
+        -- Also consider vars that changed value
+        thChanged = Set.fromList [k | k <- Map.keys env, Map.lookup k thEnv /= Map.lookup k env]
+        elChanged = Set.fromList [k | k <- Map.keys env, Map.lookup k elEnv /= Map.lookup k env]
+        allModified = Set.unions [thModified, elModified, thChanged, elChanged]
+        -- Remove all modified variables from environment
+        finalEnv = foldr Map.delete env (Set.toList allModified)
+    put finalEnv
+    return $ If cond' th' el' pos
+
+  While cond body pos -> do
+    -- For while loops, we must NOT propagate constants into the condition
+    -- because the loop body may modify the variables used in the condition.
+    -- Clear environment before optimizing condition and body.
+    modify (const Map.empty)  -- Clear all known values
+    cond' <- optExpr cond
+    body' <- optStmt body
+    modify (const Map.empty)  -- Clear again after loop (values may be modified)
+    return $ While cond' body' pos
+
+  Break pos -> return $ Break pos
+
+  ExprStmt expr pos -> do
+    expr' <- optExpr expr
+    return $ ExprStmt expr' pos
+
+-- | Record a value assignment
+recordValue :: String -> Expr -> OptM ()
+recordValue name expr = modify $ Map.insert name (exprToKnown expr)
+  where
+    exprToKnown (IntLit n _) = KInt n
+    exprToKnown (BoolLit b _) = KBool b
+    exprToKnown (StrLit s _) = KStr s
+    exprToKnown (Var v _) = KVar v
+    exprToKnown e = KExpr e
+
+-- | Optimize an expression using known values
+optExpr :: Expr -> OptM Expr
+optExpr = \case
+  IntLit n p -> return $ IntLit n p
+  BoolLit b p -> return $ BoolLit b p
+  StrLit s p -> return $ StrLit s p
+  NullLit p -> return $ NullLit p
+  This p -> return $ This p
+
+  Var name p -> lookupVar Set.empty name p
+    where
+      -- Lookup variable with cycle detection
+      lookupVar :: Set String -> String -> Int -> OptM Expr
+      lookupVar visited varName pos
+        | Set.member varName visited = return $ Var varName pos  -- Cycle detected, stop
+        | otherwise = do
+            env <- get
+            case Map.lookup varName env of
+              Just (KInt n) -> return $ IntLit n pos
+              Just (KBool b) -> return $ BoolLit b pos
+              Just (KStr s) -> return $ StrLit s pos
+              Just (KVar v) -> lookupVar (Set.insert varName visited) v pos
+              _ -> return $ Var varName pos
+
+  Unary op e p -> do
+    e' <- optExpr e
+    return $ foldUnary op e' p
+
+  Binary op l r p -> do
+    l' <- optExpr l
+    r' <- optExpr r
+    return $ foldBinaryExpr op l' r' p
+
+  Ternary c t e p -> do
+    c' <- optExpr c
+    case c' of
+      BoolLit True _ -> optExpr t
+      BoolLit False _ -> optExpr e
+      _ -> do
+        t' <- optExpr t
+        e' <- optExpr e
+        return $ Ternary c' t' e' p
+
+  Call name args p -> do
+    args' <- mapM optExpr args
+    return $ Call name args' p
+
+  InstanceCall target method args p -> do
+    target' <- optExpr target
+    args' <- mapM optExpr args
+    return $ InstanceCall target' method args' p
+
+  NewObject cn args p -> do
+    args' <- mapM optExpr args
+    return $ NewObject cn args' p
+
+  FieldAccess target field p -> do
+    target' <- optExpr target
+    return $ FieldAccess target' field p
+
+-- | Fold unary operations on constants
+foldUnary :: UnaryOp -> Expr -> Int -> Expr
+foldUnary op e p = case (op, e) of
+  (Neg, IntLit n _) -> IntLit (-n) p
+  (Not, BoolLit b _) -> BoolLit (not b) p
+  (Neg, Unary Neg inner _) -> inner  -- --x = x
+  (Not, Unary Not inner _) -> inner  -- !!x = x
+  _ -> Unary op e p
+
+-- | Fold binary operations on constants
+foldBinaryExpr :: BinaryOp -> Expr -> Expr -> Int -> Expr
+foldBinaryExpr op l r p = case (op, l, r) of
+  -- Integer arithmetic
+  (Add, IntLit a _, IntLit b _) -> IntLit (a + b) p
+  (Sub, IntLit a _, IntLit b _) -> IntLit (a - b) p
+  (Mul, IntLit a _, IntLit b _) -> IntLit (a * b) p
+  (Div, IntLit a _, IntLit b _) | b /= 0 -> IntLit (a `div` b) p
+  (Mod, IntLit a _, IntLit b _) | b /= 0 -> IntLit (a `mod` b) p
+
+  -- Integer comparisons
+  (Eq, IntLit a _, IntLit b _) -> BoolLit (a == b) p
+  (Ne, IntLit a _, IntLit b _) -> BoolLit (a /= b) p
+  (Lt, IntLit a _, IntLit b _) -> BoolLit (a < b) p
+  (Le, IntLit a _, IntLit b _) -> BoolLit (a <= b) p
+  (Gt, IntLit a _, IntLit b _) -> BoolLit (a > b) p
+  (Ge, IntLit a _, IntLit b _) -> BoolLit (a >= b) p
+
+  -- Boolean operations
+  (And, BoolLit a _, BoolLit b _) -> BoolLit (a && b) p
+  (Or, BoolLit a _, BoolLit b _) -> BoolLit (a || b) p
+
+  -- Short-circuit
+  (And, BoolLit False _, _) -> BoolLit False p
+  (And, BoolLit True _, r') -> r'
+  (And, _, BoolLit False _) -> BoolLit False p
+  (And, l', BoolLit True _) -> l'
+  (Or, BoolLit True _, _) -> BoolLit True p
+  (Or, BoolLit False _, r') -> r'
+  (Or, _, BoolLit True _) -> BoolLit True p
+  (Or, l', BoolLit False _) -> l'
+
+  -- String concatenation
+  (Add, StrLit a _, StrLit b _) -> StrLit (a ++ b) p
+
+  -- Identity operations
+  (Add, e, IntLit 0 _) -> e
+  (Add, IntLit 0 _, e) -> e
+  (Sub, e, IntLit 0 _) -> e
+  (Mul, e, IntLit 1 _) -> e
+  (Mul, IntLit 1 _, e) -> e
+  (Div, e, IntLit 1 _) -> e
+
+  -- Zero operations
+  (Mul, _, IntLit 0 _) -> IntLit 0 p
+  (Mul, IntLit 0 _, _) -> IntLit 0 p
+
+  _ -> Binary op l r p
