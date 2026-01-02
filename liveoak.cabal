@@ -24,6 +24,7 @@ library
                     , LiveOak.Lexer
                     , LiveOak.Parser
                     , LiveOak.Semantic
+                    , LiveOak.Optimize
                     , LiveOak.Codegen
                     , LiveOak.StringRuntime
                     , LiveOak.Compiler

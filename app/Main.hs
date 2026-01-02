@@ -14,19 +14,21 @@ main = do
   args <- getArgs
   case args of
     [inputFile, outputFile] -> do
-      result <- compileFile inputFile
+      source <- TIO.readFile inputFile
+      let result = compile inputFile source
       case result of
         Right samCode -> TIO.writeFile outputFile samCode
         Left diag -> do
-          hPutStrLn stderr $ "Error: " ++ formatDiag diag
+          hPutStrLn stderr $ formatDiagWithSource source diag
           exitFailure
 
     [inputFile] -> do
-      result <- compileFile inputFile
+      source <- TIO.readFile inputFile
+      let result = compile inputFile source
       case result of
         Right samCode -> TIO.putStr samCode
         Left diag -> do
-          hPutStrLn stderr $ "Error: " ++ formatDiag diag
+          hPutStrLn stderr $ formatDiagWithSource source diag
           exitFailure
 
     _ -> do

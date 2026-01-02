@@ -356,8 +356,9 @@ pAnd :: Parser Expr
 pAnd = pBinopLeft pComparison [("&", And)]
 
 -- | Parse a comparison expression.
+-- Note: Multi-character operators must come before single-character ones.
 pComparison :: Parser Expr
-pComparison = pBinopLeft pAddSub [("<", Lt), (">", Gt), ("=", Eq)]
+pComparison = pBinopLeft pAddSub [("!=", Ne), ("<=", Le), (">=", Ge), ("<", Lt), (">", Gt), ("=", Eq)]
 
 -- | Parse addition/subtraction.
 pAddSub :: Parser Expr

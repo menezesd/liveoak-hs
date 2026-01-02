@@ -8,7 +8,9 @@ module LiveOak.Diag
   , diagMessage
   , diagLine
   , diagColumn
+  , diagKind
   , formatDiag
+  , formatDiagWithSource
 
     -- * Result Type
   , Result
@@ -26,6 +28,9 @@ module LiveOak.Diag
   , fromMaybe
   , require
   ) where
+
+import Data.Text (Text)
+import qualified Data.Text as T
 
 -- | Structured diagnostic for parser/semantic/codegen errors.
 data Diag
@@ -46,9 +51,51 @@ diagLine = _diagLine
 diagColumn :: Diag -> Int
 diagColumn = _diagCol
 
--- | Format a diagnostic for display.
+-- | Get the kind of diagnostic as a string.
+diagKind :: Diag -> String
+diagKind = \case
+  SyntaxError{}  -> "Syntax error"
+  TypeError{}    -> "Type error"
+  ResolveError{} -> "Resolution error"
+
+-- | Format a diagnostic for display (simple format).
 formatDiag :: Diag -> String
-formatDiag d = diagMessage d ++ " at " ++ show (diagLine d) ++ ":" ++ show (diagColumn d)
+formatDiag d = diagKind d ++ ": " ++ diagMessage d ++ locationStr
+  where
+    locationStr
+      | diagLine d > 0 = " (line " ++ show (diagLine d) ++ ")"
+      | otherwise      = ""
+
+-- | Format a diagnostic with source context.
+-- Shows the error message, the relevant source line, and a caret pointing to the error.
+formatDiagWithSource :: Text -> Diag -> String
+formatDiagWithSource source d = unlines $ filter (not . null)
+  [ diagKind d ++ ": " ++ diagMessage d
+  , locationLine
+  , sourceLine
+  , caretLine
+  ]
+  where
+    line = diagLine d
+    col  = diagColumn d
+
+    locationLine
+      | line > 0  = "  --> line " ++ show line ++ (if col > 0 then ":" ++ show col else "")
+      | otherwise = ""
+
+    sourceLines = T.lines source
+
+    sourceLine
+      | line > 0 && line <= length sourceLines =
+          "   | " ++ T.unpack (sourceLines !! (line - 1))
+      | otherwise = ""
+
+    caretLine
+      | line > 0 && line <= length sourceLines && col > 0 =
+          "   | " ++ replicate (col - 1) ' ' ++ "^"
+      | line > 0 && line <= length sourceLines =
+          "   | " ++ "^"  -- Point to start if no column info
+      | otherwise = ""
 
 -- | Result type: Either a diagnostic or a successful value.
 type Result a = Either Diag a

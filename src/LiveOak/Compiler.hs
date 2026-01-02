@@ -1,7 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 -- | Main compiler module for LiveOak.
--- Orchestrates the compilation pipeline: parse -> validate -> semantic check -> codegen.
+-- Orchestrates the compilation pipeline: parse -> validate -> semantic check -> optimize -> codegen.
 module LiveOak.Compiler
   ( -- * Compilation
     compile
@@ -21,6 +21,7 @@ import LiveOak.Symbol
 import LiveOak.Diag
 import LiveOak.Parser (parseProgram)
 import LiveOak.Semantic (checkProgram)
+import LiveOak.Optimize (optimize)
 import LiveOak.Codegen (generateCode)
 
 -- | Compilation stages.
@@ -51,8 +52,11 @@ compile path source = do
   -- Semantic analysis
   checkProgram program symbols
 
+  -- Optimize
+  let optimizedProgram = optimize program
+
   -- Generate code
-  generateCode program symbols
+  generateCode optimizedProgram symbols
 
 -- | Compile a file to SAM assembly.
 compileFile :: FilePath -> IO (Result Text)
