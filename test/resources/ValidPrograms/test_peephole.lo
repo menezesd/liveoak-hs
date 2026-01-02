@@ -1,0 +1,18 @@
+// Test peephole optimization
+// This program has patterns that the peephole optimizer can improve
+class Main() {
+    int main() {
+        int x;
+        {
+            // x + 0 should be optimized away
+            x = 5 + 0;
+            // x * 1 should be optimized away
+            x = x * 1;
+            // x - 0 should be optimized away
+            x = x - 0;
+            // Constant folding: 2 + 3 = 5
+            x = x + 2 + 3;
+            return x;
+        }
+    }
+}

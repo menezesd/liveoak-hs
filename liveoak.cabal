@@ -27,6 +27,7 @@ library
                     , LiveOak.Warnings
                     , LiveOak.Optimize
                     , LiveOak.Codegen
+                    , LiveOak.Peephole
                     , LiveOak.StringRuntime
                     , LiveOak.Compiler
                     , LiveOak.Sam

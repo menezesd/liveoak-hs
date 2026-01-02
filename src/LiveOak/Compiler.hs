@@ -26,6 +26,7 @@ import LiveOak.Semantic (checkProgram, checkProgramCollectErrors)
 import LiveOak.Warnings (collectWarnings)
 import LiveOak.Optimize (optimize)
 import LiveOak.Codegen (generateCode)
+import qualified LiveOak.Peephole as Peephole
 
 -- | Compilation stages.
 data CompilationStage
@@ -62,13 +63,16 @@ compileWithWarnings path source = do
   -- Collect warnings
   let warnings = collectWarnings program symbols
 
-  -- Optimize
+  -- Optimize AST
   let optimizedProgram = optimize program
 
   -- Generate code
   code <- generateCode optimizedProgram symbols
 
-  return (code, warnings)
+  -- Peephole optimize SAM code
+  let optimizedCode = Peephole.optimizeText code
+
+  return (optimizedCode, warnings)
 
 -- | Compile and collect ALL errors instead of stopping at first.
 -- Returns either (code, warnings) on success, or list of all errors on failure.
@@ -83,7 +87,9 @@ compileCollectAllErrors path source =
       in if null allErrors
          then case generateCode (optimize program) symbols of
            Left codegenErr -> Left [codegenErr]
-           Right code -> Right (code, collectWarnings program symbols)
+           Right code ->
+             let optimizedCode = Peephole.optimizeText code
+             in Right (optimizedCode, collectWarnings program symbols)
          else Left allErrors
 
 -- | Validate entry point, returning list of errors.
