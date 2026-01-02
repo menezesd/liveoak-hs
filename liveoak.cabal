@@ -56,11 +56,14 @@ test-suite liveoak-test
     main-is:          Main.hs
     other-modules:    CompilerTest
                     , SimulatorTest
+                    , PropertyTest
     build-depends:    base >= 4.17 && < 5
                     , liveoak
                     , text >= 2.0
                     , tasty >= 1.4
                     , tasty-hunit >= 0.10
+                    , tasty-quickcheck >= 0.10
+                    , QuickCheck >= 2.14
                     , directory >= 1.3
                     , filepath >= 1.4
     hs-source-dirs:   test
