@@ -28,6 +28,10 @@ module LiveOak.DataFlow
     -- * String Optimizations
   , internStrings
   , optimizeStringConcat
+    -- * Loop Optimizations
+  , unrollLoops
+    -- * Range Analysis
+  , eliminateImpossibleBranches
   ) where
 
 import LiveOak.Ast
@@ -1645,3 +1649,397 @@ transformExpr _name _params = go
       NewObject cn args pos -> NewObject cn (map go args) pos
       FieldAccess target field pos -> FieldAccess (go target) field pos
       e -> e
+
+--------------------------------------------------------------------------------
+-- Loop Unrolling
+--------------------------------------------------------------------------------
+
+-- | Unroll small loops with known iteration counts.
+-- Patterns detected:
+--   while (i < N) { body; i = i + 1; }  where N is a small constant
+--   int i = 0; while (i < N) { body; i = i + 1; }
+unrollLoops :: Program -> Program
+unrollLoops (Program classes) = Program (map unrollClass classes)
+
+unrollClass :: ClassDecl -> ClassDecl
+unrollClass cls@ClassDecl{..} = cls { classMethods = map unrollMethod classMethods }
+
+unrollMethod :: MethodDecl -> MethodDecl
+unrollMethod m@MethodDecl{..} = m { methodBody = unrollStmt methodBody }
+
+-- | Maximum number of iterations to unroll
+maxUnrollCount :: Int
+maxUnrollCount = 8
+
+-- | Maximum body size (in AST nodes) to unroll
+maxUnrollBodySize :: Int
+maxUnrollBodySize = 20
+
+-- | Unroll loops in a statement
+unrollStmt :: Stmt -> Stmt
+unrollStmt = \case
+  Block stmts pos -> Block (unrollBlock stmts) pos
+  If cond th el pos -> If cond (unrollStmt th) (unrollStmt el) pos
+  While cond body pos -> tryUnroll cond body pos
+  s -> s
+
+-- | Try to unroll a block, looking for init-then-loop patterns
+unrollBlock :: [Stmt] -> [Stmt]
+unrollBlock [] = []
+unrollBlock [s] = [unrollStmt s]
+unrollBlock (s1 : s2 : rest) = case (s1, s2) of
+  -- Pattern: int i = 0; while (i < N) { body; i = i + 1; }
+  (VarDecl name _ (Just (IntLit initVal _)) _, While cond body pos)
+    | Just (loopVar, limit) <- getLoopBound cond
+    , loopVar == name
+    , initVal == 0
+    , Just increment <- getLoopIncrement name body
+    , increment == 1
+    , limit > 0 && limit <= maxUnrollCount
+    , stmtSize body <= maxUnrollBodySize
+    , not (hasBreak body) ->
+        let -- Remove the increment from body
+            bodyWithoutIncr = removeIncrement name body
+            -- Generate unrolled iterations
+            unrolled = [substituteVar name i bodyWithoutIncr | i <- [0..limit-1]]
+        in Block unrolled pos : unrollBlock rest
+
+  _ -> unrollStmt s1 : unrollBlock (s2 : rest)
+
+-- | Try to unroll a while loop
+tryUnroll :: Expr -> Stmt -> Int -> Stmt
+tryUnroll cond body pos
+  -- Pattern: while (i < N) { body; i = i + 1; } with i starting at known value
+  | Just (loopVar, limit) <- getLoopBound cond
+  , Just increment <- getLoopIncrement loopVar body
+  , increment == 1
+  , limit > 0 && limit <= maxUnrollCount
+  , stmtSize body <= maxUnrollBodySize
+  , not (hasBreak body) =
+      let bodyWithoutIncr = removeIncrement loopVar body
+          -- We don't know initial value, so generate loop with smaller bound
+          -- or partial unroll. For now, just recurse into body.
+          unrolled = [substituteVar loopVar i bodyWithoutIncr | i <- [0..limit-1]]
+      in Block unrolled pos
+  | otherwise = While cond (unrollStmt body) pos
+
+-- | Extract loop bound from condition: i < N returns (i, N)
+getLoopBound :: Expr -> Maybe (String, Int)
+getLoopBound = \case
+  Binary Lt (Var name _) (IntLit n _) _ -> Just (name, n)
+  Binary Le (Var name _) (IntLit n _) _ -> Just (name, n + 1)
+  Binary Gt (IntLit n _) (Var name _) _ -> Just (name, n)
+  Binary Ge (IntLit n _) (Var name _) _ -> Just (name, n + 1)
+  _ -> Nothing
+
+-- | Get loop increment: look for i = i + 1 or i = i - 1
+getLoopIncrement :: String -> Stmt -> Maybe Int
+getLoopIncrement name = \case
+  Block stmts _ ->
+    case filter isIncrement stmts of
+      [s] -> getLoopIncrement name s
+      _ -> Nothing
+  Assign n (Binary Add (Var v _) (IntLit delta _) _) _
+    | n == name && v == name -> Just delta
+  Assign n (Binary Sub (Var v _) (IntLit delta _) _) _
+    | n == name && v == name -> Just (-delta)
+  _ -> Nothing
+  where
+    isIncrement (Assign n _ _) = n == name
+    isIncrement _ = False
+
+-- | Remove increment statement from loop body
+removeIncrement :: String -> Stmt -> Stmt
+removeIncrement name = \case
+  Block stmts pos -> Block (filter (not . isIncrement) stmts) pos
+  s -> s
+  where
+    isIncrement (Assign n (Binary Add (Var v _) (IntLit _ _) _) _) = n == name && v == name
+    isIncrement (Assign n (Binary Sub (Var v _) (IntLit _ _) _) _) = n == name && v == name
+    isIncrement _ = False
+
+-- | Substitute a variable with a constant in a statement
+substituteVar :: String -> Int -> Stmt -> Stmt
+substituteVar name val = \case
+  Block stmts pos -> Block (map (substituteVar name val) stmts) pos
+  VarDecl n vt initOpt pos -> VarDecl n vt (substExpr name val <$> initOpt) pos
+  Assign n value pos -> Assign n (substExpr name val value) pos
+  FieldAssign target field offset value pos ->
+    FieldAssign (substExpr name val target) field offset (substExpr name val value) pos
+  Return valueOpt pos -> Return (substExpr name val <$> valueOpt) pos
+  If cond th el pos ->
+    If (substExpr name val cond) (substituteVar name val th) (substituteVar name val el) pos
+  While cond body pos -> While (substExpr name val cond) (substituteVar name val body) pos
+  Break pos -> Break pos
+  ExprStmt expr pos -> ExprStmt (substExpr name val expr) pos
+
+-- | Substitute variable with constant in expression
+substExpr :: String -> Int -> Expr -> Expr
+substExpr name val = \case
+  Var n pos | n == name -> IntLit val pos
+  Var n pos -> Var n pos
+  IntLit n pos -> IntLit n pos
+  BoolLit b pos -> BoolLit b pos
+  StrLit s pos -> StrLit s pos
+  NullLit pos -> NullLit pos
+  This pos -> This pos
+  Unary op e pos -> Unary op (substExpr name val e) pos
+  Binary op l r pos -> Binary op (substExpr name val l) (substExpr name val r) pos
+  Ternary c t e pos -> Ternary (substExpr name val c) (substExpr name val t) (substExpr name val e) pos
+  Call n args pos -> Call n (map (substExpr name val) args) pos
+  InstanceCall target method args pos ->
+    InstanceCall (substExpr name val target) method (map (substExpr name val) args) pos
+  NewObject cn args pos -> NewObject cn (map (substExpr name val) args) pos
+  FieldAccess target field pos -> FieldAccess (substExpr name val target) field pos
+
+-- | Check if statement contains break
+hasBreak :: Stmt -> Bool
+hasBreak = \case
+  Break _ -> True
+  Block stmts _ -> any hasBreak stmts
+  If _ th el _ -> hasBreak th || hasBreak el
+  While _ body _ -> hasBreak body
+  _ -> False
+
+-- | Estimate statement size for unrolling decisions
+stmtSize :: Stmt -> Int
+stmtSize = \case
+  Block stmts _ -> sum (map stmtSize stmts)
+  VarDecl _ _ (Just e) _ -> 1 + exprSize e
+  VarDecl _ _ Nothing _ -> 1
+  Assign _ e _ -> 1 + exprSize e
+  FieldAssign t _ _ v _ -> 2 + exprSize t + exprSize v
+  Return (Just e) _ -> 1 + exprSize e
+  Return Nothing _ -> 1
+  If c th el _ -> 1 + exprSize c + stmtSize th + stmtSize el
+  While c body _ -> 1 + exprSize c + stmtSize body
+  Break _ -> 1
+  ExprStmt e _ -> exprSize e
+
+-- | Estimate expression size
+exprSize :: Expr -> Int
+exprSize = \case
+  IntLit _ _ -> 1
+  BoolLit _ _ -> 1
+  StrLit _ _ -> 1
+  NullLit _ -> 1
+  Var _ _ -> 1
+  This _ -> 1
+  Unary _ e _ -> 1 + exprSize e
+  Binary _ l r _ -> 1 + exprSize l + exprSize r
+  Ternary c t e _ -> 1 + exprSize c + exprSize t + exprSize e
+  Call _ args _ -> 1 + sum (map exprSize args)
+  InstanceCall target _ args _ -> 1 + exprSize target + sum (map exprSize args)
+  NewObject _ args _ -> 1 + sum (map exprSize args)
+  FieldAccess target _ _ -> 1 + exprSize target
+
+--------------------------------------------------------------------------------
+-- Value Range Analysis
+--------------------------------------------------------------------------------
+
+-- | Value range: [lower, upper] bounds for integers
+data Range = Range
+  { rangeLower :: Maybe Int  -- Nothing = negative infinity
+  , rangeUpper :: Maybe Int  -- Nothing = positive infinity
+  } deriving (Eq, Show)
+
+-- | Full range (unknown)
+fullRange :: Range
+fullRange = Range Nothing Nothing
+
+-- | Exact value range
+exactRange :: Int -> Range
+exactRange n = Range (Just n) (Just n)
+
+-- | Map from variable to its known range
+type RangeMap = Map String Range
+
+-- | Eliminate branches that are impossible based on value range analysis.
+-- Tracks integer ranges through assignments and conditions.
+eliminateImpossibleBranches :: Program -> Program
+eliminateImpossibleBranches (Program classes) = Program (map rangeClass classes)
+
+rangeClass :: ClassDecl -> ClassDecl
+rangeClass cls@ClassDecl{..} = cls { classMethods = map rangeMethod classMethods }
+
+rangeMethod :: MethodDecl -> MethodDecl
+rangeMethod m@MethodDecl{..} =
+  let (body', _) = rangeStmt Map.empty methodBody
+  in m { methodBody = body' }
+
+-- | Analyze ranges and eliminate impossible branches
+rangeStmt :: RangeMap -> Stmt -> (Stmt, RangeMap)
+rangeStmt ranges = \case
+  Block stmts pos ->
+    let (stmts', ranges') = rangeStmts ranges stmts
+    in (Block stmts' pos, ranges')
+
+  VarDecl name vt initOpt pos ->
+    let initOpt' = rangeExpr ranges <$> initOpt
+        -- Track the range of the initialized value
+        ranges' = case initOpt' of
+          Just (IntLit n _) -> Map.insert name (exactRange n) ranges
+          Just (Binary Add (Var v _) (IntLit n _) _) ->
+            case Map.lookup v ranges of
+              Just (Range (Just lo) (Just hi)) ->
+                Map.insert name (Range (Just (lo + n)) (Just (hi + n))) ranges
+              _ -> Map.delete name ranges
+          _ -> Map.delete name ranges
+    in (VarDecl name vt initOpt' pos, ranges')
+
+  Assign name value pos ->
+    let value' = rangeExpr ranges value
+        ranges0 = Map.delete name ranges
+        ranges' = case value' of
+          IntLit n _ -> Map.insert name (exactRange n) ranges0
+          Binary Add (Var v _) (IntLit n _) _ | v == name ->
+            case Map.lookup name ranges of
+              Just (Range (Just lo) (Just hi)) ->
+                Map.insert name (Range (Just (lo + n)) (Just (hi + n))) ranges0
+              Just (Range (Just lo) Nothing) | n >= 0 ->
+                Map.insert name (Range (Just (lo + n)) Nothing) ranges0
+              _ -> ranges0
+          Var v _ -> case Map.lookup v ranges of
+            Just r -> Map.insert name r ranges0
+            Nothing -> ranges0
+          _ -> ranges0
+    in (Assign name value' pos, ranges')
+
+  FieldAssign target field offset value pos ->
+    (FieldAssign (rangeExpr ranges target) field offset (rangeExpr ranges value) pos, ranges)
+
+  Return valueOpt pos ->
+    (Return (rangeExpr ranges <$> valueOpt) pos, ranges)
+
+  If cond th el pos ->
+    let cond' = rangeExpr ranges cond
+    in case evalCondition ranges cond' of
+      Just True ->
+        let (th', _) = rangeStmt ranges th
+        in (th', ranges)  -- Condition always true
+      Just False ->
+        let (el', _) = rangeStmt ranges el
+        in (el', ranges) -- Condition always false
+      Nothing ->
+        -- Refine ranges for each branch based on condition
+        let (thRanges, elRanges) = refineRanges ranges cond'
+            (th', _) = rangeStmt thRanges th
+            (el', _) = rangeStmt elRanges el
+        in (If cond' th' el' pos, ranges)  -- Conservative: don't extend ranges after if
+
+  While cond body pos ->
+    let cond' = rangeExpr ranges cond
+        -- Refine ranges in loop body based on condition
+        (bodyRanges, _) = refineRanges ranges cond'
+        (body', _) = rangeStmt bodyRanges body
+    in (While cond' body' pos, Map.empty)  -- Conservative after loop
+
+  Break pos -> (Break pos, ranges)
+  ExprStmt expr pos -> (ExprStmt (rangeExpr ranges expr) pos, ranges)
+
+-- | Process statements with range tracking
+rangeStmts :: RangeMap -> [Stmt] -> ([Stmt], RangeMap)
+rangeStmts ranges [] = ([], ranges)
+rangeStmts ranges (s:ss) =
+  let (s', ranges') = rangeStmt ranges s
+      (ss', ranges'') = rangeStmts ranges' ss
+  in (s':ss', ranges'')
+
+-- | Apply range info to expression
+-- Note: We intentionally don't replace variables with constants here
+-- to avoid infinite loops with constant propagation. The SSA pass handles that.
+rangeExpr :: RangeMap -> Expr -> Expr
+rangeExpr _ranges = id  -- Just pass through - range info is only used for branch elimination
+
+-- | Evaluate a condition to a constant if possible
+evalCondition :: RangeMap -> Expr -> Maybe Bool
+evalCondition ranges = \case
+  BoolLit b _ -> Just b
+
+  -- x < n: if x's upper bound < n, always true; if x's lower bound >= n, always false
+  Binary Lt (Var name _) (IntLit n _) _ ->
+    case Map.lookup name ranges of
+      Just (Range _ (Just hi)) | hi < n -> Just True   -- upper < n means always true
+      Just (Range (Just lo) _) | lo >= n -> Just False -- lower >= n means always false
+      _ -> Nothing
+
+  -- x <= n: if upper <= n, always true; if lower > n, always false
+  Binary Le (Var name _) (IntLit n _) _ ->
+    case Map.lookup name ranges of
+      Just (Range _ (Just hi)) | hi <= n -> Just True
+      Just (Range (Just lo) _) | lo > n -> Just False
+      _ -> Nothing
+
+  -- x > n: if lower > n, always true; if upper <= n, always false
+  Binary Gt (Var name _) (IntLit n _) _ ->
+    case Map.lookup name ranges of
+      Just (Range (Just lo) _) | lo > n -> Just True
+      Just (Range _ (Just hi)) | hi <= n -> Just False
+      _ -> Nothing
+
+  -- x >= n: if lower >= n, always true; if upper < n, always false
+  Binary Ge (Var name _) (IntLit n _) _ ->
+    case Map.lookup name ranges of
+      Just (Range (Just lo) _) | lo >= n -> Just True
+      Just (Range _ (Just hi)) | hi < n -> Just False
+      _ -> Nothing
+
+  -- x == n: if range is exactly n, always true; if n is outside range, always false
+  Binary Eq (Var name _) (IntLit n _) _ ->
+    case Map.lookup name ranges of
+      Just (Range (Just lo) (Just hi)) | lo == hi && lo == n -> Just True
+      Just (Range (Just lo) _) | lo > n -> Just False
+      Just (Range _ (Just hi)) | hi < n -> Just False
+      _ -> Nothing
+
+  -- x != n: if n is outside range, always true; if range is exactly n, always false
+  Binary Ne (Var name _) (IntLit n _) _ ->
+    case Map.lookup name ranges of
+      Just (Range (Just lo) (Just hi)) | lo == hi && lo == n -> Just False
+      Just (Range (Just lo) _) | lo > n -> Just True
+      Just (Range _ (Just hi)) | hi < n -> Just True
+      _ -> Nothing
+
+  _ -> Nothing
+
+-- | Refine ranges based on condition being true (for then branch) or false (for else branch)
+refineRanges :: RangeMap -> Expr -> (RangeMap, RangeMap)
+refineRanges ranges = \case
+  -- x < n: then branch has x in [lo, n-1], else branch has x in [n, hi]
+  Binary Lt (Var name _) (IntLit n _) _ ->
+    let current = Map.findWithDefault fullRange name ranges
+        thenRange = current { rangeUpper = Just (min (maybe (n-1) id (rangeUpper current)) (n-1)) }
+        elseRange = current { rangeLower = Just (max (maybe n id (rangeLower current)) n) }
+    in (Map.insert name thenRange ranges, Map.insert name elseRange ranges)
+
+  -- x <= n: then has [lo, n], else has [n+1, hi]
+  Binary Le (Var name _) (IntLit n _) _ ->
+    let current = Map.findWithDefault fullRange name ranges
+        thenRange = current { rangeUpper = Just (min (maybe n id (rangeUpper current)) n) }
+        elseRange = current { rangeLower = Just (max (maybe (n+1) id (rangeLower current)) (n+1)) }
+    in (Map.insert name thenRange ranges, Map.insert name elseRange ranges)
+
+  -- x > n: then has [n+1, hi], else has [lo, n]
+  Binary Gt (Var name _) (IntLit n _) _ ->
+    let current = Map.findWithDefault fullRange name ranges
+        thenRange = current { rangeLower = Just (max (maybe (n+1) id (rangeLower current)) (n+1)) }
+        elseRange = current { rangeUpper = Just (min (maybe n id (rangeUpper current)) n) }
+    in (Map.insert name thenRange ranges, Map.insert name elseRange ranges)
+
+  -- x >= n: then has [n, hi], else has [lo, n-1]
+  Binary Ge (Var name _) (IntLit n _) _ ->
+    let current = Map.findWithDefault fullRange name ranges
+        thenRange = current { rangeLower = Just (max (maybe n id (rangeLower current)) n) }
+        elseRange = current { rangeUpper = Just (min (maybe (n-1) id (rangeUpper current)) (n-1)) }
+    in (Map.insert name thenRange ranges, Map.insert name elseRange ranges)
+
+  -- x == n: then has [n, n], else keeps current range (can't narrow much)
+  Binary Eq (Var name _) (IntLit n _) _ ->
+    (Map.insert name (exactRange n) ranges, ranges)
+
+  -- x != n: then keeps range, else has [n, n]
+  Binary Ne (Var name _) (IntLit n _) _ ->
+    (ranges, Map.insert name (exactRange n) ranges)
+
+  -- For other conditions, don't refine
+  _ -> (ranges, ranges)

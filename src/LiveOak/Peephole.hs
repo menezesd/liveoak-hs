@@ -471,8 +471,58 @@ peepholePass = \case
   -- result; ISNIL; ISNIL; JUMPC L is "jump if true"
   -- We can sometimes merge these
 
+  -- Note: PUSHIMM a : PUSHIMM b : EQUAL patterns already handled by constant folding
+
+  -- Remove no-op stores followed by loads: store n; load n; drop
+  (STOREOFF n : PUSHOFF m : ADDSP (-1) : rest) | n == m -> STOREOFF n : peepholePass rest
+
+  -- Boolean short-circuit: DUP; check; JUMPC L; drop -> if top is 0, jump
+  (DUP : ISNIL : JUMPC lbl : ADDSP (-1) : rest) ->
+    DUP : JUMPC lbl : ADDSP (-1) : peepholePass rest  -- Short-circuit: if zero, jump
+
+  -- Reduce stack depth: swap back adjacent loads
+  (PUSHOFF a : PUSHOFF b : SWAP : rest) -> PUSHOFF b : PUSHOFF a : peepholePass rest
+
+  -- DUP followed by drop of multiple values
+  (DUP : ADDSP n : rest) | n <= -2 -> ADDSP (n + 1) : peepholePass rest
+
+  -- Dead code after unconditional RST (until next label)
+  (RST : Label l : rest) -> RST : Label l : peepholePass rest
+  (RST : x : rest) | not (isControlFlow x) -> RST : peepholePass (dropUntilControl rest)
+
+  -- Consecutive jumps to same label: only need one JUMPC check
+  (JUMPC lbl1 : JUMPC lbl2 : rest) | lbl1 == lbl2 -> JUMPC lbl1 : peepholePass rest
+
+  -- PUSHIMM 0; LESS is always false (nothing is less than 0 for unsigned)
+  -- Actually in SAM integers are signed, so skip this
+
+  -- Optimize: PUSHIMM k; ADD; PUSHIMM j; ADD -> PUSHIMM (k+j); ADD
+  (PUSHIMM k : ADD : PUSHIMM j : ADD : rest) -> PUSHIMM (k + j) : ADD : peepholePass rest
+  (PUSHIMM k : SUB : PUSHIMM j : SUB : rest) -> PUSHIMM (k + j) : SUB : peepholePass rest
+
+  -- Optimize: PUSHIMM k; TIMES; PUSHIMM j; TIMES -> PUSHIMM (k*j); TIMES
+  (PUSHIMM k : TIMES : PUSHIMM j : TIMES : rest) | k * j /= 0 ->
+    PUSHIMM (k * j) : TIMES : peepholePass rest
+
   -- Default: keep instruction and continue
   (x : rest) -> x : peepholePass rest
+
+-- | Check if instruction is control flow
+isControlFlow :: SamInstr -> Bool
+isControlFlow (Label _) = True
+isControlFlow (JUMP _) = True
+isControlFlow (JUMPC _) = True
+isControlFlow JSR {} = True
+isControlFlow RST = True
+isControlFlow STOP = True
+isControlFlow _ = False
+
+-- | Drop instructions until we see control flow
+dropUntilControl :: [SamInstr] -> [SamInstr]
+dropUntilControl [] = []
+dropUntilControl (i : rest)
+  | isControlFlow i = i : rest
+  | otherwise = dropUntilControl rest
 
 --------------------------------------------------------------------------------
 -- Stack Slot Coalescing (CFG-aware)

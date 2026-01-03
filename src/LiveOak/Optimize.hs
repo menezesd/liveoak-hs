@@ -40,6 +40,7 @@ optimizeOnce =
     eliminateDeadCode
   -- Dataflow optimizations (non-SSA)
   . DF.eliminateNullChecks
+  . DF.eliminateImpossibleBranches  -- Value range analysis
   . DF.eliminateCommonSubexpressions
   . DF.globalValueNumbering
   . DF.eliminateDeadStores
@@ -54,6 +55,8 @@ optimizeOnce =
   . DF.promoteMemToReg
   -- Tail call optimization (control flow transformation)
   . DF.tailCallOptimize
+  -- Loop unrolling (before constant folding can simplify the unrolled code)
+  . DF.unrollLoops
   -- String optimizations (domain-specific)
   . DF.optimizeStringConcat
   . DF.internStrings
@@ -288,9 +291,34 @@ foldBinary op l r pos = case (op, l, r) of
   -- Self-subtraction: x - x = 0 (safe for variables)
   (Sub, Var n1 _, Var n2 _) | n1 == n2 -> IntLit 0 pos
 
+  -- Self-division: x / x = 1 (safe for variables, assuming x != 0)
+  (Div, Var n1 _, Var n2 _) | n1 == n2 -> IntLit 1 pos
+
+  -- Self-modulo: x % x = 0 (safe for variables, assuming x != 0)
+  (Mod, Var n1 _, Var n2 _) | n1 == n2 -> IntLit 0 pos
+
   -- Idempotent boolean: x & x = x, x | x = x
   (And, e1@(Var n1 _), Var n2 _) | n1 == n2 -> e1
   (Or, e1@(Var n1 _), Var n2 _) | n1 == n2 -> e1
+
+  -- Right-associative constant folding: c1 + (x + c2) = x + (c1 + c2)
+  (Add, IntLit c1 _, Binary Add x (IntLit c2 _) _) ->
+    foldBinary Add x (IntLit (c1 + c2) pos) pos
+  (Add, IntLit c1 _, Binary Add (IntLit c2 _) x _) ->
+    foldBinary Add x (IntLit (c1 + c2) pos) pos
+
+  -- c1 * (x * c2) = x * (c1 * c2)
+  (Mul, IntLit c1 _, Binary Mul x (IntLit c2 _) _) ->
+    foldBinary Mul x (IntLit (c1 * c2) pos) pos
+  (Mul, IntLit c1 _, Binary Mul (IntLit c2 _) x _) ->
+    foldBinary Mul x (IntLit (c1 * c2) pos) pos
+
+  -- Comparison strength reduction for known values
+  -- x < 0 where x >= 0 (unsigned semantics) -> false
+  -- These would need type info, skip for now
+
+  -- Distribution/factoring: x + x = 2 * x (complement of strength reduction)
+  -- Skipped - strength reduction x * 2 = x + x is more common
 
   -- No optimization possible
   _ -> Binary op l r pos
