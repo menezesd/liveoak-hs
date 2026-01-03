@@ -16,6 +16,7 @@ module LiveOak.Sam
   ) where
 
 import Control.Monad (when)
+import Data.Bits (shiftL, shiftR)
 import Data.Char (ord)
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IM
@@ -55,6 +56,7 @@ data SamInstr
   | SWAP
   | ADDSP !Int
   | ADD | SUB | TIMES | DIV | MOD
+  | LSHIFT !Int | LSHIFTIND | RSHIFT !Int | RSHIFTIND
   | EQUAL | LESS | GREATER | CMP
   | ISNIL | ISNEG | ISPOS
   | AND | OR | NOT
@@ -157,6 +159,22 @@ parseOp op args = case op of
   "TIMES"   -> Right TIMES
   "DIV"     -> Right DIV
   "MOD"     -> Right MOD
+
+  "LSHIFT" -> case args of
+    [n] -> case readInt n of
+      Just i  -> Right $ LSHIFT i
+      Nothing -> Left $ ParseError $ "Invalid integer: " ++ T.unpack n
+    _ -> Left $ ParseError "LSHIFT requires one argument"
+
+  "LSHIFTIND" -> Right LSHIFTIND
+
+  "RSHIFT" -> case args of
+    [n] -> case readInt n of
+      Just i  -> Right $ RSHIFT i
+      Nothing -> Left $ ParseError $ "Invalid integer: " ++ T.unpack n
+    _ -> Left $ ParseError "RSHIFT requires one argument"
+
+  "RSHIFTIND" -> Right RSHIFTIND
   "EQUAL"   -> Right EQUAL
   "LESS"    -> Right LESS
   "GREATER" -> Right GREATER
@@ -394,6 +412,28 @@ execInstr instr st = case instr of
     (a, st2) <- popInt st1
     when (b == 0) $ Left DivisionByZero
     Right $ push (SamInt (a `mod` b)) st2 { samPC = samPC st + 1 }
+
+  -- Shift left by immediate operand
+  LSHIFT n -> do
+    (v, st') <- popInt st
+    Right $ push (SamInt $ v `shiftL` n) st' { samPC = samPC st + 1 }
+
+  -- Shift left by value on stack (second input << first input)
+  LSHIFTIND -> do
+    (n, st1) <- popInt st
+    (v, st2) <- popInt st1
+    Right $ push (SamInt $ v `shiftL` n) st2 { samPC = samPC st + 1 }
+
+  -- Shift right by immediate operand (signed/arithmetic shift)
+  RSHIFT n -> do
+    (v, st') <- popInt st
+    Right $ push (SamInt $ v `shiftR` n) st' { samPC = samPC st + 1 }
+
+  -- Shift right by value on stack (second input >> first input, signed)
+  RSHIFTIND -> do
+    (n, st1) <- popInt st
+    (v, st2) <- popInt st1
+    Right $ push (SamInt $ v `shiftR` n) st2 { samPC = samPC st + 1 }
 
   EQUAL -> comparisonOp (==) st
   LESS -> comparisonOp (<) st

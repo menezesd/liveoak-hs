@@ -22,6 +22,7 @@ module LiveOak.Codegen
 
 import Control.Monad (forM_, when)
 import Control.Monad.State.Strict
+import Data.Bits ((.&.), shiftR)
 import Control.Monad.Reader
 import Control.Monad.Except
 import Data.Text (Text)
@@ -346,6 +347,17 @@ emitExpr = \case
     case op of
       And -> emitShortCircuitAnd left right
       Or  -> emitShortCircuitOr left right
+      -- Strength reduction: multiply by power of 2 -> shift
+      Mul | Just n <- isPowerOf2 right -> do
+        emitExpr left
+        emit $ "LSHIFT " <> tshow n <> "\n"
+      Mul | Just n <- isPowerOf2 left -> do
+        emitExpr right
+        emit $ "LSHIFT " <> tshow n <> "\n"
+      -- Strength reduction: divide by power of 2 -> shift right
+      Div | Just n <- isPowerOf2 right -> do
+        emitExpr left
+        emit $ "RSHIFT " <> tshow n <> "\n"
       _   -> do
         emitExpr left
         emitExpr right
@@ -895,3 +907,14 @@ escapeString = concatMap escapeChar
     escapeChar '\t' = "\\t"
     escapeChar '\r' = "\\r"
     escapeChar c    = [c]
+
+-- | Check if an expression is a power of 2, returning the shift amount.
+-- Returns Just n if expr == 2^n (where n >= 1), Nothing otherwise.
+isPowerOf2 :: Expr -> Maybe Int
+isPowerOf2 (IntLit n _)
+  | n > 0 && (n .&. (n - 1)) == 0 = Just (log2 n)
+  | otherwise = Nothing
+  where
+    log2 1 = 0
+    log2 x = 1 + log2 (x `shiftR` 1)
+isPowerOf2 _ = Nothing

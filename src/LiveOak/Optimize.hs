@@ -54,12 +54,6 @@ optimizeOnce =
   . DF.eliminateDeadParams
   . DF.escapeAnalysis
   . DF.promoteMemToReg
-  -- Interprocedural optimizations
-  -- NOTE: These optimizations are disabled:
-  -- - eliminateUnusedMethods: requires type info for InstanceCall
-  -- - eliminateUnusedFields: requires type info for field access
-  -- - devirtualize: not needed (no virtual functions in LiveOak)
-  -- - interproceduralConstProp: issues with string literal substitution
   -- Tail call optimization (control flow transformation)
   . DF.tailCallOptimize
   -- Loop optimizations
@@ -269,9 +263,7 @@ foldBinary op l r pos = case (op, l, r) of
   -- Modulo by 1: x % 1 = 0
   (Mod, _, IntLit 1 _) -> IntLit 0 pos
 
-  -- Strength reduction: x * 2 = x + x
-  (Mul, e, IntLit 2 _) -> Binary Add e e pos
-  (Mul, IntLit 2 _, e) -> Binary Add e e pos
+  -- Note: power-of-2 multiplication is handled in codegen with LSHIFT
 
   -- Self-comparison: x = x is always true, x != x is always false
   -- (Only safe for variables, not expressions with side effects)

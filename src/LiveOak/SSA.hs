@@ -1005,13 +1005,6 @@ foldBinaryExpr op l r p = case (op, l, r) of
   (Lt, Var a _, Var b _) | a == b -> BoolLit False p -- x < x
   (Gt, Var a _, Var b _) | a == b -> BoolLit False p -- x > x
 
-  -- Strength reduction: multiply by power of 2 -> repeated addition
-  -- SAM doesn't have shift, but x * 2 = x + x is still faster
-  (Mul, e, IntLit 2 _) -> Binary Add e e p           -- x * 2 = x + x
-  (Mul, IntLit 2 _, e) -> Binary Add e e p           -- 2 * x = x + x
-
-  -- Strength reduction: multiply by small constants
-  (Mul, e, IntLit 3 _) -> Binary Add (Binary Add e e p) e p  -- x * 3 = x + x + x
-  (Mul, IntLit 3 _, e) -> Binary Add (Binary Add e e p) e p
+  -- Note: power-of-2 multiplication is handled in codegen with LSHIFT
 
   _ -> Binary op l r p

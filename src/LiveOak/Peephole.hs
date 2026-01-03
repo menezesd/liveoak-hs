@@ -36,6 +36,10 @@ data SamInstr
   | TIMES
   | DIV
   | MOD
+  | LSHIFT Int
+  | LSHIFTIND
+  | RSHIFT Int
+  | RSHIFTIND
   | AND
   | OR
   | EQUAL
@@ -88,6 +92,10 @@ parseInstr txt = case T.words txt of
   ["TIMES"] -> Just TIMES
   ["DIV"] -> Just DIV
   ["MOD"] -> Just MOD
+  ["LSHIFT", n] -> Just $ LSHIFT (readInt n)
+  ["LSHIFTIND"] -> Just LSHIFTIND
+  ["RSHIFT", n] -> Just $ RSHIFT (readInt n)
+  ["RSHIFTIND"] -> Just RSHIFTIND
   ["AND"] -> Just AND
   ["OR"] -> Just OR
   ["EQUAL"] -> Just EQUAL
@@ -133,6 +141,10 @@ emitInstr = \case
   TIMES -> "TIMES"
   DIV -> "DIV"
   MOD -> "MOD"
+  LSHIFT n -> "LSHIFT " <> tshow n
+  LSHIFTIND -> "LSHIFTIND"
+  RSHIFT n -> "RSHIFT " <> tshow n
+  RSHIFTIND -> "RSHIFTIND"
   AND -> "AND"
   OR -> "OR"
   EQUAL -> "EQUAL"
