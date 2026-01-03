@@ -15,9 +15,10 @@ import System.IO.Unsafe (unsafePerformIO)
 import LiveOak.Types
 import LiveOak.Ast
 import LiveOak.Parser (parseProgram)
-import LiveOak.Peephole (parseSam, optimize, SamInstr(..))
+import LiveOak.Peephole (parseSam, optimize, emitSam, SamInstr(..))
 import qualified LiveOak.Optimize as Opt
 import LiveOak.Compiler (compile)
+import LiveOak.Sam (runSamText)
 
 -- | All property-based tests
 propertyTests :: TestTree
@@ -38,6 +39,18 @@ propertyTests = localOption (QuickCheckTests 100) $ testGroup "Property Tests"
       ]
   , testGroup "Compiler"
       [ testProperty "valid minimal programs compile" prop_minimalProgramCompiles
+      ]
+  , testGroup "Optimization Equivalence"
+      [ testProperty "optimized code produces same result" prop_optimizationPreservesSemantics
+      ]
+  , testGroup "Round-trip"
+      [ testProperty "SAM parse-emit-parse is identity" prop_samRoundTrip
+      ]
+  , testGroup "Stress Tests"
+      [ localOption (QuickCheckTests 50) $
+          testProperty "large programs compile" prop_largeProgramsCompile
+      , localOption (QuickCheckTests 50) $
+          testProperty "deeply nested expressions don't crash" prop_deepNesting
       ]
   ]
 
@@ -351,3 +364,235 @@ genMinimalProgram = do
     , "  }"
     , "}"
     ]
+
+--------------------------------------------------------------------------------
+-- Optimization Equivalence
+--------------------------------------------------------------------------------
+
+-- | Optimized and unoptimized code should produce the same result
+prop_optimizationPreservesSemantics :: Property
+prop_optimizationPreservesSemantics = forAll genExecutableProgram $ \code ->
+  case compile "test" code of
+    Left _ -> discard  -- Skip programs that don't compile
+    Right samCode ->
+      let optimizedSam = emitSam (optimize (parseSam samCode))
+          unoptResult = runSamText samCode
+          optResult = runSamText optimizedSam
+      in case (unoptResult, optResult) of
+        (Right v1, Right v2) -> v1 === v2
+        (Left _, Left _) -> property True  -- Both error is ok
+        _ -> property False  -- One succeeds, one fails = bad
+
+-- | Generate a program that is guaranteed to compile and execute
+genExecutableProgram :: Gen Text
+genExecutableProgram = do
+  -- Generate a simple arithmetic expression
+  expr <- genArithExpr
+  return $ T.unlines
+    [ "class Main() {"
+    , "  int main() {"
+    , "    { return " <> expr <> "; }"
+    , "  }"
+    , "}"
+    ]
+
+-- | Generate arithmetic expressions that are safe to execute
+genArithExpr :: Gen Text
+genArithExpr = sized $ \n ->
+  if n <= 0
+    then T.pack . show <$> choose (0, 100 :: Int)
+    else oneof
+      [ T.pack . show <$> choose (0, 100 :: Int)
+      , do
+          left <- resize (n `div` 2) genArithExpr
+          right <- resize (n `div` 2) genArithExpr
+          op <- elements ["+", "-", "*"]  -- No division to avoid div by zero
+          return $ "(" <> left <> " " <> op <> " " <> right <> ")"
+      ]
+
+--------------------------------------------------------------------------------
+-- Round-trip Testing
+--------------------------------------------------------------------------------
+
+-- | Parse -> Emit -> Parse should give the same result
+prop_samRoundTrip :: Property
+prop_samRoundTrip = forAll genValidSamCode $ \code ->
+  let parsed1 = parseSam code
+      emitted = emitSam parsed1
+      parsed2 = parseSam emitted
+  in parsed1 === parsed2
+
+-- | Generate valid SAM code (well-formed labels)
+genValidSamCode :: Gen Text
+genValidSamCode = do
+  len <- choose (1, 15 :: Int)
+  -- Generate some labels first so we can reference them
+  numLabels <- choose (0, 3 :: Int)
+  labels <- vectorOf numLabels $ do
+    n <- choose (0, 10 :: Int)
+    return $ "label_" <> T.pack (show n)
+  -- Generate instructions that may reference these labels
+  instrs <- vectorOf len (genValidSamInstr labels)
+  -- Add the label definitions
+  labelDefs <- mapM (\l -> return $ l <> ":") labels
+  return $ T.unlines (labelDefs ++ instrs)
+
+genValidSamInstr :: [Text] -> Gen Text
+genValidSamInstr labels = oneof $
+  [ do n <- choose (0, 100 :: Int); return $ "PUSHIMM " <> T.pack (show n)
+  , do n <- choose (0, 5 :: Int); return $ "PUSHOFF " <> T.pack (show n)
+  , do n <- choose (0, 5 :: Int); return $ "STOREOFF " <> T.pack (show n)
+  , do n <- choose (-2, 2 :: Int); return $ "ADDSP " <> T.pack (show n)
+  , return "ADD"
+  , return "SUB"
+  , return "TIMES"
+  , return "DUP"
+  , return "SWAP"
+  , return "EQUAL"
+  , return "LESS"
+  , return "LINK"
+  , return "UNLINK"
+  ] ++
+  -- Only add jump instructions if we have labels to jump to
+  (if null labels then [] else
+    [ do lbl <- elements labels; return $ "JUMP " <> lbl
+    , do lbl <- elements labels; return $ "JUMPC " <> lbl
+    , do lbl <- elements labels; return $ "JSR " <> lbl
+    ])
+
+--------------------------------------------------------------------------------
+-- Stress Tests
+--------------------------------------------------------------------------------
+
+-- | Large programs with multiple classes and methods should compile
+prop_largeProgramsCompile :: Property
+prop_largeProgramsCompile = forAll genLargeProgram $ \code ->
+  case compile "stress" code of
+    Left _ -> discard  -- Some generated programs may have type errors, skip them
+    Right _ -> property True
+
+-- | Generate a large program with multiple classes
+genLargeProgram :: Gen Text
+genLargeProgram = do
+  -- Generate 2-5 helper classes
+  numClasses <- choose (2, 5 :: Int)
+  helperClasses <- vectorOf numClasses genHelperClass
+  -- Always include Main class
+  mainClass <- genMainClass
+  return $ T.unlines (helperClasses ++ [mainClass])
+
+genHelperClass :: Gen Text
+genHelperClass = do
+  name <- genClassName
+  numFields <- choose (0, 3 :: Int)
+  fields <- vectorOf numFields genTypedField
+  numMethods <- choose (1, 3 :: Int)
+  methods <- vectorOf numMethods (genTypedMethod name)
+  return $ T.unlines
+    [ "class " <> name <> "(" <> T.intercalate " " fields <> ") {"
+    , T.unlines methods
+    , "}"
+    ]
+
+genMainClass :: Gen Text
+genMainClass = do
+  numLocals <- choose (0, 5 :: Int)
+  locals <- vectorOf numLocals genLocalDecl
+  computation <- genComputation
+  return $ T.unlines
+    [ "class Main() {"
+    , "  int main() {"
+    , "    {"
+    , T.unlines (map ("      " <>) locals)
+    , "      return " <> computation <> ";"
+    , "    }"
+    , "  }"
+    , "}"
+    ]
+
+genClassName :: Gen Text
+genClassName = do
+  suffix <- choose (1, 100 :: Int)
+  return $ "Helper" <> T.pack (show suffix)
+
+genTypedField :: Gen Text
+genTypedField = do
+  typ <- elements ["int", "bool"]
+  name <- genVarName
+  return $ typ <> " " <> name <> ";"
+
+genTypedMethod :: Text -> Gen Text
+genTypedMethod _className = do
+  retType <- elements ["int", "bool", "void"]
+  name <- genMethodName
+  body <- case retType of
+    "int" -> do
+      val <- choose (0, 100 :: Int)
+      return $ "return " <> T.pack (show val) <> ";"
+    "bool" -> do
+      val <- elements ["true", "false"]
+      return $ "return " <> val <> ";"
+    _ -> return ";"
+  return $ "  " <> retType <> " " <> name <> "() { { " <> body <> " } }"
+
+genLocalDecl :: Gen Text
+genLocalDecl = do
+  typ <- elements ["int", "bool"]
+  name <- genVarName
+  val <- case typ of
+    "int" -> T.pack . show <$> choose (0, 100 :: Int)
+    _ -> elements ["true", "false"]
+  return $ typ <> " " <> name <> "; " <> name <> " = " <> val <> ";"
+
+genComputation :: Gen Text
+genComputation = sized $ \n ->
+  if n <= 0
+    then T.pack . show <$> choose (0, 100 :: Int)
+    else oneof
+      [ T.pack . show <$> choose (0, 100 :: Int)
+      , do
+          left <- resize (n `div` 2) genComputation
+          right <- resize (n `div` 2) genComputation
+          op <- elements ["+", "-", "*"]
+          return $ "(" <> left <> " " <> op <> " " <> right <> ")"
+      ]
+
+genVarName :: Gen Text
+genVarName = do
+  n <- choose (1, 100 :: Int)
+  return $ "var" <> T.pack (show n)
+
+genMethodName :: Gen Text
+genMethodName = do
+  n <- choose (1, 100 :: Int)
+  return $ "method" <> T.pack (show n)
+
+-- | Deeply nested expressions should not crash the compiler
+prop_deepNesting :: Property
+prop_deepNesting = forAll genDeeplyNested $ \code ->
+  let result = unsafePerformIO $ try (evaluate (compile "deep" code))
+  in case result of
+    Left (_ :: SomeException) -> property False  -- Crashed
+    Right (Left _) -> discard  -- Type error, skip
+    Right (Right _) -> property True  -- Compiled successfully
+
+-- | Generate a program with deeply nested expressions
+genDeeplyNested :: Gen Text
+genDeeplyNested = do
+  depth <- choose (10, 30 :: Int)
+  expr <- genNestedExpr depth
+  return $ T.unlines
+    [ "class Main() {"
+    , "  int main() {"
+    , "    { return " <> expr <> "; }"
+    , "  }"
+    , "}"
+    ]
+
+genNestedExpr :: Int -> Gen Text
+genNestedExpr 0 = T.pack . show <$> choose (0, 10 :: Int)
+genNestedExpr n = do
+  inner <- genNestedExpr (n - 1)
+  op <- elements ["+", "-", "*"]
+  val <- choose (0, 10 :: Int)
+  return $ "(" <> inner <> " " <> op <> " " <> T.pack (show val) <> ")"
