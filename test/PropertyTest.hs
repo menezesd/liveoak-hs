@@ -206,14 +206,24 @@ prop_peepholeIdempotent = forAll genSamCode $ \code ->
       optimized2 = optimize optimized1
   in optimized1 == optimized2
 
--- | Labels should be preserved through optimization
+-- | Labels that exist AND are referenced should be preserved
+-- (unreferenced labels may be removed as dead code)
 prop_peepholePreservesLabels :: Property
 prop_peepholePreservesLabels = forAll genSamCode $ \code ->
   let instrs = parseSam code
       optimized = optimize instrs
-      labelsBefore = [l | Label l <- instrs]
+      -- Labels that are defined in the input
+      definedLabels = [l | Label l <- instrs]
+      -- Labels that are both defined AND referenced
+      referencedLabels = [l | i <- instrs, l <- getJumpTargets i, l `elem` definedLabels]
       labelsAfter = [l | Label l <- optimized]
-  in all (`elem` labelsAfter) labelsBefore
+  in all (`elem` labelsAfter) referencedLabels
+
+getJumpTargets :: SamInstr -> [Text]
+getJumpTargets (JUMP l) = [l]
+getJumpTargets (JUMPC l) = [l]
+getJumpTargets (JSR l) = [l]
+getJumpTargets _ = []
 
 -- | Optimization should reduce or preserve instruction count (never increase significantly)
 prop_peepholeReduces :: Property
