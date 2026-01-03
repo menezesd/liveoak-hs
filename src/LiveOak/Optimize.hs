@@ -74,21 +74,6 @@ optimizeOnce =
   -- Basic constant folding (algebraic simplifications)
   . constantFold
 
--- | Optimize via full SSA form (CFG-based).
--- Handles: copy propagation, constant propagation, dead code elimination, PRE.
--- NOTE: Currently disabled because fromSSA doesn't properly reconstruct
--- structured control flow from the CFG representation.
--- Use structuredSSAOpt instead which preserves the original AST structure.
-_optimizeViaCFGSSA :: Program -> Program
-_optimizeViaCFGSSA prog =
-  let ssa = SSA.toSSA prog
-      optimized = SSA.partialRedundancyElim
-                . SSA.ssaDeadCodeElim
-                . SSA.ssaCopyProp
-                . SSA.ssaConstantProp
-                $ ssa
-  in SSA.fromSSA optimized
-
 -- | Constant folding: evaluate constant expressions at compile time.
 constantFold :: Program -> Program
 constantFold (Program classes) = Program (map foldClass classes)
