@@ -1709,21 +1709,14 @@ unrollBlock (s1 : s2 : rest) = case (s1, s2) of
   _ -> unrollStmt s1 : unrollBlock (s2 : rest)
 
 -- | Try to unroll a while loop
+-- NOTE: We can only unroll loops where we know the initial value from context.
+-- The unrollBlock function handles init-then-loop patterns where init value is known.
+-- For standalone while loops without known init value, we just recurse into body.
 tryUnroll :: Expr -> Stmt -> Int -> Stmt
-tryUnroll cond body pos
-  -- Pattern: while (i < N) { body; i = i + 1; } with i starting at known value
-  | Just (loopVar, limit) <- getLoopBound cond
-  , Just increment <- getLoopIncrement loopVar body
-  , increment == 1
-  , limit > 0 && limit <= maxUnrollCount
-  , stmtSize body <= maxUnrollBodySize
-  , not (hasBreak body) =
-      let bodyWithoutIncr = removeIncrement loopVar body
-          -- We don't know initial value, so generate loop with smaller bound
-          -- or partial unroll. For now, just recurse into body.
-          unrolled = [substituteVar loopVar i bodyWithoutIncr | i <- [0..limit-1]]
-      in Block unrolled pos
-  | otherwise = While cond (unrollStmt body) pos
+tryUnroll cond body pos =
+  -- We don't know the initial value of the loop variable here, so we can't
+  -- safely unroll. The unrollBlock function handles cases where init is known.
+  While cond (unrollStmt body) pos
 
 -- | Extract loop bound from condition: i < N returns (i, N)
 getLoopBound :: Expr -> Maybe (String, Int)
@@ -1931,9 +1924,14 @@ rangeStmt ranges = \case
 
   While cond body pos ->
     let cond' = rangeExpr ranges cond
-        -- Refine ranges in loop body based on condition
-        (bodyRanges, _) = refineRanges ranges cond'
-        (body', _) = rangeStmt bodyRanges body
+        -- IMPORTANT: Variables modified in the loop may have any value after
+        -- the first iteration, so we must clear their ranges before analyzing
+        -- the loop body. Otherwise we might incorrectly eliminate branches.
+        modifiedVars = findModifiedVars body
+        bodyRanges = foldr Map.delete ranges modifiedVars
+        -- Refine ranges based on condition (only applies to unmodified vars)
+        (bodyRanges', _) = refineRanges bodyRanges cond'
+        (body', _) = rangeStmt bodyRanges' body
     in (While cond' body' pos, Map.empty)  -- Conservative after loop
 
   Break pos -> (Break pos, ranges)
@@ -1946,6 +1944,19 @@ rangeStmts ranges (s:ss) =
   let (s', ranges') = rangeStmt ranges s
       (ss', ranges'') = rangeStmts ranges' ss
   in (s':ss', ranges'')
+
+-- | Find all variables that are assigned (modified) in a statement
+findModifiedVars :: Stmt -> [String]
+findModifiedVars = \case
+  Block stmts _ -> concatMap findModifiedVars stmts
+  VarDecl name _ _ _ -> [name]  -- Declaration counts as modification
+  Assign name _ _ -> [name]
+  FieldAssign _ _ _ _ _ -> []  -- Field assigns don't modify local vars
+  Return _ _ -> []
+  If _ th el _ -> findModifiedVars th ++ findModifiedVars el
+  While _ body _ -> findModifiedVars body
+  Break _ -> []
+  ExprStmt _ _ -> []
 
 -- | Apply range info to expression
 -- Note: We intentionally don't replace variables with constants here
