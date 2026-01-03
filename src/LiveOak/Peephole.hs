@@ -221,23 +221,16 @@ rewriteJump m instr = case instr of
   JSR lbl -> JSR (Map.findWithDefault lbl lbl m)
   _ -> instr
 
--- | Eliminate branch-to-branch patterns
--- When code following a conditional jump tests the same condition again,
--- we can simplify it.
+-- | Eliminate branch-to-branch patterns and optimize control flow
 eliminateBranchToBranch :: [SamInstr] -> [SamInstr]
-eliminateBranchToBranch = go
+eliminateBranchToBranch = removeJumpToNext
   where
-    go [] = []
-    -- Pattern: JUMPC L1; L1: JUMPC L2 -> JUMPC L2; L1: JUMPC L2
-    -- (condition was true, so second test is always true)
-    -- We can't eliminate the label, but we can note the pattern for later
-    go (JUMPC lbl1 : rest) =
-      let rest' = go rest
-      in JUMPC lbl1 : rest'
-
-    -- Pattern: After ISNIL; JUMPC, if we reach the target with a DUP before,
-    -- the duplicate is of a known-true value
-    go (x:rest) = x : go rest
+    -- Remove JUMP L when L is the next instruction
+    removeJumpToNext [] = []
+    removeJumpToNext [x] = [x]
+    removeJumpToNext (JUMP lbl : Label lbl' : rest)
+      | lbl == lbl' = Label lbl' : removeJumpToNext rest
+    removeJumpToNext (x : rest) = x : removeJumpToNext rest
 
 -- | Remove dead code after unconditional jumps (until next label).
 removeDeadCode :: [SamInstr] -> [SamInstr]
@@ -358,12 +351,6 @@ peepholePass = \case
   (JUMPC lbl : Label lbl' : rest) | lbl == lbl' -> ADDSP (-1) : Label lbl' : peepholePass rest
 
   -- Basic block optimizations:
-
-  -- Strength reduction: x * 4 = (x * 2) * 2 = (x + x) + (x + x)
-  (PUSHIMM 4 : TIMES : rest) -> DUP : ADD : DUP : ADD : peepholePass rest
-
-  -- Strength reduction: x * 8
-  (PUSHIMM 8 : TIMES : rest) -> DUP : ADD : DUP : ADD : DUP : ADD : peepholePass rest
 
   -- x / 2 using shift (integer division)
   -- Note: SAM doesn't have shift, so we keep DIV for now
@@ -505,6 +492,19 @@ peepholePass = \case
   -- Optimize: PUSHIMM k; TIMES; PUSHIMM j; TIMES -> PUSHIMM (k*j); TIMES
   (PUSHIMM k : TIMES : PUSHIMM j : TIMES : rest) | k * j /= 0 ->
     PUSHIMM (k * j) : TIMES : peepholePass rest
+
+  --------------------------------------------------------------------------------
+  -- Additional Peephole Patterns
+  --------------------------------------------------------------------------------
+
+  -- Commutative reordering: SWAP before commutative op is redundant
+  (SWAP : ADD : rest) -> ADD : peepholePass rest
+  (SWAP : TIMES : rest) -> TIMES : peepholePass rest
+  (SWAP : EQUAL : rest) -> EQUAL : peepholePass rest
+  (SWAP : AND : rest) -> AND : peepholePass rest
+  (SWAP : OR : rest) -> OR : peepholePass rest
+
+  -- SWAP before SUB changes sign: a; b; SWAP; SUB = b - a (keep as is, semantically different)
 
   -- Default: keep instruction and continue
   (x : rest) -> x : peepholePass rest
