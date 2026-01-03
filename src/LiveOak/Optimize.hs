@@ -47,15 +47,23 @@ optimizeOnce =
   . DF.loadStoreForwarding
   . DF.hoistLoopInvariants
   . DF.inlineSmallMethods
+  . DF.aggressiveInline
   -- Advanced optimizations
   . DF.sinkCode
   . DF.hoistCommonCode
   . DF.eliminateDeadParams
   . DF.escapeAnalysis
   . DF.promoteMemToReg
+  -- Interprocedural optimizations
+  -- NOTE: These optimizations are disabled:
+  -- - eliminateUnusedMethods: requires type info for InstanceCall
+  -- - eliminateUnusedFields: requires type info for field access
+  -- - devirtualize: not needed (no virtual functions in LiveOak)
+  -- - interproceduralConstProp: issues with string literal substitution
   -- Tail call optimization (control flow transformation)
   . DF.tailCallOptimize
-  -- Loop unrolling (before constant folding can simplify the unrolled code)
+  -- Loop optimizations
+  . DF.fuseLoops
   . DF.unrollLoops
   -- String optimizations (domain-specific)
   . DF.optimizeStringConcat

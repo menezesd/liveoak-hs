@@ -17,6 +17,13 @@ module LiveOak.DataFlow
   , inlineSmallMethods
   , eliminateDeadParams
   , tailCallOptimize
+  , aggressiveInline
+    -- * Interprocedural Optimizations
+  , interproceduralConstProp
+  , eliminateUnusedMethods
+  , eliminateUnusedFields
+  , devirtualize
+  , specializeFunction
     -- * Code Motion
   , hoistCommonCode
   , sinkCode
@@ -30,6 +37,8 @@ module LiveOak.DataFlow
   , optimizeStringConcat
     -- * Loop Optimizations
   , unrollLoops
+  , fuseLoops
+  , fissLoops
     -- * Range Analysis
   , eliminateImpossibleBranches
   ) where
@@ -2043,3 +2052,707 @@ refineRanges ranges = \case
 
   -- For other conditions, don't refine
   _ -> (ranges, ranges)
+
+--------------------------------------------------------------------------------
+-- Interprocedural Constant Propagation
+--------------------------------------------------------------------------------
+
+-- | Propagate constants across method boundaries.
+-- If a method is always called with the same constant argument,
+-- substitute that constant in the method body.
+interproceduralConstProp :: Program -> Program
+interproceduralConstProp prog@(Program classes) =
+  let -- Collect all call sites and their arguments
+      callInfo = collectCallInfo prog
+      -- Find parameters that are always passed the same constant
+      constParams = findConstantParams callInfo
+      -- Substitute constants into method bodies
+  in if Map.null constParams
+     then prog
+     else Program (map (ipcpClass constParams) classes)
+
+-- | Info about a call: (className, methodName, argIndex) -> set of values passed
+type CallInfo = Map (String, String, Int) (Set ConstValue)
+
+data ConstValue = CVInt Int | CVBool Bool | CVStr String | CVNull | CVUnknown
+  deriving (Eq, Ord, Show)
+
+-- | Collect information about all call sites
+collectCallInfo :: Program -> CallInfo
+collectCallInfo (Program classes) =
+  Map.unionsWith Set.union [collectClassCalls cls | cls <- classes]
+  where
+    collectClassCalls cls = Map.unionsWith Set.union
+      [collectMethodCalls (className cls) (methodBody m) | m <- classMethods cls]
+
+    collectMethodCalls clsName = collectStmtCalls
+      where
+        collectStmtCalls = \case
+          Block stmts _ -> Map.unionsWith Set.union (map collectStmtCalls stmts)
+          VarDecl _ _ (Just e) _ -> collectExprCalls e
+          Assign _ e _ -> collectExprCalls e
+          FieldAssign t _ _ v _ -> Map.unionWith Set.union (collectExprCalls t) (collectExprCalls v)
+          Return (Just e) _ -> collectExprCalls e
+          If c th el _ -> Map.unionsWith Set.union [collectExprCalls c, collectStmtCalls th, collectStmtCalls el]
+          While c body _ -> Map.unionWith Set.union (collectExprCalls c) (collectStmtCalls body)
+          ExprStmt e _ -> collectExprCalls e
+          _ -> Map.empty
+
+        collectExprCalls = \case
+          -- Local calls: use the current class name
+          Call name args _ ->
+            let argInfo = [((clsName, name, i), Set.singleton (exprToConst arg))
+                          | (i, arg) <- zip [0..] args]
+            in Map.unionsWith Set.union (Map.fromList argInfo : map collectExprCalls args)
+          InstanceCall target _method args _ ->
+            -- For instance calls, we'd need type info - skip for now
+            Map.unionsWith Set.union (collectExprCalls target : map collectExprCalls args)
+          NewObject cn args _ ->
+            let argInfo = [((cn, cn, i), Set.singleton (exprToConst arg))
+                          | (i, arg) <- zip [0..] args]
+            in Map.unionsWith Set.union (Map.fromList argInfo : map collectExprCalls args)
+          Binary _ l r _ -> Map.unionWith Set.union (collectExprCalls l) (collectExprCalls r)
+          Unary _ e _ -> collectExprCalls e
+          Ternary c t e _ -> Map.unionsWith Set.union [collectExprCalls c, collectExprCalls t, collectExprCalls e]
+          FieldAccess t _ _ -> collectExprCalls t
+          _ -> Map.empty
+
+    exprToConst = \case
+      IntLit n _ -> CVInt n
+      BoolLit b _ -> CVBool b
+      StrLit s _ -> CVStr s
+      NullLit _ -> CVNull
+      _ -> CVUnknown
+
+-- | Find parameters that are always passed the same constant
+findConstantParams :: CallInfo -> Map (String, String, Int) ConstValue
+findConstantParams = Map.mapMaybe getSingleConst
+  where
+    getSingleConst vals =
+      case Set.toList vals of
+        [cv] | cv /= CVUnknown -> Just cv
+        _ -> Nothing
+
+-- | Apply IPCP to a class
+ipcpClass :: Map (String, String, Int) ConstValue -> ClassDecl -> ClassDecl
+ipcpClass constParams cls@ClassDecl{..} =
+  cls { classMethods = map (ipcpMethod className constParams) classMethods }
+
+-- | Apply IPCP to a method
+ipcpMethod :: String -> Map (String, String, Int) ConstValue -> MethodDecl -> MethodDecl
+ipcpMethod clsName constParams m@MethodDecl{..} =
+  let -- Find which parameters of this method are constant
+      paramConsts = [(paramName p, cv)
+                    | (i, p) <- zip [0..] methodParams
+                    , Just cv <- [Map.lookup (clsName, methodName, i) constParams]]
+      substMap = Map.fromList paramConsts
+  in if Map.null substMap
+     then m
+     else m { methodBody = substConstants substMap methodBody }
+
+-- | Substitute constants for variables
+substConstants :: Map String ConstValue -> Stmt -> Stmt
+substConstants subst = \case
+  Block stmts pos -> Block (map (substConstants subst) stmts) pos
+  VarDecl name vt initOpt pos -> VarDecl name vt (substConstExpr subst <$> initOpt) pos
+  Assign name value pos -> Assign name (substConstExpr subst value) pos
+  FieldAssign target field offset value pos ->
+    FieldAssign (substConstExpr subst target) field offset (substConstExpr subst value) pos
+  Return valueOpt pos -> Return (substConstExpr subst <$> valueOpt) pos
+  If cond th el pos ->
+    If (substConstExpr subst cond) (substConstants subst th) (substConstants subst el) pos
+  While cond body pos -> While (substConstExpr subst cond) (substConstants subst body) pos
+  Break pos -> Break pos
+  ExprStmt expr pos -> ExprStmt (substConstExpr subst expr) pos
+
+substConstExpr :: Map String ConstValue -> Expr -> Expr
+substConstExpr subst = \case
+  Var name pos -> case Map.lookup name subst of
+    Just (CVInt n) -> IntLit n pos
+    Just (CVBool b) -> BoolLit b pos
+    Just (CVStr s) -> StrLit s pos
+    Just CVNull -> NullLit pos
+    _ -> Var name pos
+  Binary op l r pos -> Binary op (substConstExpr subst l) (substConstExpr subst r) pos
+  Unary op e pos -> Unary op (substConstExpr subst e) pos
+  Ternary c t e pos -> Ternary (substConstExpr subst c) (substConstExpr subst t) (substConstExpr subst e) pos
+  Call name args pos -> Call name (map (substConstExpr subst) args) pos
+  InstanceCall target method args pos ->
+    InstanceCall (substConstExpr subst target) method (map (substConstExpr subst) args) pos
+  NewObject cn args pos -> NewObject cn (map (substConstExpr subst) args) pos
+  FieldAccess target field pos -> FieldAccess (substConstExpr subst target) field pos
+  e -> e
+
+--------------------------------------------------------------------------------
+-- Unused Method Elimination
+--------------------------------------------------------------------------------
+
+-- | Remove methods that are never called.
+eliminateUnusedMethods :: Program -> Program
+eliminateUnusedMethods prog@(Program classes) =
+  let -- Find all called methods
+      calledMethods = findCalledMethods prog
+      -- Keep Main.main and all transitively called methods
+      reachable = computeReachable calledMethods ("Main", "main")
+  in Program [cls { classMethods = filter (isReachable reachable (className cls)) (classMethods cls) }
+             | cls <- classes]
+  where
+    isReachable reach clsName m = (clsName, methodName m) `Set.member` reach
+
+-- | Find all method calls: returns map from method to methods it calls
+findCalledMethods :: Program -> Map (String, String) (Set (String, String))
+findCalledMethods (Program classes) =
+  Map.fromList [((className cls, methodName m), findMethodCalls cls m)
+               | cls <- classes, m <- classMethods cls]
+  where
+    -- Build a map from method name to all classes that have it
+    methodToClasses :: Map String [String]
+    methodToClasses = Map.fromListWith (++)
+      [(methodName m, [className cls]) | cls <- classes, m <- classMethods cls]
+
+    findMethodCalls cls m = findStmtCalls (className cls) (methodBody m)
+
+    findStmtCalls clsName = \case
+      Block stmts _ -> Set.unions (map (findStmtCalls clsName) stmts)
+      VarDecl _ _ (Just e) _ -> findExprCalls clsName e
+      Assign _ e _ -> findExprCalls clsName e
+      FieldAssign t _ _ v _ -> Set.union (findExprCalls clsName t) (findExprCalls clsName v)
+      Return (Just e) _ -> findExprCalls clsName e
+      If c th el _ -> Set.unions [findExprCalls clsName c, findStmtCalls clsName th, findStmtCalls clsName el]
+      While c body _ -> Set.union (findExprCalls clsName c) (findStmtCalls clsName body)
+      ExprStmt e _ -> findExprCalls clsName e
+      _ -> Set.empty
+
+    findExprCalls clsName = \case
+      Call name _ _ -> Set.singleton (clsName, name)  -- Local call
+      InstanceCall (Var "this" _) method _ _ -> Set.singleton (clsName, method)
+      -- For non-this calls, we don't know the receiver type, so mark ALL classes with this method
+      InstanceCall target method args _ ->
+        let targetCalls = findExprCalls clsName target
+            argCalls = Set.unions (map (findExprCalls clsName) args)
+            -- Conservative: any class that has a method with this name might be called
+            possibleClasses = Map.findWithDefault [] method methodToClasses
+            methodCalls = Set.fromList [(c, method) | c <- possibleClasses]
+        in Set.unions [targetCalls, argCalls, methodCalls]
+      NewObject cn _ _ -> Set.singleton (cn, cn)  -- Constructor
+      Binary _ l r _ -> Set.union (findExprCalls clsName l) (findExprCalls clsName r)
+      Unary _ e _ -> findExprCalls clsName e
+      Ternary c t e _ -> Set.unions [findExprCalls clsName c, findExprCalls clsName t, findExprCalls clsName e]
+      FieldAccess t _ _ -> findExprCalls clsName t
+      _ -> Set.empty
+
+-- | Compute reachable methods from entry point
+computeReachable :: Map (String, String) (Set (String, String)) -> (String, String) -> Set (String, String)
+computeReachable callGraph entry = go Set.empty [entry]
+  where
+    go visited [] = visited
+    go visited (m:rest)
+      | m `Set.member` visited = go visited rest
+      | otherwise =
+          let callees = Map.findWithDefault Set.empty m callGraph
+          in go (Set.insert m visited) (Set.toList callees ++ rest)
+
+--------------------------------------------------------------------------------
+-- Unused Field Elimination
+--------------------------------------------------------------------------------
+
+-- | Remove fields that are never accessed.
+eliminateUnusedFields :: Program -> Program
+eliminateUnusedFields prog@(Program classes) =
+  let -- Find all accessed fields per class
+      accessedFields = findAccessedFields prog
+  in Program [cls { classFields = filter (isAccessed accessedFields (className cls)) (classFields cls) }
+             | cls <- classes]
+  where
+    isAccessed accessed clsName f = (clsName, fst f) `Set.member` accessed
+
+-- | Find all field accesses
+findAccessedFields :: Program -> Set (String, String)
+findAccessedFields (Program classes) =
+  Set.unions [findClassFieldAccesses cls | cls <- classes]
+  where
+    findClassFieldAccesses cls =
+      Set.unions [findMethodFieldAccesses (className cls) m | m <- classMethods cls]
+
+    findMethodFieldAccesses clsName m = findStmtFields clsName (methodBody m)
+
+    findStmtFields clsName = \case
+      Block stmts _ -> Set.unions (map (findStmtFields clsName) stmts)
+      VarDecl _ _ (Just e) _ -> findExprFields clsName e
+      Assign _ e _ -> findExprFields clsName e
+      FieldAssign (This _) field _ v _ ->
+        Set.insert (clsName, field) (findExprFields clsName v)
+      FieldAssign t _ _ v _ -> Set.union (findExprFields clsName t) (findExprFields clsName v)
+      Return (Just e) _ -> findExprFields clsName e
+      If c th el _ -> Set.unions [findExprFields clsName c, findStmtFields clsName th, findStmtFields clsName el]
+      While c body _ -> Set.union (findExprFields clsName c) (findStmtFields clsName body)
+      ExprStmt e _ -> findExprFields clsName e
+      _ -> Set.empty
+
+    findExprFields clsName = \case
+      FieldAccess (This _) field _ -> Set.singleton (clsName, field)
+      FieldAccess t _ _ -> findExprFields clsName t
+      Binary _ l r _ -> Set.union (findExprFields clsName l) (findExprFields clsName r)
+      Unary _ e _ -> findExprFields clsName e
+      Ternary c t e _ -> Set.unions [findExprFields clsName c, findExprFields clsName t, findExprFields clsName e]
+      Call _ args _ -> Set.unions (map (findExprFields clsName) args)
+      InstanceCall target _ args _ ->
+        Set.unions (findExprFields clsName target : map (findExprFields clsName) args)
+      NewObject _ args _ -> Set.unions (map (findExprFields clsName) args)
+      _ -> Set.empty
+
+--------------------------------------------------------------------------------
+-- Devirtualization
+--------------------------------------------------------------------------------
+
+-- | Replace virtual calls with direct calls when receiver type is known.
+devirtualize :: Program -> Program
+devirtualize prog@(Program classes) =
+  let -- Build type info: what class does each variable have?
+      classMap = Map.fromList [(className c, c) | c <- classes]
+  in Program (map (devirtClass classMap) classes)
+
+devirtClass :: Map String ClassDecl -> ClassDecl -> ClassDecl
+devirtClass classMap cls@ClassDecl{..} =
+  cls { classMethods = map (devirtMethod classMap className) classMethods }
+
+devirtMethod :: Map String ClassDecl -> String -> MethodDecl -> MethodDecl
+devirtMethod classMap clsName m@MethodDecl{..} =
+  m { methodBody = devirtStmt classMap clsName Map.empty methodBody }
+
+-- | Type environment: variable -> known class type
+type TypeEnv = Map String String
+
+devirtStmt :: Map String ClassDecl -> String -> TypeEnv -> Stmt -> Stmt
+devirtStmt classMap clsName typeEnv = \case
+  Block stmts pos ->
+    let (stmts', _) = devirtStmts classMap clsName typeEnv stmts
+    in Block stmts' pos
+
+  VarDecl name vt initOpt pos ->
+    let initOpt' = devirtExpr classMap clsName typeEnv <$> initOpt
+        typeEnv' = case initOpt' of
+          Just (NewObject cn _ _) -> Map.insert name cn typeEnv
+          _ -> typeEnv
+    in VarDecl name vt initOpt' pos
+
+  Assign name value pos ->
+    let value' = devirtExpr classMap clsName typeEnv value
+    in Assign name value' pos
+
+  FieldAssign target field offset value pos ->
+    FieldAssign (devirtExpr classMap clsName typeEnv target) field offset
+                (devirtExpr classMap clsName typeEnv value) pos
+
+  Return valueOpt pos ->
+    Return (devirtExpr classMap clsName typeEnv <$> valueOpt) pos
+
+  If cond th el pos ->
+    If (devirtExpr classMap clsName typeEnv cond)
+       (devirtStmt classMap clsName typeEnv th)
+       (devirtStmt classMap clsName typeEnv el) pos
+
+  While cond body pos ->
+    While (devirtExpr classMap clsName typeEnv cond)
+          (devirtStmt classMap clsName typeEnv body) pos
+
+  Break pos -> Break pos
+
+  ExprStmt expr pos ->
+    ExprStmt (devirtExpr classMap clsName typeEnv expr) pos
+
+devirtStmts :: Map String ClassDecl -> String -> TypeEnv -> [Stmt] -> ([Stmt], TypeEnv)
+devirtStmts _ _ typeEnv [] = ([], typeEnv)
+devirtStmts classMap clsName typeEnv (s:ss) =
+  let s' = devirtStmt classMap clsName typeEnv s
+      typeEnv' = updateTypeEnv s typeEnv
+      (ss', typeEnv'') = devirtStmts classMap clsName typeEnv' ss
+  in (s':ss', typeEnv'')
+  where
+    updateTypeEnv stmt env = case stmt of
+      VarDecl name _ (Just (NewObject cn _ _)) _ -> Map.insert name cn env
+      Assign name (NewObject cn _ _) _ -> Map.insert name cn env
+      _ -> env
+
+devirtExpr :: Map String ClassDecl -> String -> TypeEnv -> Expr -> Expr
+devirtExpr classMap clsName typeEnv = \case
+  -- Devirtualize: this.method() -> method() (local call)
+  -- Only devirtualize to local Call if it's in the same class
+  InstanceCall (This _) method args pos ->
+    let args' = map (devirtExpr classMap clsName typeEnv) args
+    in Call method args' pos  -- Just method name, no class prefix
+
+  -- Devirtualize: x.method() where x's type is known to be our own class
+  InstanceCall (Var v vpos) method args pos ->
+    case Map.lookup v typeEnv of
+      Just targetClass | targetClass == clsName ->
+        -- Same class: convert to local Call
+        let args' = map (devirtExpr classMap clsName typeEnv) args
+        in Call method args' pos
+      _ ->
+        -- Different class or unknown: keep as InstanceCall
+        InstanceCall (Var v vpos) method (map (devirtExpr classMap clsName typeEnv) args) pos
+
+  InstanceCall target method args pos ->
+    InstanceCall (devirtExpr classMap clsName typeEnv target) method
+                 (map (devirtExpr classMap clsName typeEnv) args) pos
+
+  Binary op l r pos ->
+    Binary op (devirtExpr classMap clsName typeEnv l) (devirtExpr classMap clsName typeEnv r) pos
+  Unary op e pos -> Unary op (devirtExpr classMap clsName typeEnv e) pos
+  Ternary c t e pos ->
+    Ternary (devirtExpr classMap clsName typeEnv c)
+            (devirtExpr classMap clsName typeEnv t)
+            (devirtExpr classMap clsName typeEnv e) pos
+  Call name args pos -> Call name (map (devirtExpr classMap clsName typeEnv) args) pos
+  NewObject cn args pos -> NewObject cn (map (devirtExpr classMap clsName typeEnv) args) pos
+  FieldAccess target field pos -> FieldAccess (devirtExpr classMap clsName typeEnv target) field pos
+  e -> e
+
+--------------------------------------------------------------------------------
+-- Function Specialization
+--------------------------------------------------------------------------------
+
+-- | Create specialized versions of functions for constant arguments.
+specializeFunction :: Program -> Program
+specializeFunction prog@(Program classes) =
+  let -- Find methods called with constants
+      callInfo = collectCallInfo prog
+      -- Group by (method, argIndex) with constant values
+      specializations = findSpecializations callInfo
+      -- Create specialized methods and update call sites
+  in if Map.null specializations
+     then prog
+     else Program (map (specializeClass specializations) classes)
+
+-- | Map from (className, methodName, argIndex, value) to specialized method name
+type SpecMap = Map (String, String, Int, ConstValue) String
+
+findSpecializations :: CallInfo -> SpecMap
+findSpecializations callInfo =
+  Map.fromList
+    [((cls, method, idx, cv), cls ++ "_" ++ method ++ "_spec" ++ show idx ++ "_" ++ showCV cv)
+    | ((cls, method, idx), vals) <- Map.toList callInfo
+    , cv <- Set.toList vals
+    , cv /= CVUnknown
+    , Set.size vals == 1  -- Only specialize when always same constant
+    ]
+  where
+    showCV (CVInt n) = show n
+    showCV (CVBool b) = if b then "T" else "F"
+    showCV (CVStr _) = "S"
+    showCV CVNull = "N"
+    showCV CVUnknown = "U"
+
+specializeClass :: SpecMap -> ClassDecl -> ClassDecl
+specializeClass specs cls@ClassDecl{..} =
+  let -- Create specialized methods
+      newMethods = [createSpecialized specs className m idx cv newName
+                   | m <- classMethods
+                   , ((cn, mn, idx, cv), newName) <- Map.toList specs
+                   , cn == className, mn == methodName m]
+      -- Update call sites in existing methods
+      updatedMethods = map (updateCallSites specs className) classMethods
+  in cls { classMethods = updatedMethods ++ newMethods }
+
+createSpecialized :: SpecMap -> String -> MethodDecl -> Int -> ConstValue -> String -> MethodDecl
+createSpecialized _ clsName m idx cv newName =
+  let -- Remove the specialized parameter
+      newParams = [p | (i, p) <- zip [0..] (methodParams m), i /= idx]
+      -- Substitute the constant in the body
+      substMap = Map.singleton (paramName (methodParams m !! idx)) cv
+      newBody = substConstants substMap (methodBody m)
+  in m { methodName = newName
+       , methodParams = newParams
+       , methodBody = newBody
+       }
+
+updateCallSites :: SpecMap -> String -> MethodDecl -> MethodDecl
+updateCallSites specs clsName m@MethodDecl{..} =
+  m { methodBody = updateStmtCalls specs clsName methodBody }
+
+updateStmtCalls :: SpecMap -> String -> Stmt -> Stmt
+updateStmtCalls specs clsName = \case
+  Block stmts pos -> Block (map (updateStmtCalls specs clsName) stmts) pos
+  VarDecl name vt initOpt pos -> VarDecl name vt (updateExprCalls specs clsName <$> initOpt) pos
+  Assign name value pos -> Assign name (updateExprCalls specs clsName value) pos
+  FieldAssign target field offset value pos ->
+    FieldAssign (updateExprCalls specs clsName target) field offset (updateExprCalls specs clsName value) pos
+  Return valueOpt pos -> Return (updateExprCalls specs clsName <$> valueOpt) pos
+  If cond th el pos ->
+    If (updateExprCalls specs clsName cond) (updateStmtCalls specs clsName th) (updateStmtCalls specs clsName el) pos
+  While cond body pos -> While (updateExprCalls specs clsName cond) (updateStmtCalls specs clsName body) pos
+  Break pos -> Break pos
+  ExprStmt expr pos -> ExprStmt (updateExprCalls specs clsName expr) pos
+
+updateExprCalls :: SpecMap -> String -> Expr -> Expr
+updateExprCalls specs clsName = \case
+  Call name args pos ->
+    -- Check if any argument matches a specialization
+    let args' = map (updateExprCalls specs clsName) args
+        argVals = [(i, exprToConstValue arg) | (i, arg) <- zip [0..] args]
+    in case [(idx, cv, newName) | (idx, cv) <- argVals
+                                , cv /= CVUnknown
+                                , Just newName <- [Map.lookup (clsName, name, idx, cv) specs]] of
+      ((idx, _, newName):_) ->
+        -- Replace with specialized call (remove the constant arg)
+        Call newName [a | (i, a) <- zip [0..] args', i /= idx] pos
+      [] -> Call name args' pos
+
+  Binary op l r pos -> Binary op (updateExprCalls specs clsName l) (updateExprCalls specs clsName r) pos
+  Unary op e pos -> Unary op (updateExprCalls specs clsName e) pos
+  Ternary c t e pos ->
+    Ternary (updateExprCalls specs clsName c) (updateExprCalls specs clsName t) (updateExprCalls specs clsName e) pos
+  InstanceCall target method args pos ->
+    InstanceCall (updateExprCalls specs clsName target) method (map (updateExprCalls specs clsName) args) pos
+  NewObject cn args pos -> NewObject cn (map (updateExprCalls specs clsName) args) pos
+  FieldAccess target field pos -> FieldAccess (updateExprCalls specs clsName target) field pos
+  e -> e
+
+exprToConstValue :: Expr -> ConstValue
+exprToConstValue = \case
+  IntLit n _ -> CVInt n
+  BoolLit b _ -> CVBool b
+  StrLit s _ -> CVStr s
+  NullLit _ -> CVNull
+  _ -> CVUnknown
+
+--------------------------------------------------------------------------------
+-- Aggressive Inlining
+--------------------------------------------------------------------------------
+
+-- | More aggressive inlining based on size and call frequency heuristics.
+aggressiveInline :: Program -> Program
+aggressiveInline prog@(Program classes) =
+  let -- Find inlinable methods (small enough)
+      inlineCandidates = findInlineCandidates prog
+      -- Inline them
+  in if Map.null inlineCandidates
+     then prog
+     else Program (map (aggressiveInlineClass inlineCandidates) classes)
+
+-- | Max size for inlining (AST nodes)
+maxInlineSize :: Int
+maxInlineSize = 30
+
+-- | Find methods suitable for inlining
+findInlineCandidates :: Program -> Map (String, String) MethodDecl
+findInlineCandidates (Program classes) =
+  Map.fromList
+    [((className cls, methodName m), m)
+    | cls <- classes
+    , m <- classMethods cls
+    , stmtSize (methodBody m) <= maxInlineSize
+    , not (isRecursive (className cls) m)
+    ]
+  where
+    isRecursive clsName m = callsSelf clsName (methodName m) (methodBody m)
+
+    callsSelf clsName mName = \case
+      Block stmts _ -> any (callsSelf clsName mName) stmts
+      VarDecl _ _ (Just e) _ -> exprCallsSelf clsName mName e
+      Assign _ e _ -> exprCallsSelf clsName mName e
+      FieldAssign _ _ _ e _ -> exprCallsSelf clsName mName e
+      Return (Just e) _ -> exprCallsSelf clsName mName e
+      If c th el _ -> exprCallsSelf clsName mName c || callsSelf clsName mName th || callsSelf clsName mName el
+      While c body _ -> exprCallsSelf clsName mName c || callsSelf clsName mName body
+      ExprStmt e _ -> exprCallsSelf clsName mName e
+      _ -> False
+
+    exprCallsSelf clsName mName = \case
+      Call name _ _ -> name == mName || name == clsName ++ "_" ++ mName
+      InstanceCall (This _) method _ _ -> method == mName
+      Binary _ l r _ -> exprCallsSelf clsName mName l || exprCallsSelf clsName mName r
+      Unary _ e _ -> exprCallsSelf clsName mName e
+      Ternary c t e _ -> any (exprCallsSelf clsName mName) [c, t, e]
+      InstanceCall target _ args _ -> any (exprCallsSelf clsName mName) (target : args)
+      NewObject _ args _ -> any (exprCallsSelf clsName mName) args
+      FieldAccess t _ _ -> exprCallsSelf clsName mName t
+      _ -> False
+
+aggressiveInlineClass :: Map (String, String) MethodDecl -> ClassDecl -> ClassDecl
+aggressiveInlineClass candidates cls@ClassDecl{..} =
+  cls { classMethods = map (aggressiveInlineMethod candidates className) classMethods }
+
+aggressiveInlineMethod :: Map (String, String) MethodDecl -> String -> MethodDecl -> MethodDecl
+aggressiveInlineMethod candidates clsName m@MethodDecl{..} =
+  m { methodBody = inlineInStmt candidates clsName methodBody }
+
+inlineInStmt :: Map (String, String) MethodDecl -> String -> Stmt -> Stmt
+inlineInStmt candidates clsName = \case
+  Block stmts pos -> Block (map (inlineInStmt candidates clsName) stmts) pos
+  VarDecl name vt initOpt pos -> VarDecl name vt (inlineInExpr candidates clsName <$> initOpt) pos
+  Assign name value pos -> Assign name (inlineInExpr candidates clsName value) pos
+  FieldAssign target field offset value pos ->
+    FieldAssign (inlineInExpr candidates clsName target) field offset (inlineInExpr candidates clsName value) pos
+  Return valueOpt pos -> Return (inlineInExpr candidates clsName <$> valueOpt) pos
+  If cond th el pos ->
+    If (inlineInExpr candidates clsName cond) (inlineInStmt candidates clsName th) (inlineInStmt candidates clsName el) pos
+  While cond body pos -> While (inlineInExpr candidates clsName cond) (inlineInStmt candidates clsName body) pos
+  Break pos -> Break pos
+  ExprStmt expr pos -> ExprStmt (inlineInExpr candidates clsName expr) pos
+
+inlineInExpr :: Map (String, String) MethodDecl -> String -> Expr -> Expr
+inlineInExpr candidates clsName = \case
+  -- Try to inline local calls
+  Call name args pos ->
+    let args' = map (inlineInExpr candidates clsName) args
+    in case Map.lookup (clsName, name) candidates of
+      Just m | Just result <- tryInline m args' -> result
+      _ -> Call name args' pos
+
+  Binary op l r pos -> Binary op (inlineInExpr candidates clsName l) (inlineInExpr candidates clsName r) pos
+  Unary op e pos -> Unary op (inlineInExpr candidates clsName e) pos
+  Ternary c t e pos ->
+    Ternary (inlineInExpr candidates clsName c) (inlineInExpr candidates clsName t) (inlineInExpr candidates clsName e) pos
+  InstanceCall target method args pos ->
+    InstanceCall (inlineInExpr candidates clsName target) method (map (inlineInExpr candidates clsName) args) pos
+  NewObject cn args pos -> NewObject cn (map (inlineInExpr candidates clsName) args) pos
+  FieldAccess target field pos -> FieldAccess (inlineInExpr candidates clsName target) field pos
+  e -> e
+
+-- | Try to inline a method call
+tryInline :: MethodDecl -> [Expr] -> Maybe Expr
+tryInline m args =
+  case getReturnExpr (methodBody m) of
+    Just retExpr ->
+      let paramNames = map paramName (methodParams m)
+          subst = Map.fromList (zip paramNames args)
+      in Just (substituteExprs subst retExpr)
+    Nothing -> Nothing
+
+getReturnExpr :: Stmt -> Maybe Expr
+getReturnExpr = \case
+  Return (Just e) _ -> Just e
+  Block [s] _ -> getReturnExpr s
+  Block stmts _ -> getReturnExpr (last stmts)
+  _ -> Nothing
+
+substituteExprs :: Map String Expr -> Expr -> Expr
+substituteExprs subst = \case
+  Var name pos -> Map.findWithDefault (Var name pos) name subst
+  Binary op l r pos -> Binary op (substituteExprs subst l) (substituteExprs subst r) pos
+  Unary op e pos -> Unary op (substituteExprs subst e) pos
+  Ternary c t e pos ->
+    Ternary (substituteExprs subst c) (substituteExprs subst t) (substituteExprs subst e) pos
+  Call name args pos -> Call name (map (substituteExprs subst) args) pos
+  InstanceCall target method args pos ->
+    InstanceCall (substituteExprs subst target) method (map (substituteExprs subst) args) pos
+  NewObject cn args pos -> NewObject cn (map (substituteExprs subst) args) pos
+  FieldAccess target field pos -> FieldAccess (substituteExprs subst target) field pos
+  e -> e
+
+--------------------------------------------------------------------------------
+-- Loop Fusion
+--------------------------------------------------------------------------------
+
+-- | Fuse adjacent loops with the same bounds.
+-- while (i < n) { A; i++; } while (j < n) { B; j++; }
+-- becomes: while (i < n) { A; B; i++; }
+fuseLoops :: Program -> Program
+fuseLoops (Program classes) = Program (map fuseClass classes)
+
+fuseClass :: ClassDecl -> ClassDecl
+fuseClass cls@ClassDecl{..} = cls { classMethods = map fuseMethod classMethods }
+
+fuseMethod :: MethodDecl -> MethodDecl
+fuseMethod m@MethodDecl{..} = m { methodBody = fuseStmt methodBody }
+
+fuseStmt :: Stmt -> Stmt
+fuseStmt = \case
+  Block stmts pos -> Block (fuseBlock stmts) pos
+  If cond th el pos -> If cond (fuseStmt th) (fuseStmt el) pos
+  While cond body pos -> While cond (fuseStmt body) pos
+  s -> s
+
+fuseBlock :: [Stmt] -> [Stmt]
+fuseBlock [] = []
+fuseBlock [s] = [fuseStmt s]
+fuseBlock (s1 : s2 : rest) = case (s1, s2) of
+  -- Pattern: two while loops with same bound
+  (While cond1 body1 pos1, While cond2 body2 _)
+    | Just (var1, bound1) <- getLoopBound cond1
+    , Just (var2, bound2) <- getLoopBound cond2
+    , bound1 == bound2
+    , Just incr1 <- getLoopIncrement var1 body1
+    , Just incr2 <- getLoopIncrement var2 body2
+    , incr1 == incr2 && incr1 == 1
+    , var1 == var2  -- Same loop variable
+    ->
+      let -- Merge bodies (excluding increments)
+          body1' = removeIncrement var1 body1
+          body2' = removeIncrement var2 body2
+          merged = mergeLoopBodies body1' body2'
+          -- Add single increment at end
+          newBody = addIncrement var1 merged
+      in fuseBlock (While cond1 newBody pos1 : rest)
+
+  _ -> fuseStmt s1 : fuseBlock (s2 : rest)
+
+mergeLoopBodies :: Stmt -> Stmt -> Stmt
+mergeLoopBodies (Block s1 pos) (Block s2 _) = Block (s1 ++ s2) pos
+mergeLoopBodies (Block s1 pos) s2 = Block (s1 ++ [s2]) pos
+mergeLoopBodies s1 (Block s2 pos) = Block (s1 : s2) pos
+mergeLoopBodies s1 s2 = Block [s1, s2] 0
+
+addIncrement :: String -> Stmt -> Stmt
+addIncrement name (Block stmts pos) =
+  Block (stmts ++ [Assign name (Binary Add (Var name 0) (IntLit 1 0) 0) 0]) pos
+addIncrement name s = Block [s, Assign name (Binary Add (Var name 0) (IntLit 1 0) 0) 0] 0
+
+--------------------------------------------------------------------------------
+-- Loop Fission
+--------------------------------------------------------------------------------
+
+-- | Split loops to improve locality.
+-- while (i < n) { A; B; i++; } where A and B are independent
+-- becomes: while (i < n) { A; i++; } while (j < n) { B; j++; }
+fissLoops :: Program -> Program
+fissLoops (Program classes) = Program (map fissClass classes)
+
+fissClass :: ClassDecl -> ClassDecl
+fissClass cls@ClassDecl{..} = cls { classMethods = map fissMethod classMethods }
+
+fissMethod :: MethodDecl -> MethodDecl
+fissMethod m@MethodDecl{..} = m { methodBody = fissStmt methodBody }
+
+fissStmt :: Stmt -> Stmt
+fissStmt = \case
+  Block stmts pos -> Block (concatMap fissStmtToList stmts) pos
+  If cond th el pos -> If cond (fissStmt th) (fissStmt el) pos
+  While cond body pos -> tryFiss cond body pos
+  s -> s
+
+fissStmtToList :: Stmt -> [Stmt]
+fissStmtToList s = case fissStmt s of
+  Block stmts _ -> stmts
+  other -> [other]
+
+tryFiss :: Expr -> Stmt -> Int -> Stmt
+tryFiss cond body pos
+  | Just (loopVar, bound) <- getLoopBound cond
+  , Just 1 <- getLoopIncrement loopVar body
+  , (groups, canFiss) <- partitionIndependent loopVar body
+  , canFiss && length groups > 1 =
+      -- Create separate loops for each group
+      let loops = [While cond (addIncrement loopVar (Block g 0)) pos | g <- groups]
+      in Block loops pos
+  | otherwise = While cond (fissStmt body) pos
+
+-- | Partition loop body into independent statement groups
+partitionIndependent :: String -> Stmt -> ([[Stmt]], Bool)
+partitionIndependent loopVar body =
+  let stmts = case removeIncrement loopVar body of
+        Block ss _ -> ss
+        s -> [s]
+      -- For simplicity, only fiss if we have exactly 2 independent statements
+      -- that don't share variables (other than the loop var)
+  in if length stmts == 2
+     then let [s1, s2] = stmts
+              vars1 = usedInStmt s1 `Set.union` modifiedInStmt s1
+              vars2 = usedInStmt s2 `Set.union` modifiedInStmt s2
+              shared = Set.intersection vars1 vars2 Set.\\ Set.singleton loopVar
+          in if Set.null shared
+             then ([[s1], [s2]], True)
+             else ([stmts], False)
+     else ([stmts], False)
