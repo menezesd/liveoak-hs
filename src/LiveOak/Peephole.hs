@@ -11,9 +11,7 @@ module LiveOak.Peephole
   , emitSam
   , coalesceStackSlots
   , scheduleInstructions
-  , tailDuplicate
   , mergeBlocks
-  , reorderOperands
   ) where
 
 import Data.Text (Text)
@@ -178,12 +176,10 @@ optimize =
     go n instrs =
       let -- First apply jump threading
           threaded = jumpThread instrs
-          -- Block merging: DISABLED for now, needs debugging
-          -- merged = mergeBlocks threaded
-          -- Tail duplication: DISABLED for now, needs debugging
-          -- duplicated = tailDuplicate merged
+          -- Block merging (removes redundant jumps/labels)
+          merged = mergeBlocks threaded
           -- Then apply peephole patterns
-          optimized = peepholePass threaded
+          optimized = peepholePass merged
           -- Remove dead code after unconditional jumps
           cleaned = removeDeadCode optimized
       in if cleaned == instrs
@@ -793,61 +789,6 @@ isPush DUP = True
 isPush _ = False
 
 --------------------------------------------------------------------------------
--- Tail Duplication
---------------------------------------------------------------------------------
-
--- | Duplicate small tails to eliminate jumps.
--- Pattern: JUMP L; ...; L: small-block; JUMP/RST
--- If the block after L is small and ends with JUMP/RST, duplicate it.
-tailDuplicate :: [SamInstr] -> [SamInstr]
-tailDuplicate instrs =
-  let labelBlocks = buildLabelBlocks instrs
-  in go labelBlocks instrs
-  where
-    -- Max size for tail to duplicate
-    maxTailSize = 5
-
-    go _ [] = []
-    go blocks (JUMP lbl : rest) =
-      case Map.lookup lbl blocks of
-        Just tailBlock | length tailBlock <= maxTailSize && endsWithTerminator tailBlock ->
-          -- Duplicate the tail instead of jumping
-          tailBlock ++ go blocks rest
-        _ -> JUMP lbl : go blocks rest
-    go blocks (x : rest) = x : go blocks rest
-
-    endsWithTerminator [] = False
-    endsWithTerminator xs = case last xs of
-      RST -> True
-      STOP -> True
-      JUMP _ -> True
-      _ -> False
-
--- | Build map from label to the basic block that follows it
-buildLabelBlocks :: [SamInstr] -> Map Text [SamInstr]
-buildLabelBlocks = go Map.empty
-  where
-    go m [] = m
-    go m (Label lbl : rest) =
-      let (block, remaining) = extractBasicBlock rest
-      in go (Map.insert lbl block m) remaining
-    go m (_ : rest) = go m rest
-
-    extractBasicBlock [] = ([], [])
-    extractBasicBlock (x : rest)
-      | isTerminator x = ([x], rest)
-      | Label _ <- x = ([], x : rest)  -- New label starts new block
-      | otherwise =
-          let (block, remaining) = extractBasicBlock rest
-          in (x : block, remaining)
-
-    isTerminator RST = True
-    isTerminator STOP = True
-    isTerminator (JUMP _) = True
-    isTerminator (JUMPC _) = True
-    isTerminator _ = False
-
---------------------------------------------------------------------------------
 -- Block Merging
 --------------------------------------------------------------------------------
 
@@ -887,38 +828,3 @@ collectReferencedLabels = Set.fromList . mapMaybe getJumpTarget
     getJumpTarget (JUMPC lbl) = Just lbl
     getJumpTarget (JSR lbl) = Just lbl
     getJumpTarget _ = Nothing
-
---------------------------------------------------------------------------------
--- Operand Reordering for Commutative Ops
---------------------------------------------------------------------------------
-
--- | Reorder operands of commutative operations to minimize stack depth.
--- For commutative ops (ADD, TIMES, EQUAL, etc.), compute cheaper operand second
--- so it stays on stack shorter.
-reorderOperands :: [SamInstr] -> [SamInstr]
-reorderOperands = go
-  where
-    go [] = []
-    go (x : y : op : rest)
-      | isCommutative op && shouldSwap x y =
-          -- Swap operand order: put more expensive first
-          y : x : op : go rest
-    go (x : rest) = x : go rest
-
-    -- Commutative operations
-    isCommutative ADD = True
-    isCommutative TIMES = True
-    isCommutative EQUAL = True
-    isCommutative AND = True
-    isCommutative OR = True
-    isCommutative _ = False
-
-    -- Prefer to compute simpler operand second (stays on stack less time)
-    -- PUSHIMM is cheapest, then PUSHOFF, then complex expressions
-    shouldSwap x y = operandCost x < operandCost y
-
-    operandCost (PUSHIMM _) = 1
-    operandCost (PUSHOFF _) = 2
-    operandCost (PUSHIMMSTR _) = 2
-    operandCost DUP = 1
-    operandCost _ = 3  -- Other instructions are more expensive
