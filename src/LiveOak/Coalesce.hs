@@ -18,13 +18,13 @@ module LiveOak.Coalesce
 import LiveOak.CFG
 import LiveOak.SSATypes
 import LiveOak.Dominance
+import LiveOak.RegAlloc (LivenessInfo(..), computeLiveness)
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.List (foldl')
-import Control.Monad.State.Strict
 
 --------------------------------------------------------------------------------
 -- Interference Graph
@@ -36,87 +36,16 @@ type InterferenceGraph = Map String (Set String)
 -- | Build interference graph from liveness information
 -- Two variables interfere if they are both live at the same point
 buildInterferenceGraph :: CFG -> DomTree -> [SSABlock] -> InterferenceGraph
-buildInterferenceGraph cfg domTree blocks =
-  let -- Compute live-out sets for each block
-      liveOut = computeLiveness cfg blocks
+buildInterferenceGraph cfg _domTree blocks =
+  let -- Compute live-out sets for each block using RegAlloc's liveness
+      liveness = computeLiveness cfg blocks
       -- Build interference edges
-  in foldl' (addBlockInterference liveOut) Map.empty blocks
-
--- | Compute liveness (simplified - full liveness would need dataflow)
-computeLiveness :: CFG -> [SSABlock] -> Map BlockId (Set String)
-computeLiveness cfg blocks =
-  let blockMap = Map.fromList [(blockLabel b, b) | b <- blocks]
-      -- Initialize with uses in successors
-      initial = Map.fromList [(blockLabel b, Set.empty) | b <- blocks]
-      -- Iterate until fixed point
-  in iterateLiveness cfg blockMap initial
-
--- | Iterate liveness computation
-iterateLiveness :: CFG -> Map BlockId SSABlock -> Map BlockId (Set String) -> Map BlockId (Set String)
-iterateLiveness cfg blockMap liveOut =
-  let liveOut' = Map.mapWithKey (updateLiveOut cfg blockMap liveOut) liveOut
-  in if liveOut' == liveOut
-     then liveOut
-     else iterateLiveness cfg blockMap liveOut'
-
--- | Update live-out for a block
-updateLiveOut :: CFG -> Map BlockId SSABlock -> Map BlockId (Set String) -> BlockId -> Set String -> Set String
-updateLiveOut cfg blockMap liveOut bid _ =
-  -- Live-out = union of live-in of all successors
-  let succs = successors cfg bid
-      liveIns = map (computeLiveIn blockMap liveOut) succs
-  in Set.unions liveIns
-
--- | Compute live-in for a block
-computeLiveIn :: Map BlockId SSABlock -> Map BlockId (Set String) -> BlockId -> Set String
-computeLiveIn blockMap liveOut bid =
-  case Map.lookup bid blockMap of
-    Nothing -> Set.empty
-    Just block ->
-      let out = Map.findWithDefault Set.empty bid liveOut
-          -- Live-in = (live-out - defs) + uses
-          defs = blockDefs block
-          uses = blockUses block
-      in Set.union uses (Set.difference out defs)
-
--- | Get all definitions in a block
-blockDefs :: SSABlock -> Set String
-blockDefs SSABlock{..} = Set.fromList $
-  [ssaName (phiVar phi) | phi <- blockPhis] ++
-  [ssaName var | SSAAssign var _ <- blockInstrs]
-
--- | Get all uses in a block
-blockUses :: SSABlock -> Set String
-blockUses SSABlock{..} = Set.unions $
-  [phiUses phi | phi <- blockPhis] ++
-  map instrUses blockInstrs
-  where
-    phiUses PhiNode{..} = Set.fromList [ssaName v | (_, v) <- phiArgs]
-
-    instrUses = \case
-      SSAAssign _ expr -> exprUses expr
-      SSAReturn (Just expr) -> exprUses expr
-      SSAReturn Nothing -> Set.empty
-      SSAJump _ -> Set.empty
-      SSABranch cond _ _ -> exprUses cond
-      SSAFieldStore target _ _ value -> exprUses target `Set.union` exprUses value
-      SSAExprStmt expr -> exprUses expr
-
-    exprUses = \case
-      SSAUse var -> Set.singleton (ssaName var)
-      SSAUnary _ e -> exprUses e
-      SSABinary _ l r -> exprUses l `Set.union` exprUses r
-      SSATernary c t e -> exprUses c `Set.union` exprUses t `Set.union` exprUses e
-      SSACall _ args -> Set.unions (map exprUses args)
-      SSAInstanceCall target _ args -> exprUses target `Set.union` Set.unions (map exprUses args)
-      SSANewObject _ args -> Set.unions (map exprUses args)
-      SSAFieldAccess target _ -> exprUses target
-      _ -> Set.empty
+  in foldl' (addBlockInterference (liveOut liveness)) Map.empty blocks
 
 -- | Add interference edges for a block
 addBlockInterference :: Map BlockId (Set String) -> InterferenceGraph -> SSABlock -> InterferenceGraph
-addBlockInterference liveOut graph block =
-  let live = Map.findWithDefault Set.empty (blockLabel block) liveOut
+addBlockInterference liveOutMap graph block =
+  let live = Map.findWithDefault Set.empty (blockLabel block) liveOutMap
       -- All live variables interfere with each other
       liveList = Set.toList live
   in foldl' (addEdges liveList) graph liveList

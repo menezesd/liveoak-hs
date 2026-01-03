@@ -9,9 +9,10 @@ module LiveOak.PhiLower
     lowerPhis
   , LowerResult(..)
 
-    -- * Critical Edge Splitting
-  , splitCriticalEdges
-  , isCriticalEdge
+    -- * Critical Edge Splitting (re-exported from CFG)
+  , CFG.isCriticalEdge
+    -- * SSABlock-level splitting
+  , splitCriticalEdgesSSA
 
     -- * Parallel Copy Sequentialization
   , ParallelCopy(..)
@@ -19,7 +20,8 @@ module LiveOak.PhiLower
   ) where
 
 import LiveOak.SSATypes
-import LiveOak.CFG hiding (isCriticalEdge, splitCriticalEdges, findCriticalEdges, splitEdge)
+import qualified LiveOak.CFG as CFG
+import LiveOak.CFG (CFG, BlockId, predecessors, successors)
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -54,48 +56,27 @@ data LowerResult = LowerResult
   } deriving (Show)
 
 --------------------------------------------------------------------------------
--- Critical Edge Splitting
+-- Critical Edge Splitting for SSABlocks
 --------------------------------------------------------------------------------
 
--- | Check if an edge is critical
--- A critical edge goes from a block with multiple successors
--- to a block with multiple predecessors
-isCriticalEdge :: CFG -> BlockId -> BlockId -> Bool
-isCriticalEdge cfg from to =
-  length (successors cfg from) > 1 &&
-  length (predecessors cfg to) > 1
-
--- | Split all critical edges in the CFG
-splitCriticalEdges :: CFG -> [SSABlock] -> (CFG, [SSABlock])
-splitCriticalEdges cfg blocks =
+-- | Split all critical edges in the CFG (SSABlock version)
+-- Uses CFG.findCriticalEdges for detection, but operates on SSABlocks
+splitCriticalEdgesSSA :: CFG -> [SSABlock] -> (CFG, [SSABlock])
+splitCriticalEdgesSSA cfg blocks =
   let blockMap = Map.fromList [(blockLabel b, b) | b <- blocks]
-      -- Find all critical edges
-      criticalEdges = findCriticalEdges cfg blocks
+      -- Find all critical edges using CFG's function
+      criticalEdges = CFG.findCriticalEdges cfg
       -- Split each edge
-      (cfg', blockMap', newBlocks) = foldl' splitEdge (cfg, blockMap, []) criticalEdges
+      (cfg', blockMap', newBlocks) = foldl' splitEdgeSSA (cfg, blockMap, []) criticalEdges
       -- Reconstruct block list
       allBlocks = Map.elems blockMap' ++ newBlocks
   in (cfg', allBlocks)
 
--- | Find all critical edges
-findCriticalEdges :: CFG -> [SSABlock] -> [(BlockId, BlockId)]
-findCriticalEdges cfg blocks =
-  [(from, to) | SSABlock{..} <- blocks
-              , let from = blockLabel
-              , to <- blockSuccessors blockInstrs
-              , isCriticalEdge cfg from to]
-  where
-    blockSuccessors instrs = concatMap instrSuccessors instrs
-    instrSuccessors = \case
-      SSAJump target -> [target]
-      SSABranch _ thenB elseB -> [thenB, elseB]
-      _ -> []
-
--- | Split a single critical edge by inserting a new block
-splitEdge :: (CFG, Map BlockId SSABlock, [SSABlock]) ->
-             (BlockId, BlockId) ->
-             (CFG, Map BlockId SSABlock, [SSABlock])
-splitEdge (cfg, blockMap, newBlocks) (from, to) =
+-- | Split a single critical edge by inserting a new SSABlock
+splitEdgeSSA :: (CFG, Map BlockId SSABlock, [SSABlock]) ->
+                (BlockId, BlockId) ->
+                (CFG, Map BlockId SSABlock, [SSABlock])
+splitEdgeSSA (cfg, blockMap, newBlocks) (from, to) =
   let -- Create new block name
       splitName = from ++ "_to_" ++ to
       -- Create new block with just a jump
@@ -230,7 +211,7 @@ handleCycles copies
 lowerPhis :: CFG -> [SSABlock] -> LowerResult
 lowerPhis cfg blocks =
   let -- First, split critical edges
-      (cfg', blocks') = splitCriticalEdges cfg blocks
+      (cfg', blocks') = splitCriticalEdgesSSA cfg blocks
       numSplit = length blocks' - length blocks
 
       -- For each block, lower its phi nodes by inserting copies in predecessors
