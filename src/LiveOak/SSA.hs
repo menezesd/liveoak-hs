@@ -4,7 +4,7 @@
 -- | Static Single Assignment (SSA) form for LiveOak.
 -- Each variable is assigned exactly once, with phi functions at join points.
 module LiveOak.SSA
-  ( -- * SSA Types
+  ( -- * SSA Types (re-exported from SSATypes)
     SSAProgram(..)
   , SSAClass(..)
   , SSAMethod(..)
@@ -16,6 +16,7 @@ module LiveOak.SSA
 
     -- * Conversion
   , toSSA
+  , toSSAWithCFG    -- ^ Uses CFG-based phi placement
   , fromSSA
 
     -- * SSA Optimizations
@@ -30,88 +31,22 @@ module LiveOak.SSA
 
     -- * Structured SSA Optimization
   , structuredSSAOpt
+
+    -- * CFG-Based Optimization Pipeline
+  , optimizeSSA       -- ^ Full CFG-based SSA optimization
   ) where
 
 import LiveOak.Ast
 import LiveOak.Types (ValueType)
+import LiveOak.SSATypes
+import LiveOak.CFG
+import LiveOak.Dominance
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Control.Monad.State
-
---------------------------------------------------------------------------------
--- SSA Types
---------------------------------------------------------------------------------
-
--- | SSA variable with version number
-data SSAVar = SSAVar
-  { ssaName :: !String     -- ^ Original variable name
-  , ssaVersion :: !Int     -- ^ Version number (0 = original)
-  , ssaVarType :: !(Maybe ValueType)  -- ^ Type (if known, e.g., for parameters)
-  } deriving (Eq, Ord, Show)
-
--- | Phi node: selects value based on predecessor block
-data PhiNode = PhiNode
-  { phiVar :: !SSAVar                    -- ^ Variable being defined
-  , phiArgs :: ![(String, SSAVar)]       -- ^ (predecessor label, value)
-  } deriving (Eq, Show)
-
--- | SSA expression
-data SSAExpr
-  = SSAInt !Int
-  | SSABool !Bool
-  | SSAStr !String
-  | SSANull
-  | SSAUse !SSAVar                      -- ^ Use of SSA variable
-  | SSAThis
-  | SSAUnary !UnaryOp !SSAExpr
-  | SSABinary !BinaryOp !SSAExpr !SSAExpr
-  | SSATernary !SSAExpr !SSAExpr !SSAExpr
-  | SSACall !String ![SSAExpr]
-  | SSAInstanceCall !SSAExpr !String ![SSAExpr]
-  | SSANewObject !String ![SSAExpr]
-  | SSAFieldAccess !SSAExpr !String
-  deriving (Eq, Show)
-
--- | SSA instruction
-data SSAInstr
-  = SSAAssign !SSAVar !SSAExpr          -- ^ x_n = expr
-  | SSAFieldStore !SSAExpr !String !Int !SSAExpr  -- ^ target.field = value
-  | SSAReturn !(Maybe SSAExpr)
-  | SSAJump !String                     -- ^ Unconditional jump
-  | SSABranch !SSAExpr !String !String  -- ^ Conditional branch (cond, true, false)
-  | SSAExprStmt !SSAExpr                -- ^ Expression for side effects
-  deriving (Eq, Show)
-
--- | Basic block in SSA form
-data SSABlock = SSABlock
-  { blockLabel :: !String
-  , blockPhis :: ![PhiNode]             -- ^ Phi functions at block start
-  , blockInstrs :: ![SSAInstr]          -- ^ Instructions (non-phi)
-  } deriving (Eq, Show)
-
--- | Method in SSA form
-data SSAMethod = SSAMethod
-  { ssaMethodClassName :: !String       -- ^ Containing class name
-  , ssaMethodName :: !String
-  , ssaMethodParams :: ![SSAVar]        -- ^ Parameters as SSA vars (version 0)
-  , ssaMethodReturnSig :: !ReturnSig    -- ^ Return signature
-  , ssaMethodBlocks :: ![SSABlock]      -- ^ Basic blocks
-  , ssaEntryBlock :: !String            -- ^ Entry block label
-  } deriving (Eq, Show)
-
--- | Class in SSA form
-data SSAClass = SSAClass
-  { ssaClassName :: !String
-  , ssaClassFields :: ![(String, ValueType)]  -- ^ Field declarations
-  , ssaClassMethods :: ![SSAMethod]
-  } deriving (Eq, Show)
-
--- | Program in SSA form
-data SSAProgram = SSAProgram
-  { ssaClasses :: ![SSAClass]
-  } deriving (Eq, Show)
+import Data.List (foldl')
 
 --------------------------------------------------------------------------------
 -- Conversion to SSA
@@ -231,10 +166,10 @@ stmtToBlocks label = \case
         elseBlocks' = addJumpToEnd elseBlocks joinLabel
 
     let branchInstr = SSABranch ssaCond thenLabel elseLabel
-        entryBlock = SSABlock label [] [branchInstr]
+        ifEntryBlock = SSABlock label [] [branchInstr]
         joinBlock = SSABlock joinLabel [] []  -- Phi nodes would go here
 
-    return $ entryBlock : thenBlocks' ++ elseBlocks' ++ [joinBlock]
+    return $ ifEntryBlock : thenBlocks' ++ elseBlocks' ++ [joinBlock]
 
   While cond body _ -> do
     ssaCond <- exprToSSA cond
@@ -250,10 +185,10 @@ stmtToBlocks label = \case
     let bodyBlocks' = addJumpToEnd bodyBlocks headerLabel
 
     -- Entry jumps to header
-    let entryBlock = SSABlock label [] [SSAJump headerLabel]
+    let whileEntryBlock = SSABlock label [] [SSAJump headerLabel]
         exitBlock = SSABlock exitLabel [] []
 
-    return $ entryBlock : headerBlock : bodyBlocks' ++ [exitBlock]
+    return $ whileEntryBlock : headerBlock : bodyBlocks' ++ [exitBlock]
 
   Break _ -> do
     -- Note: proper break handling requires knowing the enclosing loop
@@ -301,6 +236,237 @@ exprToSSA = \case
     SSAInstanceCall <$> exprToSSA target <*> pure method <*> mapM exprToSSA args
   NewObject cn args _ -> SSANewObject cn <$> mapM exprToSSA args
   FieldAccess target field _ -> SSAFieldAccess <$> exprToSSA target <*> pure field
+
+--------------------------------------------------------------------------------
+-- CFG-Based SSA Conversion (with proper phi placement)
+--------------------------------------------------------------------------------
+
+-- | Convert a program to SSA form using CFG and dominance analysis.
+-- This produces proper phi node placement using dominance frontiers.
+toSSAWithCFG :: Program -> SSAProgram
+toSSAWithCFG (Program classes) = SSAProgram
+  [classToSSAWithCFG c | c <- classes]
+
+-- | Convert a class using CFG-based SSA
+classToSSAWithCFG :: ClassDecl -> SSAClass
+classToSSAWithCFG ClassDecl{..} = SSAClass
+  { ssaClassName = className
+  , ssaClassFields = classFields
+  , ssaClassMethods = map (methodToSSAWithCFG className) classMethods
+  }
+
+-- | Convert a method using CFG-based SSA with proper phi placement
+methodToSSAWithCFG :: String -> MethodDecl -> SSAMethod
+methodToSSAWithCFG clsName decl@MethodDecl{..} =
+  -- Step 1: Convert to basic blocks (with simple SSA naming)
+  let basicMethod = methodToSSA clsName decl
+      -- Step 2: Build CFG
+      cfg = buildCFG basicMethod
+      -- Step 3: Compute dominance
+      domTree = computeDominators cfg
+      domFrontier = computeDomFrontier cfg domTree
+      -- Step 4: Find all variables that need phi nodes
+      defSites = findDefSites basicMethod
+      -- Step 5: Insert phi nodes at dominance frontiers
+      blocksWithPhis = insertPhis cfg domFrontier defSites (ssaMethodBlocks basicMethod)
+      -- Step 6: Rename variables with proper SSA numbering
+      renamedBlocks = renameVariables cfg domTree methodParams blocksWithPhis
+  in basicMethod { ssaMethodBlocks = renamedBlocks }
+
+-- | Find all definition sites for each variable
+-- Returns: variable name -> set of blocks where it's defined
+findDefSites :: SSAMethod -> Map String (Set BlockId)
+findDefSites method = foldl' addBlockDefs Map.empty (ssaMethodBlocks method)
+  where
+    addBlockDefs acc block =
+      foldl' (addDef (blockLabel block)) acc (blockInstrs block)
+
+    addDef blockId acc instr = case instr of
+      SSAAssign var _ ->
+        Map.insertWith Set.union (ssaName var) (Set.singleton blockId) acc
+      _ -> acc
+
+-- | Insert phi nodes at dominance frontiers of definition sites
+insertPhis :: CFG -> DomFrontier -> Map String (Set BlockId) -> [SSABlock] -> [SSABlock]
+insertPhis cfg domFrontier defSites blocks =
+  let -- For each variable, compute blocks that need phi nodes
+      phiSites = Map.mapWithKey (computePhiSites domFrontier) defSites
+      -- Insert phi nodes into blocks
+      blockMap = Map.fromList [(blockLabel b, b) | b <- blocks]
+      blockMap' = Map.foldlWithKey' (insertPhisForVar cfg) blockMap phiSites
+  in map snd $ Map.toList blockMap'
+
+-- | Compute where phi nodes are needed for a variable using dominance frontiers
+computePhiSites :: DomFrontier -> String -> Set BlockId -> Set BlockId
+computePhiSites domFrontier _varName defBlocks = go defBlocks Set.empty
+  where
+    go worklist phiBlocks
+      | Set.null worklist = phiBlocks
+      | otherwise =
+          let (block, rest) = Set.deleteFindMin worklist
+              -- Get dominance frontier of this block
+              frontier = Map.findWithDefault Set.empty block domFrontier
+              -- Add phi nodes at frontier blocks that don't have one yet
+              newPhiBlocks = Set.difference frontier phiBlocks
+              -- Phi nodes are also definitions, so add to worklist
+              newWorklist = Set.union rest (Set.difference newPhiBlocks defBlocks)
+          in go newWorklist (Set.union phiBlocks newPhiBlocks)
+
+-- | Insert phi nodes for a variable into the appropriate blocks
+insertPhisForVar :: CFG -> Map BlockId SSABlock -> String -> Set BlockId -> Map BlockId SSABlock
+insertPhisForVar cfg blockMap varName phiBlocks =
+  Set.foldl' insertPhi blockMap phiBlocks
+  where
+    insertPhi bm blockId =
+      case Map.lookup blockId bm of
+        Nothing -> bm  -- Block not found
+        Just block ->
+          -- Create phi node with placeholder arguments
+          let preds = predecessors cfg blockId
+              phiArgs = [(p, SSAVar varName 0 Nothing) | p <- preds]
+              phi = PhiNode (SSAVar varName 0 Nothing) phiArgs
+              -- Add phi if not already present for this variable
+              existingPhis = blockPhis block
+              hasPhiForVar = any (\p -> ssaName (phiVar p) == varName) existingPhis
+          in if hasPhiForVar
+             then bm
+             else Map.insert blockId (block { blockPhis = phi : existingPhis }) bm
+
+--------------------------------------------------------------------------------
+-- SSA Variable Renaming
+--------------------------------------------------------------------------------
+
+-- | Rename variables with proper SSA versioning
+-- Uses dominator tree traversal to maintain reaching definitions
+renameVariables :: CFG -> DomTree -> [ParamDecl] -> [SSABlock] -> [SSABlock]
+renameVariables cfg domTree params blocks =
+  let -- Initialize with parameters as version 0
+      initVersions = Map.fromList [(paramName p, 0) | p <- params]
+      initDefs = Map.fromList [(paramName p, SSAVar (paramName p) 0 (Just (paramType p))) | p <- params]
+      initState = RenameState initVersions initDefs
+      -- Process blocks in dominator tree order
+      blockMap = Map.fromList [(blockLabel b, b) | b <- blocks]
+      (_, renamedMap) = renameBlock cfg domTree (cfgEntry cfg) initState blockMap
+  in map snd $ Map.toList renamedMap
+
+-- | State for variable renaming
+data RenameState = RenameState
+  { renameVersions :: !(Map String Int)      -- ^ Next version for each variable
+  , renameCurrentDef :: !(Map String SSAVar) -- ^ Current reaching definition
+  }
+
+-- | Rename variables in a block and its dominance subtree
+renameBlock :: CFG -> DomTree -> BlockId -> RenameState -> Map BlockId SSABlock
+           -> (RenameState, Map BlockId SSABlock)
+renameBlock cfg domTree blockId renSt blockMap =
+  case Map.lookup blockId blockMap of
+    Nothing -> (renSt, blockMap)
+    Just block ->
+      let -- Rename phi node definitions (create new versions)
+          (renSt1, renamedPhis) = renamePhistDefs renSt (blockPhis block)
+          -- Rename instructions
+          (renSt2, renamedInstrs) = renameInstrs renSt1 (blockInstrs block)
+          -- Update block
+          renamedBlock = block { blockPhis = renamedPhis, blockInstrs = renamedInstrs }
+          blockMap1 = Map.insert blockId renamedBlock blockMap
+          -- Fill in phi arguments in successor blocks
+          blockMap2 = foldl' (fillPhiArgs blockId renSt2) blockMap1 (successors cfg blockId)
+          -- Process children in dominator tree
+          (renSt3, blockMap3) = foldl' (processChild cfg domTree)
+                                       (renSt2, blockMap2)
+                                       (domChildren domTree blockId)
+      in (renSt3, blockMap3)
+
+-- | Process a child in the dominator tree
+processChild :: CFG -> DomTree -> (RenameState, Map BlockId SSABlock) -> BlockId
+            -> (RenameState, Map BlockId SSABlock)
+processChild cfg domTree (renSt, blockMap) childId =
+  renameBlock cfg domTree childId renSt blockMap
+
+-- | Rename phi node definitions
+renamePhistDefs :: RenameState -> [PhiNode] -> (RenameState, [PhiNode])
+renamePhistDefs renSt phis = foldl' renamePhi (renSt, []) phis
+  where
+    renamePhi (st, acc) phi =
+      let varName = ssaName (phiVar phi)
+          version = Map.findWithDefault 0 varName (renameVersions st)
+          newVar = SSAVar varName version (ssaVarType (phiVar phi))
+          st' = st { renameVersions = Map.insert varName (version + 1) (renameVersions st)
+                   , renameCurrentDef = Map.insert varName newVar (renameCurrentDef st)
+                   }
+          phi' = phi { phiVar = newVar }
+      in (st', acc ++ [phi'])
+
+-- | Rename instructions
+renameInstrs :: RenameState -> [SSAInstr] -> (RenameState, [SSAInstr])
+renameInstrs renSt instrs = foldl' renameInstr (renSt, []) instrs
+  where
+    renameInstr (st, acc) instr = case instr of
+      SSAAssign var expr ->
+        let expr' = renameExpr st expr
+            varName = ssaName var
+            version = Map.findWithDefault 0 varName (renameVersions st)
+            newVar = SSAVar varName version (ssaVarType var)
+            st' = st { renameVersions = Map.insert varName (version + 1) (renameVersions st)
+                     , renameCurrentDef = Map.insert varName newVar (renameCurrentDef st)
+                     }
+        in (st', acc ++ [SSAAssign newVar expr'])
+
+      SSAFieldStore target field off value ->
+        let target' = renameExpr st target
+            value' = renameExpr st value
+        in (st, acc ++ [SSAFieldStore target' field off value'])
+
+      SSAReturn exprOpt ->
+        let exprOpt' = fmap (renameExpr st) exprOpt
+        in (st, acc ++ [SSAReturn exprOpt'])
+
+      SSAJump target ->
+        (st, acc ++ [SSAJump target])
+
+      SSABranch cond t f ->
+        let cond' = renameExpr st cond
+        in (st, acc ++ [SSABranch cond' t f])
+
+      SSAExprStmt expr ->
+        let expr' = renameExpr st expr
+        in (st, acc ++ [SSAExprStmt expr'])
+
+-- | Rename uses in an expression
+renameExpr :: RenameState -> SSAExpr -> SSAExpr
+renameExpr renSt = \case
+  SSAUse var ->
+    case Map.lookup (ssaName var) (renameCurrentDef renSt) of
+      Just v -> SSAUse v
+      Nothing -> SSAUse var  -- Keep original if not found
+  SSAUnary op e -> SSAUnary op (renameExpr renSt e)
+  SSABinary op l r -> SSABinary op (renameExpr renSt l) (renameExpr renSt r)
+  SSATernary c t e -> SSATernary (renameExpr renSt c) (renameExpr renSt t) (renameExpr renSt e)
+  SSACall name args -> SSACall name (map (renameExpr renSt) args)
+  SSAInstanceCall t m args -> SSAInstanceCall (renameExpr renSt t) m (map (renameExpr renSt) args)
+  SSANewObject cn args -> SSANewObject cn (map (renameExpr renSt) args)
+  SSAFieldAccess t f -> SSAFieldAccess (renameExpr renSt t) f
+  e -> e  -- Literals don't need renaming
+
+-- | Fill in phi arguments from predecessor
+fillPhiArgs :: BlockId -> RenameState -> Map BlockId SSABlock -> BlockId -> Map BlockId SSABlock
+fillPhiArgs predId renSt blockMap succId =
+  case Map.lookup succId blockMap of
+    Nothing -> blockMap
+    Just block ->
+      let phis' = map (fillPhiArg predId renSt) (blockPhis block)
+      in Map.insert succId (block { blockPhis = phis' }) blockMap
+
+-- | Fill in phi argument from a specific predecessor
+fillPhiArg :: BlockId -> RenameState -> PhiNode -> PhiNode
+fillPhiArg predId renSt phi =
+  let varName = ssaName (phiVar phi)
+      currentDef = Map.findWithDefault (SSAVar varName 0 Nothing) varName (renameCurrentDef renSt)
+      args' = map updateArg (phiArgs phi)
+      updateArg (p, v)
+        | p == predId = (p, currentDef)
+        | otherwise = (p, v)
+  in phi { phiArgs = args' }
 
 --------------------------------------------------------------------------------
 -- Conversion from SSA
@@ -1008,3 +1174,28 @@ foldBinaryExpr op l r p = case (op, l, r) of
   -- Note: power-of-2 multiplication is handled in codegen with LSHIFT
 
   _ -> Binary op l r p
+
+--------------------------------------------------------------------------------
+-- CFG-Based SSA Optimization Pipeline
+--------------------------------------------------------------------------------
+
+-- | Full CFG-based SSA optimization.
+-- Converts to SSA with proper phi placement, applies optimizations, then
+-- converts back. This enables global optimizations across control flow.
+optimizeSSA :: Program -> Program
+optimizeSSA prog =
+  let -- Convert to SSA with proper phi placement
+      ssaProg = toSSAWithCFG prog
+      -- Apply SSA optimizations
+      optimized = ssaOptPipeline ssaProg
+      -- Convert back to AST
+  in fromSSA optimized
+
+-- | SSA optimization pipeline
+ssaOptPipeline :: SSAProgram -> SSAProgram
+ssaOptPipeline =
+    simplifyPhis           -- Remove trivial phi nodes
+  . ssaDeadCodeElim        -- Remove dead assignments
+  . ssaCopyProp            -- Propagate copies
+  . ssaConstantProp        -- Fold constants
+  . simplifyPhis           -- Clean up again

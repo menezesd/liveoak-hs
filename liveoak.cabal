@@ -30,6 +30,10 @@ library
                     , LiveOak.Peephole
                     , LiveOak.DataFlow
                     , LiveOak.SSA
+                    , LiveOak.SSATypes
+                    , LiveOak.CFG
+                    , LiveOak.Dominance
+                    , LiveOak.SSACodegen
                     , LiveOak.StringRuntime
                     , LiveOak.Compiler
                     , LiveOak.Sam
