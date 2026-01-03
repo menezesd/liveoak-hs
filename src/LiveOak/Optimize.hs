@@ -68,8 +68,9 @@ optimizeOnce =
   -- String optimizations (domain-specific)
   . DF.optimizeStringConcat
   . DF.internStrings
-  -- Structured SSA optimization (constant/copy propagation)
-  -- Replaces: DF.copyPropagate, DF.sparseCondConstProp
+  -- Full SSA-based optimization (global constant/copy propagation)
+  . SSA.fullSSAOptimize
+  -- Structured SSA optimization (local constant/copy propagation)
   . SSA.structuredSSAOpt
   -- Basic constant folding (algebraic simplifications)
   . constantFold

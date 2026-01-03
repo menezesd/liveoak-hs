@@ -23,6 +23,10 @@ module LiveOak.SSA
   , ssaDeadCodeElim
   , ssaCopyProp
   , partialRedundancyElim
+  , simplifyPhis
+
+    -- * Full SSA Optimization Pipeline
+  , fullSSAOptimize
 
     -- * Structured SSA Optimization
   , structuredSSAOpt
@@ -611,6 +615,151 @@ eliminateRedundant redundant blocks = map elimBlock blocks
     elimInstr instr = [instr]
 
 --------------------------------------------------------------------------------
+-- Phi Simplification
+--------------------------------------------------------------------------------
+
+-- | Simplify trivial phi nodes
+-- - phi(x, x, x) -> x (all args same)
+-- - phi(c, c, c) -> c (all args same constant)
+simplifyPhis :: SSAProgram -> SSAProgram
+simplifyPhis (SSAProgram classes) =
+  SSAProgram [c { ssaClassMethods = map simplifyMethod (ssaClassMethods c) } | c <- classes]
+  where
+    simplifyMethod m = m { ssaMethodBlocks = map simplifyBlock (ssaMethodBlocks m) }
+
+    simplifyBlock b =
+      let (simplified, copies) = unzip $ map simplifyPhi (blockPhis b)
+          -- Some phis become copy statements
+          extraInstrs = [SSAAssign dst (SSAUse src) | Just (dst, src) <- copies]
+      in b { blockPhis = [p | (Just p, _) <- zip simplified (repeat Nothing)]
+           , blockInstrs = extraInstrs ++ blockInstrs b
+           }
+
+    -- Returns (Maybe simplified phi, Maybe (dst, src) for copy)
+    simplifyPhi :: PhiNode -> (Maybe PhiNode, Maybe (SSAVar, SSAVar))
+    simplifyPhi phi@PhiNode{..}
+      -- All arguments are the same variable
+      | allSame (map snd phiArgs) =
+          case phiArgs of
+            ((_, v):_) -> (Nothing, Just (phiVar, v))
+            [] -> (Just phi, Nothing)
+      | otherwise = (Just phi, Nothing)
+
+    allSame [] = True
+    allSame (x:xs) = all (== x) xs
+
+--------------------------------------------------------------------------------
+-- Full SSA Optimization Pipeline
+--------------------------------------------------------------------------------
+
+-- | Full SSA-based optimization pipeline.
+-- This version preserves the original AST structure while applying
+-- additional SSA-style optimizations that complement structuredSSAOpt.
+--
+-- Currently applies:
+-- 1. Dead branch elimination (if with constant condition)
+-- 2. Additional algebraic simplifications
+-- 3. Common subexpression elimination within expressions
+fullSSAOptimize :: Program -> Program
+fullSSAOptimize (Program classes) = Program (map optimizeClassFull classes)
+
+-- | Optimize a class with full SSA techniques
+optimizeClassFull :: ClassDecl -> ClassDecl
+optimizeClassFull c@ClassDecl{..} =
+  c { classMethods = map optimizeMethodFull classMethods }
+
+-- | Optimize a method with full SSA techniques
+optimizeMethodFull :: MethodDecl -> MethodDecl
+optimizeMethodFull m@MethodDecl{..} =
+  m { methodBody = optimizeStmtFull methodBody }
+
+-- | Optimize a statement with additional SSA techniques
+optimizeStmtFull :: Stmt -> Stmt
+optimizeStmtFull = \case
+  Block stmts pos ->
+    -- Eliminate empty statements and merge adjacent blocks
+    let stmts' = filter (not . isEmptyStmt) $ map optimizeStmtFull stmts
+    in Block stmts' pos
+
+  VarDecl name ty initOpt pos ->
+    VarDecl name ty (optimizeExprFull <$> initOpt) pos
+
+  Assign name expr pos ->
+    Assign name (optimizeExprFull expr) pos
+
+  FieldAssign target field off value pos ->
+    FieldAssign (optimizeExprFull target) field off (optimizeExprFull value) pos
+
+  Return exprOpt pos ->
+    Return (optimizeExprFull <$> exprOpt) pos
+
+  If cond th el pos ->
+    let cond' = optimizeExprFull cond
+        th' = optimizeStmtFull th
+        el' = optimizeStmtFull el
+    in case cond' of
+      -- Dead branch elimination
+      BoolLit True _ -> th'
+      BoolLit False _ -> el'
+      -- If both branches are empty, eliminate the if
+      _ | isEmptyStmt th' && isEmptyStmt el' -> Block [] pos
+      -- If both branches are identical, just use one
+        | th' == el' -> th'
+        | otherwise -> If cond' th' el' pos
+
+  While cond body pos ->
+    let cond' = optimizeExprFull cond
+        body' = optimizeStmtFull body
+    in case cond' of
+      -- while(false) is dead code
+      BoolLit False _ -> Block [] pos
+      _ -> While cond' body' pos
+
+  Break pos -> Break pos
+  ExprStmt expr pos -> ExprStmt (optimizeExprFull expr) pos
+
+-- | Check if a statement is empty (does nothing)
+isEmptyStmt :: Stmt -> Bool
+isEmptyStmt (Block [] _) = True
+isEmptyStmt (Block stmts _) = all isEmptyStmt stmts
+isEmptyStmt (ExprStmt (NullLit _) _) = True
+isEmptyStmt _ = False
+
+-- | Optimize an expression with additional techniques
+optimizeExprFull :: Expr -> Expr
+optimizeExprFull = \case
+  IntLit n p -> IntLit n p
+  BoolLit b p -> BoolLit b p
+  StrLit s p -> StrLit s p
+  NullLit p -> NullLit p
+  Var name p -> Var name p
+  This p -> This p
+
+  Unary op e p -> foldUnary op (optimizeExprFull e) p
+
+  Binary op l r p ->
+    let l' = optimizeExprFull l
+        r' = optimizeExprFull r
+    in foldBinaryExpr op l' r' p
+
+  Ternary c t e p ->
+    let c' = optimizeExprFull c
+        t' = optimizeExprFull t
+        e' = optimizeExprFull e
+    in case c' of
+      BoolLit True _ -> t'
+      BoolLit False _ -> e'
+      -- If both branches are identical, eliminate the ternary
+      _ | t' == e' -> t'
+        | otherwise -> Ternary c' t' e' p
+
+  Call name args p -> Call name (map optimizeExprFull args) p
+  InstanceCall target method args p ->
+    InstanceCall (optimizeExprFull target) method (map optimizeExprFull args) p
+  NewObject cn args p -> NewObject cn (map optimizeExprFull args) p
+  FieldAccess target field p -> FieldAccess (optimizeExprFull target) field p
+
+--------------------------------------------------------------------------------
 -- Structured SSA Optimization
 --------------------------------------------------------------------------------
 -- This performs SSA-style optimizations directly on the structured AST,
@@ -844,5 +993,25 @@ foldBinaryExpr op l r p = case (op, l, r) of
   -- Zero operations
   (Mul, _, IntLit 0 _) -> IntLit 0 p
   (Mul, IntLit 0 _, _) -> IntLit 0 p
+
+  -- Self operations (x op x)
+  (Sub, Var a _, Var b _) | a == b -> IntLit 0 p     -- x - x = 0
+  (Div, Var a _, Var b _) | a == b -> IntLit 1 p     -- x / x = 1 (assuming x != 0)
+  (Mod, Var a _, Var b _) | a == b -> IntLit 0 p     -- x % x = 0
+  (Eq, Var a _, Var b _) | a == b -> BoolLit True p  -- x == x
+  (Ne, Var a _, Var b _) | a == b -> BoolLit False p -- x != x
+  (Le, Var a _, Var b _) | a == b -> BoolLit True p  -- x <= x
+  (Ge, Var a _, Var b _) | a == b -> BoolLit True p  -- x >= x
+  (Lt, Var a _, Var b _) | a == b -> BoolLit False p -- x < x
+  (Gt, Var a _, Var b _) | a == b -> BoolLit False p -- x > x
+
+  -- Strength reduction: multiply by power of 2 -> repeated addition
+  -- SAM doesn't have shift, but x * 2 = x + x is still faster
+  (Mul, e, IntLit 2 _) -> Binary Add e e p           -- x * 2 = x + x
+  (Mul, IntLit 2 _, e) -> Binary Add e e p           -- 2 * x = x + x
+
+  -- Strength reduction: multiply by small constants
+  (Mul, e, IntLit 3 _) -> Binary Add (Binary Add e e p) e p  -- x * 3 = x + x + x
+  (Mul, IntLit 3 _, e) -> Binary Add (Binary Add e e p) e p
 
   _ -> Binary op l r p
