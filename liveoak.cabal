@@ -43,6 +43,14 @@ library
                     , LiveOak.StringRuntime
                     , LiveOak.Compiler
                     , LiveOak.Sam
+                    , LiveOak.TailCall
+                    , LiveOak.Inline
+                    , LiveOak.PRE
+                    , LiveOak.Escape
+                    , LiveOak.StrengthReduce
+                    , LiveOak.RegAlloc
+                    , LiveOak.Schedule
+                    , LiveOak.PhiLower
     build-depends:    base >= 4.17 && < 5
                     , text >= 2.0
                     , megaparsec >= 9.0
