@@ -22,6 +22,7 @@ module LiveOak.Schedule
 import LiveOak.SSATypes
 import LiveOak.CFG
 import LiveOak.Ast (BinaryOp(..))
+import LiveOak.SSAUtils (exprUses, instrUses, instrDefs)
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -140,9 +141,9 @@ findDeps allInstrs (fromIdx, fromInstr) =
 findDep :: Int -> SSAInstr -> (Int, SSAInstr) -> [DepEdge]
 findDep fromIdx fromInstr (toIdx, toInstr) =
   let fromDefs = instrDefs fromInstr
-      fromUses = instrUseSet fromInstr
+      fromUses = instrUses fromInstr
       toDefs = instrDefs toInstr
-      toUses = instrUseSet toInstr
+      toUses = instrUses toInstr
 
       -- RAW: from writes, to reads
       raw = if not (Set.null (Set.intersection fromDefs toUses))
@@ -160,37 +161,6 @@ findDep fromIdx fromInstr (toIdx, toInstr) =
             else []
 
   in raw ++ war ++ waw
-
--- | Get definitions from an instruction
-instrDefs :: SSAInstr -> Set String
-instrDefs = \case
-  SSAAssign var _ -> Set.singleton (ssaName var)
-  _ -> Set.empty
-
--- | Get uses from an instruction as a Set
-instrUseSet :: SSAInstr -> Set String
-instrUseSet = \case
-  SSAAssign _ expr -> exprUseSet expr
-  SSAReturn (Just expr) -> exprUseSet expr
-  SSAReturn Nothing -> Set.empty
-  SSAJump _ -> Set.empty
-  SSABranch cond _ _ -> exprUseSet cond
-  SSAFieldStore target _ _ value -> exprUseSet target `Set.union` exprUseSet value
-  SSAExprStmt expr -> exprUseSet expr
-
--- | Get uses from an expression as a Set
-exprUseSet :: SSAExpr -> Set String
-exprUseSet = \case
-  SSAUse var -> Set.singleton (ssaName var)
-  SSAUnary _ e -> exprUseSet e
-  SSABinary _ l r -> exprUseSet l `Set.union` exprUseSet r
-  SSATernary c t e -> exprUseSet c `Set.union` exprUseSet t `Set.union` exprUseSet e
-  SSACall _ args -> Set.unions (map exprUseSet args)
-  SSAInstanceCall target _ args ->
-    exprUseSet target `Set.union` Set.unions (map exprUseSet args)
-  SSANewObject _ args -> Set.unions (map exprUseSet args)
-  SSAFieldAccess target _ -> exprUseSet target
-  _ -> Set.empty
 
 --------------------------------------------------------------------------------
 -- Critical Path Analysis

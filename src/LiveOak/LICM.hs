@@ -14,6 +14,7 @@ import LiveOak.CFG
 import LiveOak.Dominance
 import LiveOak.Loop
 import LiveOak.SSATypes
+import LiveOak.SSAUtils (blockDefs, isPure)
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -79,12 +80,6 @@ computeLoopDefs :: Map BlockId SSABlock -> BlockId -> Loop -> Set String
 computeLoopDefs blockMap _ loop =
   Set.unions [blockDefs b | bid <- Set.toList (loopBody loop)
                           , Just b <- [Map.lookup bid blockMap]]
-  where
-    blockDefs SSABlock{..} =
-      Set.fromList $ concat
-        [ [ssaName (phiVar phi) | phi <- blockPhis]
-        , [ssaName var | SSAAssign var _ <- blockInstrs]
-        ]
 
 -- | Process all loops
 processLoops :: CFG -> DomTree -> [Loop] -> LICM ()
@@ -157,23 +152,6 @@ canHoist _domTree loop defsInLoop = \case
 
   -- Other instructions cannot be hoisted
   _ -> False
-
--- | Check if an expression is pure (no side effects)
-isPure :: SSAExpr -> Bool
-isPure = \case
-  SSAInt _ -> True
-  SSABool _ -> True
-  SSAStr _ -> True
-  SSANull -> True
-  SSAThis -> True
-  SSAUse _ -> True
-  SSAUnary _ e -> isPure e
-  SSABinary _ l r -> isPure l && isPure r
-  SSATernary c t e -> isPure c && isPure t && isPure e
-  SSACall _ _ -> False  -- Calls may have side effects
-  SSAInstanceCall _ _ _ -> False
-  SSANewObject _ _ -> False  -- Allocation has effects
-  SSAFieldAccess target _ -> isPure target  -- Reading is pure
 
 -- | Hoist an instruction from one block to another
 hoistInstr :: BlockId -> BlockId -> SSAInstr -> LICM ()

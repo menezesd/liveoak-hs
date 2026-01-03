@@ -20,7 +20,6 @@ module LiveOak.Optimize
 
 import LiveOak.Ast
 import qualified LiveOak.DataFlow as DF
-import qualified LiveOak.SSA as SSA
 
 -- | Apply all optimizations to a program.
 -- Runs multiple passes until the program stabilizes or max iterations reached.
@@ -38,35 +37,8 @@ optimize = go (10 :: Int)
 optimizeOnce :: Program -> Program
 optimizeOnce =
     eliminateDeadCode
-  -- Dataflow optimizations (non-SSA)
-  . DF.eliminateNullChecks
-  . DF.eliminateImpossibleBranches  -- Value range analysis
-  . DF.eliminateCommonSubexpressions
-  . DF.globalValueNumbering
-  . DF.eliminateDeadStores
-  . DF.loadStoreForwarding
-  . DF.hoistLoopInvariants
-  . DF.inlineSmallMethods
-  . DF.aggressiveInline
-  -- Advanced optimizations
-  . DF.sinkCode
-  . DF.hoistCommonCode
-  . DF.eliminateDeadParams
-  . DF.escapeAnalysis
-  . DF.promoteMemToReg
-  -- Tail call optimization (control flow transformation)
-  . DF.tailCallOptimize
-  -- Loop optimizations
-  . DF.fuseLoops
-  . DF.unrollLoops
-  -- String optimizations (domain-specific)
-  . DF.optimizeStringConcat
-  . DF.internStrings
-  -- Full SSA-based optimization (global constant/copy propagation)
-  . SSA.fullSSAOptimize
-  -- Structured SSA optimization (local constant/copy propagation)
-  . SSA.structuredSSAOpt
-  -- Basic constant folding (algebraic simplifications)
+  . DF.optimizeSSADataFlow
+  . DF.optimizeASTDataFlow
   . constantFold
 
 -- | Constant folding: evaluate constant expressions at compile time.

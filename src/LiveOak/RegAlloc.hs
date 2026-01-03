@@ -21,6 +21,7 @@ module LiveOak.RegAlloc
 
 import LiveOak.SSATypes
 import LiveOak.CFG
+import LiveOak.SSAUtils (exprUses, instrUses, blockDefs, blockUses)
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -111,43 +112,6 @@ computeIn blockMap liveOut bid _ =
           defs = blockDefs block
           uses = blockUses block
       in Set.union uses (Set.difference out defs)
-
--- | Get definitions in a block
-blockDefs :: SSABlock -> Set String
-blockDefs SSABlock{..} = Set.fromList $
-  [ssaName (phiVar phi) | phi <- blockPhis] ++
-  [ssaName var | SSAAssign var _ <- blockInstrs]
-
--- | Get uses in a block
-blockUses :: SSABlock -> Set String
-blockUses SSABlock{..} = Set.unions $
-  [Set.fromList [ssaName v | (_, v) <- phiArgs phi] | phi <- blockPhis] ++
-  map instrUses blockInstrs
-
--- | Get uses in an instruction
-instrUses :: SSAInstr -> Set String
-instrUses = \case
-  SSAAssign _ expr -> exprUses expr
-  SSAReturn (Just expr) -> exprUses expr
-  SSAReturn Nothing -> Set.empty
-  SSAJump _ -> Set.empty
-  SSABranch cond _ _ -> exprUses cond
-  SSAFieldStore target _ _ value -> exprUses target `Set.union` exprUses value
-  SSAExprStmt expr -> exprUses expr
-
--- | Get uses in an expression
-exprUses :: SSAExpr -> Set String
-exprUses = \case
-  SSAUse var -> Set.singleton (ssaName var)
-  SSAUnary _ e -> exprUses e
-  SSABinary _ l r -> exprUses l `Set.union` exprUses r
-  SSATernary c t e -> exprUses c `Set.union` exprUses t `Set.union` exprUses e
-  SSACall _ args -> Set.unions (map exprUses args)
-  SSAInstanceCall target _ args ->
-    exprUses target `Set.union` Set.unions (map exprUses args)
-  SSANewObject _ args -> Set.unions (map exprUses args)
-  SSAFieldAccess target _ -> exprUses target
-  _ -> Set.empty
 
 -- | Compute liveness at each instruction point
 computePerInstrLiveness :: Map BlockId SSABlock -> Map BlockId (Set String) ->

@@ -29,8 +29,11 @@ library
                     , LiveOak.Codegen
                     , LiveOak.Peephole
                     , LiveOak.DataFlow
+                    , LiveOak.DataFlow.AST
+                    , LiveOak.DataFlow.SSA
                     , LiveOak.SSA
                     , LiveOak.SSATypes
+                    , LiveOak.SSAUtils
                     , LiveOak.CFG
                     , LiveOak.Dominance
                     , LiveOak.SSACodegen
