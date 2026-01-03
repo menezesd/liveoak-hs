@@ -7,6 +7,7 @@
 module LiveOak.Coalesce
   ( -- * Copy Coalescing
     coalescePhiCopies
+  , applyCoalescing
   , CoalesceResult(..)
 
     -- * Interference Graph

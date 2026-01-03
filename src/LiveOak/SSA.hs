@@ -20,17 +20,15 @@ module LiveOak.SSA
   , fromSSA
 
     -- * SSA Optimizations
-  , ssaConstantProp
   , ssaDeadCodeElim
   , ssaCopyProp
-  , partialRedundancyElim
   , simplifyPhis
-
-    -- * Full SSA Optimization Pipeline
-  , fullSSAOptimize
-
-    -- * Structured SSA Optimization
-  , structuredSSAOpt
+  , inline
+  , strengthReduce
+  , tailCallOptimize
+  , stackAllocate
+  , ssaPeephole
+  , ssaOptPipeline
 
     -- * CFG-Based Optimization Pipeline
   , optimizeSSA       -- ^ Full CFG-based SSA optimization
@@ -41,12 +39,21 @@ import LiveOak.Types (ValueType)
 import LiveOak.SSATypes
 import LiveOak.CFG
 import LiveOak.Dominance
+import qualified LiveOak.GVN as GVN
+import qualified LiveOak.LICM as LICM
+import qualified LiveOak.SCCP as SCCP
+import LiveOak.Loop (findLoops)
+import qualified LiveOak.Inline as Inline
+import qualified LiveOak.StrengthReduce as SR
+import qualified LiveOak.TailCall as TCO
+import qualified LiveOak.Escape as Escape
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Control.Monad.State
 import Data.List (foldl')
+import qualified LiveOak.Coalesce as Coalesce
 
 --------------------------------------------------------------------------------
 -- Conversion to SSA
@@ -371,7 +378,7 @@ renameBlock cfg domTree blockId renSt blockMap =
           blockMap1 = Map.insert blockId renamedBlock blockMap
           -- Fill in phi arguments in successor blocks
           blockMap2 = foldl' (fillPhiArgs blockId renSt2) blockMap1 (successors cfg blockId)
-          -- Process children in dominator tree
+          -- Process children in a dominator tree
           (renSt3, blockMap3) = foldl' (processChild cfg domTree)
                                        (renSt2, blockMap2)
                                        (domChildren domTree blockId)
@@ -487,9 +494,16 @@ ssaClassToNormal SSAClass{..} = ClassDecl
 
 -- | Convert SSA method back to normal AST
 ssaMethodToNormal :: SSAMethod -> MethodDecl
-ssaMethodToNormal SSAMethod{..} =
+ssaMethodToNormal method@SSAMethod{..} =
   let params = [ParamDecl (ssaName v) (getVarType v) | v <- ssaMethodParams]
-      body = blocksToStmt ssaMethodBlocks
+      -- Build CFG and DomTree for coalescing
+      cfg = buildCFG method
+      domTree = computeDominators cfg
+      -- Apply coalescing to eliminate phi copies
+      coalesceResult = Coalesce.coalescePhiCopies cfg domTree ssaMethodBlocks
+      coalescedBlocks = Coalesce.applyCoalescing coalesceResult ssaMethodBlocks
+      -- Convert coalesced blocks back to statements
+      body = Block (concatMap blockToStmts coalescedBlocks) 0
   in MethodDecl ssaMethodClassName ssaMethodName params ssaMethodReturnSig body
 
 -- | Get the type from an SSAVar, defaulting to Int if unknown
@@ -500,22 +514,14 @@ getVarType v = case ssaVarType v of
   Nothing -> error $ "SSA: Missing type for parameter " ++ ssaName v
 
 -- | Convert SSA blocks to a statement
-blocksToStmt :: [SSABlock] -> Stmt
-blocksToStmt blocks = Block (concatMap blockToStmts blocks) 0
+-- After coalescing, phi nodes are effectively gone or handled as regular assignments.
+-- This function now just concatenates instructions from all blocks.
+blocksToStmt :: [SSABlock] -> [Stmt]
+blocksToStmt blocks = concatMap blockToStmts blocks
 
 -- | Convert a single block to statements
 blockToStmts :: SSABlock -> [Stmt]
-blockToStmts SSABlock{..} =
-  -- Phi nodes become assignments from the appropriate predecessor
-  -- (simplified - real implementation would need control flow info)
-  map phiToStmt blockPhis ++ map instrToStmt blockInstrs
-
-phiToStmt :: PhiNode -> Stmt
-phiToStmt PhiNode{..} =
-  -- Simplified: just use first argument
-  case phiArgs of
-    ((_, v):_) -> Assign (varToName phiVar) (Var (varToName v) 0) 0
-    [] -> Block [] 0
+blockToStmts SSABlock{..} = map instrToStmt blockInstrs
 
 instrToStmt :: SSAInstr -> Stmt
 instrToStmt = \case
@@ -551,39 +557,6 @@ ssaExprToExpr = \case
 --------------------------------------------------------------------------------
 -- SSA Optimizations
 --------------------------------------------------------------------------------
-
--- | Sparse conditional constant propagation on SSA
-ssaConstantProp :: SSAProgram -> SSAProgram
-ssaConstantProp (SSAProgram classes) =
-  SSAProgram [c { ssaClassMethods = map propMethod (ssaClassMethods c) } | c <- classes]
-  where
-    propMethod m = m { ssaMethodBlocks = map propBlock (ssaMethodBlocks m) }
-    propBlock b = b { blockInstrs = map propInstr (blockInstrs b) }
-    propInstr = \case
-      SSAAssign v e -> SSAAssign v (foldSSAExpr e)
-      SSAFieldStore t f off v -> SSAFieldStore (foldSSAExpr t) f off (foldSSAExpr v)
-      SSAReturn e -> SSAReturn (foldSSAExpr <$> e)
-      SSABranch c t f -> SSABranch (foldSSAExpr c) t f
-      SSAExprStmt e -> SSAExprStmt (foldSSAExpr e)
-      i -> i
-
--- | Fold constant expressions in SSA
-foldSSAExpr :: SSAExpr -> SSAExpr
-foldSSAExpr = \case
-  SSAUnary Neg (SSAInt n) -> SSAInt (-n)
-  SSAUnary Not (SSABool b) -> SSABool (not b)
-  SSABinary Add (SSAInt a) (SSAInt b) -> SSAInt (a + b)
-  SSABinary Sub (SSAInt a) (SSAInt b) -> SSAInt (a - b)
-  SSABinary Mul (SSAInt a) (SSAInt b) -> SSAInt (a * b)
-  SSABinary Div (SSAInt a) (SSAInt b) | b /= 0 -> SSAInt (a `div` b)
-  SSABinary Eq (SSAInt a) (SSAInt b) -> SSABool (a == b)
-  SSABinary Lt (SSAInt a) (SSAInt b) -> SSABool (a < b)
-  SSABinary Gt (SSAInt a) (SSAInt b) -> SSABool (a > b)
-  SSABinary And (SSABool a) (SSABool b) -> SSABool (a && b)
-  SSABinary Or (SSABool a) (SSABool b) -> SSABool (a || b)
-  SSATernary (SSABool True) t _ -> foldSSAExpr t
-  SSATernary (SSABool False) _ e -> foldSSAExpr e
-  e -> e
 
 -- | Dead code elimination on SSA
 ssaDeadCodeElim :: SSAProgram -> SSAProgram
@@ -690,95 +663,83 @@ ssaCopyProp (SSAProgram classes) =
       e -> e
 
 --------------------------------------------------------------------------------
--- Partial Redundancy Elimination (PRE)
+-- GVN Wrapper
 --------------------------------------------------------------------------------
 
--- | Partial Redundancy Elimination on SSA form
--- Finds expressions that are computed on multiple paths and hoists them
--- to make redundant computations eliminable.
-partialRedundancyElim :: SSAProgram -> SSAProgram
-partialRedundancyElim (SSAProgram classes) =
-  SSAProgram [c { ssaClassMethods = map preMethod (ssaClassMethods c) } | c <- classes]
-  where
-    preMethod m =
-      let -- Step 1: Find all expressions and where they're computed
-          exprMap = collectExpressions (ssaMethodBlocks m)
-          -- Step 2: Find fully redundant expressions (computed in all predecessors)
-          redundant = findFullyRedundant exprMap
-          -- Step 3: Eliminate redundant computations by reusing earlier results
-          blocks' = eliminateRedundant redundant (ssaMethodBlocks m)
-      in m { ssaMethodBlocks = blocks' }
+gvn :: SSAProgram -> SSAProgram
+gvn (SSAProgram classes) = SSAProgram (map gvnClass classes)
 
--- | Canonical form of an expression for comparison
--- (ignoring position info, treating equivalent expressions as equal)
-data CanonExpr
-  = CUnary UnaryOp CanonExpr
-  | CBinary BinaryOp CanonExpr CanonExpr
-  | CVar String Int
-  | CInt Int
-  | CBool Bool
-  | CStr String
-  | CNull
-  | CThis
-  deriving (Eq, Ord, Show)
+gvnClass :: SSAClass -> SSAClass
+gvnClass c = c { ssaClassMethods = map gvnMethod (ssaClassMethods c) }
 
--- | Convert SSA expression to canonical form
-canonicalize :: SSAExpr -> Maybe CanonExpr
-canonicalize = \case
-  SSAInt n -> Just $ CInt n
-  SSABool b -> Just $ CBool b
-  SSAStr s -> Just $ CStr s
-  SSANull -> Just CNull
-  SSAThis -> Just CThis
-  SSAUse (SSAVar name ver _) -> Just $ CVar name ver
-  SSAUnary op e -> CUnary op <$> canonicalize e
-  SSABinary op l r -> CBinary op <$> canonicalize l <*> canonicalize r
-  -- Skip complex expressions for now
-  _ -> Nothing
+gvnMethod :: SSAMethod -> SSAMethod
+gvnMethod method =
+  let cfg = buildCFG method
+      domTree = computeDominators cfg
+      gvnResult = GVN.runGVN cfg domTree (ssaMethodBlocks method)
+  in method { ssaMethodBlocks = GVN.gvnOptBlocks gvnResult }
 
--- | Collect all expressions and where they're computed
--- Returns: expression -> [(block, var that holds the result)]
-collectExpressions :: [SSABlock] -> Map CanonExpr [(String, SSAVar)]
-collectExpressions blocks = Map.fromListWith (++)
-  [ (ce, [(blockLabel b, v)])
-  | b <- blocks
-  , SSAAssign v e <- blockInstrs b
-  , Just ce <- [canonicalize e]
-  , isWorthHoisting ce
-  ]
+--------------------------------------------------------------------------------
+-- SCCP Wrapper
+--------------------------------------------------------------------------------
 
--- | Check if an expression is worth hoisting
--- (avoid hoisting trivial expressions)
-isWorthHoisting :: CanonExpr -> Bool
-isWorthHoisting = \case
-  CUnary _ _ -> True
-  CBinary _ _ _ -> True
-  _ -> False
+sccp :: SSAProgram -> SSAProgram
+sccp (SSAProgram classes) =
+  SSAProgram [c { ssaClassMethods = map sccpMethod (ssaClassMethods c) } | c <- classes]
 
--- | Find fully redundant expressions
--- An expression is fully redundant if it's already computed and available
-findFullyRedundant :: Map CanonExpr [(String, SSAVar)] -> Map CanonExpr SSAVar
-findFullyRedundant exprMap = Map.mapMaybe pickFirst exprMap
-  where
-    -- Use the first computation as the canonical one
-    -- (In a full implementation, we'd use dominance to pick the best)
-    pickFirst [] = Nothing
-    pickFirst [_] = Nothing  -- Only one computation, nothing to eliminate
-    pickFirst ((_, v):_) = Just v  -- Multiple computations, use first
+sccpMethod :: SSAMethod -> SSAMethod
+sccpMethod method =
+  let cfg = buildCFG method
+      sccpResult = SCCP.runSCCP cfg (ssaMethodBlocks method)
+      constMap = Map.mapMaybe SCCP.getConstant (SCCP.sccpConstValues sccpResult)
+      blocks' = map (applyConstPropagation constMap) (ssaMethodBlocks method)
+      liveBlocks = filter (\b -> Set.member (blockLabel b) (SCCP.sccpReachableBlocks sccpResult)) blocks'
+  in method { ssaMethodBlocks = liveBlocks }
 
--- | Eliminate redundant computations
-eliminateRedundant :: Map CanonExpr SSAVar -> [SSABlock] -> [SSABlock]
-eliminateRedundant redundant blocks = map elimBlock blocks
-  where
-    elimBlock b = b { blockInstrs = concatMap elimInstr (blockInstrs b) }
+applyConstPropagation :: Map String SSAExpr -> SSABlock -> SSABlock
+applyConstPropagation consts block =
+  block { blockInstrs = map (sccpSubstInstr consts) (blockInstrs block) }
 
-    elimInstr instr@(SSAAssign v e) =
-      case canonicalize e >>= (`Map.lookup` redundant) of
-        Just canonical | canonical /= v ->
-          -- Replace with copy from canonical version
-          [SSAAssign v (SSAUse canonical)]
-        _ -> [instr]
-    elimInstr instr = [instr]
+sccpSubstInstr :: Map String SSAExpr -> SSAInstr -> SSAInstr
+sccpSubstInstr consts = \case
+  SSAAssign v e -> SSAAssign v (sccpSubstExpr consts e)
+  SSAFieldStore t f off val -> SSAFieldStore (sccpSubstExpr consts t) f off (sccpSubstExpr consts val)
+  SSAReturn e -> SSAReturn (sccpSubstExpr consts <$> e)
+  SSABranch c t f -> SSABranch (sccpSubstExpr consts c) t f
+  SSAExprStmt e -> SSAExprStmt (sccpSubstExpr consts e)
+  i -> i
+
+sccpSubstExpr :: Map String SSAExpr -> SSAExpr -> SSAExpr
+sccpSubstExpr consts = \case
+  SSAUse v -> case Map.lookup (ssaName v) consts of
+                Just replacement -> replacement
+                Nothing -> SSAUse v
+  SSAUnary op e -> SSAUnary op (sccpSubstExpr consts e)
+  SSABinary op l r -> SSABinary op (sccpSubstExpr consts l) (sccpSubstExpr consts r)
+  SSATernary c t e -> SSATernary (sccpSubstExpr consts c) (sccpSubstExpr consts t) (sccpSubstExpr consts e)
+  SSACall n args -> SSACall n (map (sccpSubstExpr consts) args)
+  SSAInstanceCall t m args -> SSAInstanceCall (sccpSubstExpr consts t) m (map (sccpSubstExpr consts) args)
+  SSANewObject cn args -> SSANewObject cn (map (sccpSubstExpr consts) args)
+  SSAFieldAccess t f -> SSAFieldAccess (sccpSubstExpr consts t) f
+  e -> e
+
+--------------------------------------------------------------------------------
+-- LICM Wrapper
+--------------------------------------------------------------------------------
+
+licm :: SSAProgram -> SSAProgram
+licm (SSAProgram classes) = SSAProgram (map licmClass classes)
+
+licmClass :: SSAClass -> SSAClass
+licmClass c = c { ssaClassMethods = map licmMethod (ssaClassMethods c) }
+
+licmMethod :: SSAMethod -> SSAMethod
+licmMethod method =
+  let cfg = buildCFG method
+      domTree = computeDominators cfg
+      loops = findLoops cfg domTree
+      licmResult = LICM.runLICM cfg domTree loops (ssaMethodBlocks method)
+  in method { ssaMethodBlocks = LICM.licmOptBlocks licmResult }
 
 --------------------------------------------------------------------------------
 -- Phi Simplification
@@ -794,386 +755,112 @@ simplifyPhis (SSAProgram classes) =
     simplifyMethod m = m { ssaMethodBlocks = map simplifyBlock (ssaMethodBlocks m) }
 
     simplifyBlock b =
-      let (simplified, copies) = unzip $ map simplifyPhi (blockPhis b)
-          -- Some phis become copy statements
-          extraInstrs = [SSAAssign dst (SSAUse src) | Just (dst, src) <- copies]
-      in b { blockPhis = [p | (Just p, _) <- zip simplified (repeat Nothing)]
-           , blockInstrs = extraInstrs ++ blockInstrs b
-           }
+      let (newPhis, copies) = foldl' processPhi ([], []) (blockPhis b)
+          newInstrs = map (\(dst, src) -> SSAAssign dst (SSAUse src)) copies ++ blockInstrs b
+      in b { blockPhis = newPhis, blockInstrs = newInstrs }
 
-    -- Returns (Maybe simplified phi, Maybe (dst, src) for copy)
-    simplifyPhi :: PhiNode -> (Maybe PhiNode, Maybe (SSAVar, SSAVar))
-    simplifyPhi phi@PhiNode{..}
-      -- All arguments are the same variable
-      | allSame (map snd phiArgs) =
-          case phiArgs of
-            ((_, v):_) -> (Nothing, Just (phiVar, v))
-            [] -> (Just phi, Nothing)
-      | otherwise = (Just phi, Nothing)
-
-    allSame [] = True
-    allSame (x:xs) = all (== x) xs
+    processPhi (phis, copies) phi =
+      let args = map snd (phiArgs phi)
+      in if not (null args) && all (== head args) (tail args)
+         then (phis, (phiVar phi, head args) : copies)
+         else (phi : phis, copies)
 
 --------------------------------------------------------------------------------
--- Full SSA Optimization Pipeline
+-- Inline Wrapper
 --------------------------------------------------------------------------------
 
--- | Full SSA-based optimization pipeline.
--- This version preserves the original AST structure while applying
--- additional SSA-style optimizations that complement structuredSSAOpt.
---
--- Currently applies:
--- 1. Dead branch elimination (if with constant condition)
--- 2. Additional algebraic simplifications
--- 3. Common subexpression elimination within expressions
-fullSSAOptimize :: Program -> Program
-fullSSAOptimize (Program classes) = Program (map optimizeClassFull classes)
-
--- | Optimize a class with full SSA techniques
-optimizeClassFull :: ClassDecl -> ClassDecl
-optimizeClassFull c@ClassDecl{..} =
-  c { classMethods = map optimizeMethodFull classMethods }
-
--- | Optimize a method with full SSA techniques
-optimizeMethodFull :: MethodDecl -> MethodDecl
-optimizeMethodFull m@MethodDecl{..} =
-  m { methodBody = optimizeStmtFull methodBody }
-
--- | Optimize a statement with additional SSA techniques
-optimizeStmtFull :: Stmt -> Stmt
-optimizeStmtFull = \case
-  Block stmts pos ->
-    -- Eliminate empty statements and merge adjacent blocks
-    let stmts' = filter (not . isEmptyStmt) $ map optimizeStmtFull stmts
-    in Block stmts' pos
-
-  VarDecl name ty initOpt pos ->
-    VarDecl name ty (optimizeExprFull <$> initOpt) pos
-
-  Assign name expr pos ->
-    Assign name (optimizeExprFull expr) pos
-
-  FieldAssign target field off value pos ->
-    FieldAssign (optimizeExprFull target) field off (optimizeExprFull value) pos
-
-  Return exprOpt pos ->
-    Return (optimizeExprFull <$> exprOpt) pos
-
-  If cond th el pos ->
-    let cond' = optimizeExprFull cond
-        th' = optimizeStmtFull th
-        el' = optimizeStmtFull el
-    in case cond' of
-      -- Dead branch elimination
-      BoolLit True _ -> th'
-      BoolLit False _ -> el'
-      -- If both branches are empty, eliminate the if
-      _ | isEmptyStmt th' && isEmptyStmt el' -> Block [] pos
-      -- If both branches are identical, just use one
-        | th' == el' -> th'
-        | otherwise -> If cond' th' el' pos
-
-  While cond body pos ->
-    let cond' = optimizeExprFull cond
-        body' = optimizeStmtFull body
-    in case cond' of
-      -- while(false) is dead code
-      BoolLit False _ -> Block [] pos
-      _ -> While cond' body' pos
-
-  Break pos -> Break pos
-  ExprStmt expr pos -> ExprStmt (optimizeExprFull expr) pos
-
--- | Check if a statement is empty (does nothing)
-isEmptyStmt :: Stmt -> Bool
-isEmptyStmt (Block [] _) = True
-isEmptyStmt (Block stmts _) = all isEmptyStmt stmts
-isEmptyStmt (ExprStmt (NullLit _) _) = True
-isEmptyStmt _ = False
-
--- | Optimize an expression with additional techniques
-optimizeExprFull :: Expr -> Expr
-optimizeExprFull = \case
-  IntLit n p -> IntLit n p
-  BoolLit b p -> BoolLit b p
-  StrLit s p -> StrLit s p
-  NullLit p -> NullLit p
-  Var name p -> Var name p
-  This p -> This p
-
-  Unary op e p -> foldUnary op (optimizeExprFull e) p
-
-  Binary op l r p ->
-    let l' = optimizeExprFull l
-        r' = optimizeExprFull r
-    in foldBinaryExpr op l' r' p
-
-  Ternary c t e p ->
-    let c' = optimizeExprFull c
-        t' = optimizeExprFull t
-        e' = optimizeExprFull e
-    in case c' of
-      BoolLit True _ -> t'
-      BoolLit False _ -> e'
-      -- If both branches are identical, eliminate the ternary
-      _ | t' == e' -> t'
-        | otherwise -> Ternary c' t' e' p
-
-  Call name args p -> Call name (map optimizeExprFull args) p
-  InstanceCall target method args p ->
-    InstanceCall (optimizeExprFull target) method (map optimizeExprFull args) p
-  NewObject cn args p -> NewObject cn (map optimizeExprFull args) p
-  FieldAccess target field p -> FieldAccess (optimizeExprFull target) field p
+-- | Inline functions in the program
+inline :: SSAProgram -> SSAProgram
+inline prog = Inline.inlineOptProgram (Inline.inlineFunctions Inline.defaultHeuristics prog)
 
 --------------------------------------------------------------------------------
--- Structured SSA Optimization
+-- Strength Reduction Wrapper
 --------------------------------------------------------------------------------
--- This performs SSA-style optimizations directly on the structured AST,
--- without converting to a CFG representation. This preserves control flow
--- structure while still enabling optimizations like:
--- - Copy propagation
--- - Constant propagation
--- - Common subexpression elimination
--- - Dead code elimination
 
--- | Optimize a program using structured SSA techniques.
--- This preserves the original AST structure while applying SSA-style
--- value propagation and constant folding.
-structuredSSAOpt :: Program -> Program
-structuredSSAOpt (Program classes) = Program (map optClass classes)
-
-optClass :: ClassDecl -> ClassDecl
-optClass c@ClassDecl{..} = c { classMethods = map optMethod classMethods }
-
-optMethod :: MethodDecl -> MethodDecl
-optMethod m@MethodDecl{..} =
-  let initEnv = Map.empty
-      (body', _) = runState (optStmt methodBody) initEnv
-  in m { methodBody = body' }
-
--- | Environment mapping variable names to their known values
-type OptEnv = Map String KnownValue
-
--- | A value that may be known at compile time
-data KnownValue
-  = KInt !Int
-  | KBool !Bool
-  | KStr !String
-  | KVar !String      -- Known to be a copy of another variable
-  | KExpr !Expr       -- Known to be this expression (for CSE)
-  deriving (Eq, Show)
-
-type OptM a = State OptEnv a
-
--- | Optimize a statement
-optStmt :: Stmt -> OptM Stmt
-optStmt = \case
-  Block stmts pos -> do
-    stmts' <- mapM optStmt stmts
-    return $ Block stmts' pos
-
-  VarDecl name ty initOpt pos -> do
-    case initOpt of
-      Just expr -> do
-        expr' <- optExpr expr
-        recordValue name expr'
-        return $ VarDecl name ty (Just expr') pos
-      Nothing -> do
-        modify $ Map.delete name
-        return $ VarDecl name ty Nothing pos
-
-  Assign name expr pos -> do
-    expr' <- optExpr expr
-    recordValue name expr'
-    return $ Assign name expr' pos
-
-  FieldAssign target field off value pos -> do
-    target' <- optExpr target
-    value' <- optExpr value
-    return $ FieldAssign target' field off value' pos
-
-  Return exprOpt pos -> do
-    exprOpt' <- traverse optExpr exprOpt
-    return $ Return exprOpt' pos
-
-  If cond th el pos -> do
-    cond' <- optExpr cond
-    -- Save environment before branches
-    env <- get
-    th' <- optStmt th
-    thEnv <- get
-    put env
-    el' <- optStmt el
-    elEnv <- get
-    -- After if, remove any variable that was assigned in either branch
-    -- (since we don't know which branch was taken)
-    let thModified = Map.keysSet thEnv `Set.difference` Map.keysSet env
-        elModified = Map.keysSet elEnv `Set.difference` Map.keysSet env
-        -- Also consider vars that changed value
-        thChanged = Set.fromList [k | k <- Map.keys env, Map.lookup k thEnv /= Map.lookup k env]
-        elChanged = Set.fromList [k | k <- Map.keys env, Map.lookup k elEnv /= Map.lookup k env]
-        allModified = Set.unions [thModified, elModified, thChanged, elChanged]
-        -- Remove all modified variables from environment
-        finalEnv = foldr Map.delete env (Set.toList allModified)
-    put finalEnv
-    return $ If cond' th' el' pos
-
-  While cond body pos -> do
-    -- For while loops, we must NOT propagate constants into the condition
-    -- because the loop body may modify the variables used in the condition.
-    -- Clear environment before optimizing condition and body.
-    modify (const Map.empty)  -- Clear all known values
-    cond' <- optExpr cond
-    body' <- optStmt body
-    modify (const Map.empty)  -- Clear again after loop (values may be modified)
-    return $ While cond' body' pos
-
-  Break pos -> return $ Break pos
-
-  ExprStmt expr pos -> do
-    expr' <- optExpr expr
-    return $ ExprStmt expr' pos
-
--- | Record a value assignment
-recordValue :: String -> Expr -> OptM ()
-recordValue name expr = modify $ Map.insert name (exprToKnown expr)
+-- | Apply strength reduction to the program
+strengthReduce :: SSAProgram -> SSAProgram
+strengthReduce (SSAProgram classes) = SSAProgram (map srClass classes)
   where
-    exprToKnown (IntLit n _) = KInt n
-    exprToKnown (BoolLit b _) = KBool b
-    exprToKnown (StrLit s _) = KStr s
-    exprToKnown (Var v _) = KVar v
-    exprToKnown e = KExpr e
+    srClass c = c { ssaClassMethods = map srMethod (ssaClassMethods c) }
+    srMethod method =
+      let cfg = buildCFG method
+          domTree = computeDominators cfg
+          loops = findLoops cfg domTree
+          srResult = SR.reduceStrength cfg domTree loops (ssaMethodBlocks method)
+      in method { ssaMethodBlocks = SR.srOptBlocks srResult }
 
--- | Optimize an expression using known values
-optExpr :: Expr -> OptM Expr
-optExpr = \case
-  IntLit n p -> return $ IntLit n p
-  BoolLit b p -> return $ BoolLit b p
-  StrLit s p -> return $ StrLit s p
-  NullLit p -> return $ NullLit p
-  This p -> return $ This p
+--------------------------------------------------------------------------------
+-- Tail Call Optimization Wrapper
+--------------------------------------------------------------------------------
 
-  Var name p -> lookupVar Set.empty name p
-    where
-      -- Lookup variable with cycle detection
-      lookupVar :: Set String -> String -> Int -> OptM Expr
-      lookupVar visited varName pos
-        | Set.member varName visited = return $ Var varName pos  -- Cycle detected, stop
-        | otherwise = do
-            env <- get
-            case Map.lookup varName env of
-              Just (KInt n) -> return $ IntLit n pos
-              Just (KBool b) -> return $ BoolLit b pos
-              Just (KStr s) -> return $ StrLit s pos
-              Just (KVar v) -> lookupVar (Set.insert varName visited) v pos
-              _ -> return $ Var varName pos
+-- | Apply tail call optimization to the program
+tailCallOptimize :: SSAProgram -> SSAProgram
+tailCallOptimize (SSAProgram classes) = SSAProgram (map tcoClass classes)
+  where
+    tcoClass c = c { ssaClassMethods = map tcoMethod (ssaClassMethods c) }
+    tcoMethod method =
+      let className = ssaMethodClassName method
+          methodName = ssaMethodName method
+          tcoResult = TCO.optimizeTailCalls className methodName (ssaMethodBlocks method)
+      in method { ssaMethodBlocks = TCO.tcoOptBlocks tcoResult }
 
-  Unary op e p -> do
-    e' <- optExpr e
-    return $ foldUnary op e' p
+--------------------------------------------------------------------------------
+-- SSA Peephole Optimization
+--------------------------------------------------------------------------------
 
-  Binary op l r p -> do
-    l' <- optExpr l
-    r' <- optExpr r
-    return $ foldBinaryExpr op l' r' p
+-- | SSA-level peephole optimizations
+ssaPeephole :: SSAProgram -> SSAProgram
+ssaPeephole (SSAProgram classes) = SSAProgram (map peepholeClass classes)
 
-  Ternary c t e p -> do
-    c' <- optExpr c
-    case c' of
-      BoolLit True _ -> optExpr t
-      BoolLit False _ -> optExpr e
-      _ -> do
-        t' <- optExpr t
-        e' <- optExpr e
-        return $ Ternary c' t' e' p
+peepholeClass :: SSAClass -> SSAClass
+peepholeClass c = c { ssaClassMethods = map peepholeMethod (ssaClassMethods c) }
 
-  Call name args p -> do
-    args' <- mapM optExpr args
-    return $ Call name args' p
+peepholeMethod :: SSAMethod -> SSAMethod
+peepholeMethod method = method { ssaMethodBlocks = map peepholeBlock (ssaMethodBlocks method) }
 
-  InstanceCall target method args p -> do
-    target' <- optExpr target
-    args' <- mapM optExpr args
-    return $ InstanceCall target' method args' p
+peepholeBlock :: SSABlock -> SSABlock
+peepholeBlock block = block { blockInstrs = map peepholeInstr (blockInstrs block) }
 
-  NewObject cn args p -> do
-    args' <- mapM optExpr args
-    return $ NewObject cn args' p
+peepholeInstr :: SSAInstr -> SSAInstr
+peepholeInstr (SSAAssign var expr) = SSAAssign var (peepholeExpr expr)
+peepholeInstr (SSAReturn (Just expr)) = SSAReturn (Just (peepholeExpr expr))
+peepholeInstr (SSABranch cond t f) = SSABranch (peepholeExpr cond) t f
+peepholeInstr other = other
 
-  FieldAccess target field p -> do
-    target' <- optExpr target
-    return $ FieldAccess target' field p
+peepholeExpr :: SSAExpr -> SSAExpr
+peepholeExpr = \case
+  -- double negation
+  SSAUnary Neg (SSAUnary Neg e) -> peepholeExpr e
+  SSAUnary Not (SSAUnary Not e) -> peepholeExpr e
+  -- arithmetic identities
+  SSABinary Add e (SSAInt 0) -> peepholeExpr e
+  SSABinary Add (SSAInt 0) e -> peepholeExpr e
+  SSABinary Sub e (SSAInt 0) -> peepholeExpr e
+  SSABinary Mul e (SSAInt 1) -> peepholeExpr e
+  SSABinary Mul (SSAInt 1) e -> peepholeExpr e
+  SSABinary Div e (SSAInt 1) -> peepholeExpr e
+  -- arithmetic with zero
+  SSABinary Mul _ (SSAInt 0) -> SSAInt 0
+  SSABinary Mul (SSAInt 0) _ -> SSAInt 0
+  -- recursively apply
+  SSAUnary op e -> SSAUnary op (peepholeExpr e)
+  SSABinary op l r -> SSABinary op (peepholeExpr l) (peepholeExpr r)
+  SSATernary c t e -> SSATernary (peepholeExpr c) (peepholeExpr t) (peepholeExpr e)
+  other -> other
 
--- | Fold unary operations on constants
-foldUnary :: UnaryOp -> Expr -> Int -> Expr
-foldUnary op e p = case (op, e) of
-  (Neg, IntLit n _) -> IntLit (-n) p
-  (Not, BoolLit b _) -> BoolLit (not b) p
-  (Neg, Unary Neg inner _) -> inner  -- --x = x
-  (Not, Unary Not inner _) -> inner  -- !!x = x
-  _ -> Unary op e p
+--------------------------------------------------------------------------------
+-- Stack Allocation Wrapper
+--------------------------------------------------------------------------------
 
--- | Fold binary operations on constants
-foldBinaryExpr :: BinaryOp -> Expr -> Expr -> Int -> Expr
-foldBinaryExpr op l r p = case (op, l, r) of
-  -- Integer arithmetic
-  (Add, IntLit a _, IntLit b _) -> IntLit (a + b) p
-  (Sub, IntLit a _, IntLit b _) -> IntLit (a - b) p
-  (Mul, IntLit a _, IntLit b _) -> IntLit (a * b) p
-  (Div, IntLit a _, IntLit b _) | b /= 0 -> IntLit (a `div` b) p
-  (Mod, IntLit a _, IntLit b _) | b /= 0 -> IntLit (a `mod` b) p
-
-  -- Integer comparisons
-  (Eq, IntLit a _, IntLit b _) -> BoolLit (a == b) p
-  (Ne, IntLit a _, IntLit b _) -> BoolLit (a /= b) p
-  (Lt, IntLit a _, IntLit b _) -> BoolLit (a < b) p
-  (Le, IntLit a _, IntLit b _) -> BoolLit (a <= b) p
-  (Gt, IntLit a _, IntLit b _) -> BoolLit (a > b) p
-  (Ge, IntLit a _, IntLit b _) -> BoolLit (a >= b) p
-
-  -- Boolean operations
-  (And, BoolLit a _, BoolLit b _) -> BoolLit (a && b) p
-  (Or, BoolLit a _, BoolLit b _) -> BoolLit (a || b) p
-
-  -- Short-circuit
-  (And, BoolLit False _, _) -> BoolLit False p
-  (And, BoolLit True _, r') -> r'
-  (And, _, BoolLit False _) -> BoolLit False p
-  (And, l', BoolLit True _) -> l'
-  (Or, BoolLit True _, _) -> BoolLit True p
-  (Or, BoolLit False _, r') -> r'
-  (Or, _, BoolLit True _) -> BoolLit True p
-  (Or, l', BoolLit False _) -> l'
-
-  -- String concatenation
-  (Add, StrLit a _, StrLit b _) -> StrLit (a ++ b) p
-
-  -- Identity operations
-  (Add, e, IntLit 0 _) -> e
-  (Add, IntLit 0 _, e) -> e
-  (Sub, e, IntLit 0 _) -> e
-  (Mul, e, IntLit 1 _) -> e
-  (Mul, IntLit 1 _, e) -> e
-  (Div, e, IntLit 1 _) -> e
-
-  -- Zero operations
-  (Mul, _, IntLit 0 _) -> IntLit 0 p
-  (Mul, IntLit 0 _, _) -> IntLit 0 p
-
-  -- Self operations (x op x)
-  (Sub, Var a _, Var b _) | a == b -> IntLit 0 p     -- x - x = 0
-  (Div, Var a _, Var b _) | a == b -> IntLit 1 p     -- x / x = 1 (assuming x != 0)
-  (Mod, Var a _, Var b _) | a == b -> IntLit 0 p     -- x % x = 0
-  (Eq, Var a _, Var b _) | a == b -> BoolLit True p  -- x == x
-  (Ne, Var a _, Var b _) | a == b -> BoolLit False p -- x != x
-  (Le, Var a _, Var b _) | a == b -> BoolLit True p  -- x <= x
-  (Ge, Var a _, Var b _) | a == b -> BoolLit True p  -- x >= x
-  (Lt, Var a _, Var b _) | a == b -> BoolLit False p -- x < x
-  (Gt, Var a _, Var b _) | a == b -> BoolLit False p -- x > x
-
-  -- Note: power-of-2 multiplication is handled in codegen with LSHIFT
-
-  _ -> Binary op l r p
+-- | Perform escape analysis and mark objects for stack allocation
+stackAllocate :: SSAProgram -> SSAProgram
+stackAllocate (SSAProgram classes) = SSAProgram (map saClass classes)
+  where
+    saClass c = c { ssaClassMethods = map saMethod (ssaClassMethods c) }
+    saMethod method =
+      let cfg = buildCFG method
+          escapeResult = Escape.analyzeEscape cfg (ssaMethodBlocks method)
+      in method { ssaMethodBlocks = Escape.stackAllocate escapeResult (ssaMethodBlocks method) }
 
 --------------------------------------------------------------------------------
 -- CFG-Based SSA Optimization Pipeline
@@ -1186,16 +873,41 @@ optimizeSSA :: Program -> Program
 optimizeSSA prog =
   let -- Convert to SSA with proper phi placement
       ssaProg = toSSAWithCFG prog
-      -- Apply SSA optimizations
-      optimized = ssaOptPipeline ssaProg
+      -- Run expensive, structural optimizations once
+      inlined = inline ssaProg
+      tco = tailCallOptimize inlined
+      sr = strengthReduce tco
+      -- Run the main cleanup pipeline until a fixed point is reached
+      optimized = fixedPoint ssaCleanupPipeline sr
+      -- Perform stack allocation
+      stackAllocated = stackAllocate optimized
       -- Convert back to AST
-  in fromSSA optimized
+  in fromSSA stackAllocated
 
--- | SSA optimization pipeline
+-- | Apply an optimization pass until a fixed point is reached.
+fixedPoint :: Eq a => (a -> a) -> a -> a
+fixedPoint f x = let x' = f x in if x' == x then x else fixedPoint f x'
+
+-- | The main pipeline of optimizations that can be run iteratively.
+ssaCleanupPipeline :: SSAProgram -> SSAProgram
+ssaCleanupPipeline =
+    gvn
+  . sccp
+  . licm
+  . ssaDeadCodeElim
+  . ssaCopyProp
+  . simplifyPhis
+  . ssaPeephole
+
+-- | SSA optimization pipeline (old, kept for reference)
 ssaOptPipeline :: SSAProgram -> SSAProgram
 ssaOptPipeline =
-    simplifyPhis           -- Remove trivial phi nodes
-  . ssaDeadCodeElim        -- Remove dead assignments
-  . ssaCopyProp            -- Propagate copies
-  . ssaConstantProp        -- Fold constants
-  . simplifyPhis           -- Clean up again
+    inline
+  . strengthReduce
+  . tailCallOptimize
+  . gvn
+  . sccp
+  . licm
+  . ssaDeadCodeElim
+  . ssaCopyProp
+  . simplifyPhis

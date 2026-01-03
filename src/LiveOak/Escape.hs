@@ -13,6 +13,7 @@ module LiveOak.Escape
     -- * Queries
   , doesEscape
   , canStackAllocate
+  , stackAllocate
   ) where
 
 import LiveOak.SSATypes

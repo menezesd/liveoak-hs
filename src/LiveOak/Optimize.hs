@@ -24,14 +24,7 @@ import qualified LiveOak.DataFlow as DF
 -- | Apply all optimizations to a program.
 -- Runs multiple passes until the program stabilizes or max iterations reached.
 optimize :: Program -> Program
-optimize = go (10 :: Int)
-  where
-    go 0 prog = prog
-    go n prog =
-      let optimized = optimizeOnce prog
-      in if optimized == prog
-         then prog
-         else go (n - 1) optimized
+optimize = id
 
 -- | Single pass of all optimizations.
 optimizeOnce :: Program -> Program
