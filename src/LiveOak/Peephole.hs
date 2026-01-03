@@ -175,13 +175,11 @@ optimize =
           threaded = jumpThread instrs
           -- Block merging (removes redundant jumps/labels)
           merged = mergeBlocks threaded
-          -- Then apply peephole patterns
+          -- Then peephole patterns
           optimized = peepholePass merged
-          -- Remove dead code after unconditional jumps
-          cleaned = removeDeadCode optimized
-      in if cleaned == instrs
+      in if optimized == instrs
          then instrs
-         else go (n - 1) cleaned
+         else go (n - 1) optimized
 
 -- | Jump threading: when a label just jumps to another label, update all
 -- jumps to go directly to the final destination.
