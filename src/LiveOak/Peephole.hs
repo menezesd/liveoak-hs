@@ -369,6 +369,12 @@ peepholePass = \case
   -- DUP; SUB = 0
   (DUP : SUB : rest) -> ADDSP (-1) : PUSHIMM 0 : peepholePass rest
 
+  -- DUP; AND = x (x & x = x, so DUP:AND is no-op)
+  (DUP : AND : rest) -> peepholePass rest
+
+  -- DUP; OR = x (x | x = x, so DUP:OR is no-op)
+  (DUP : OR : rest) -> peepholePass rest
+
   -- Redundant operations: PUSHIMM x; ADDSP -1 = nothing (push then pop)
   (PUSHIMMSTR _ : ADDSP (-1) : rest) -> peepholePass rest
 
