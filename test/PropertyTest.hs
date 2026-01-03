@@ -21,32 +21,23 @@ import LiveOak.Compiler (compile)
 
 -- | All property-based tests
 propertyTests :: TestTree
-propertyTests = testGroup "Property Tests"
+propertyTests = localOption (QuickCheckTests 100) $ testGroup "Property Tests"
   [ testGroup "Parser Fuzzing"
-      [ localOption (QuickCheckTests 10) $
-          testProperty "parser doesn't crash on random input" prop_parserNoCrash
-      , localOption (QuickCheckTests 10) $
-          testProperty "parser doesn't crash on semi-valid input" prop_parserSemiValid
+      [ testProperty "parser doesn't crash on random input" prop_parserNoCrash
+      , testProperty "parser doesn't crash on semi-valid input" prop_parserSemiValid
       ]
   , testGroup "Peephole Optimizer"
-      [ localOption (QuickCheckTests 10) $
-          testProperty "peephole doesn't crash on random SAM" prop_peepholeNoCrash
-      , localOption (QuickCheckTests 10) $
-          testProperty "peephole is idempotent" prop_peepholeIdempotent
-      , localOption (QuickCheckTests 10) $
-          testProperty "peephole preserves labels" prop_peepholePreservesLabels
-      , localOption (QuickCheckTests 10) $
-          testProperty "optimize reduces or preserves instruction count" prop_peepholeReduces
+      [ testProperty "peephole doesn't crash on random SAM" prop_peepholeNoCrash
+      , testProperty "peephole is idempotent" prop_peepholeIdempotent
+      , testProperty "peephole preserves labels" prop_peepholePreservesLabels
+      , testProperty "optimize reduces or preserves instruction count" prop_peepholeReduces
       ]
   , testGroup "AST Optimizer"
-      [ localOption (QuickCheckTests 10) $
-          testProperty "constant folding preserves int literals" prop_constFoldInt
-      , localOption (QuickCheckTests 10) $
-          testProperty "optimizer is idempotent" prop_optimizerIdempotent
+      [ testProperty "constant folding preserves int literals" prop_constFoldInt
+      , testProperty "optimizer is idempotent" prop_optimizerIdempotent
       ]
   , testGroup "Compiler"
-      [ localOption (QuickCheckTests 10) $
-          testProperty "valid minimal programs compile" prop_minimalProgramCompiles
+      [ testProperty "valid minimal programs compile" prop_minimalProgramCompiles
       ]
   ]
 
