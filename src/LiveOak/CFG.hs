@@ -30,9 +30,15 @@ module LiveOak.CFG
 
     -- * Utilities
   , validateCFG
+
+    -- * Critical Edge Splitting
+  , isCriticalEdge
+  , findCriticalEdges
+  , splitCriticalEdges
+  , splitEdge
   ) where
 
-import LiveOak.SSATypes (SSABlock(..), SSAInstr(..), SSAMethod(..), PhiNode, SSAExpr)
+import LiveOak.SSATypes (SSABlock(..), SSAInstr(..), SSAMethod(..), PhiNode(..), SSAExpr)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
@@ -243,3 +249,88 @@ validateCFG cfg = concat
       , to <- tos
       , from `notElem` predecessors cfg to
       ]
+
+--------------------------------------------------------------------------------
+-- Critical Edge Splitting
+--------------------------------------------------------------------------------
+
+-- | Check if an edge is critical
+-- A critical edge goes from a block with multiple successors
+-- to a block with multiple predecessors
+isCriticalEdge :: CFG -> BlockId -> BlockId -> Bool
+isCriticalEdge cfg from to =
+  length (successors cfg from) > 1 && length (predecessors cfg to) > 1
+
+-- | Find all critical edges in the CFG
+findCriticalEdges :: CFG -> [(BlockId, BlockId)]
+findCriticalEdges cfg =
+  [ (from, to)
+  | from <- allBlockIds cfg
+  , to <- successors cfg from
+  , isCriticalEdge cfg from to
+  ]
+
+-- | Split all critical edges in the CFG
+-- Returns the new CFG and a list of created blocks
+splitCriticalEdges :: CFG -> (CFG, [(BlockId, BlockId, BlockId)])
+splitCriticalEdges cfg =
+  let criticals = findCriticalEdges cfg
+  in foldl' splitOne (cfg, []) (zip [0..] criticals)
+  where
+    splitOne (c, created) (n, (from, to)) =
+      let newBlockId = "__split_" ++ show n ++ "__"
+          (c', _) = splitEdge c from to newBlockId
+      in (c', (from, to, newBlockId) : created)
+
+-- | Split a single edge by inserting a new block
+-- Returns the modified CFG and the new block
+splitEdge :: CFG -> BlockId -> BlockId -> BlockId -> (CFG, CFGBlock)
+splitEdge cfg from to newBlockId =
+  let -- Create the new block (just jumps to the target)
+      newBlock = CFGBlock
+        { cfgBlockId = newBlockId
+        , cfgPhis = []
+        , cfgInstrs = []
+        , cfgTerm = TermJump to
+        }
+
+      -- Update the source block's terminator to point to new block
+      updateTerm = \case
+        TermJump t | t == to -> TermJump newBlockId
+        TermBranch cond thenB elseB ->
+          TermBranch cond
+            (if thenB == to then newBlockId else thenB)
+            (if elseB == to then newBlockId else elseB)
+        other -> other
+
+      -- Update source block
+      blocks' = case Map.lookup from (cfgBlocks cfg) of
+        Just b -> Map.insert from (b { cfgTerm = updateTerm (cfgTerm b) }) (cfgBlocks cfg)
+        Nothing -> cfgBlocks cfg
+
+      -- Add new block
+      blocks'' = Map.insert newBlockId newBlock blocks'
+
+      -- Update phi nodes in target block to reference new block
+      blocks''' = case Map.lookup to blocks'' of
+        Just targetBlock ->
+          let phis' = map (updatePhiPred from newBlockId) (cfgPhis targetBlock)
+          in Map.insert to (targetBlock { cfgPhis = phis' }) blocks''
+        Nothing -> blocks''
+
+      -- Rebuild successor/predecessor maps
+      succMap = Map.fromList [(cfgBlockId b, termSuccessors (cfgTerm b)) | b <- Map.elems blocks''']
+      predMap = computePredecessors succMap
+
+  in ( cfg { cfgBlocks = blocks''', cfgSuccs = succMap, cfgPreds = predMap }
+     , newBlock
+     )
+
+-- | Update a phi node to replace one predecessor with another
+updatePhiPred :: BlockId -> BlockId -> PhiNode -> PhiNode
+updatePhiPred oldPred newPred phi@PhiNode{..} =
+  phi { phiArgs = map updateArg phiArgs }
+  where
+    updateArg (predBlock, var)
+      | predBlock == oldPred = (newPred, var)
+      | otherwise = (predBlock, var)

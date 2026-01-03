@@ -239,22 +239,6 @@ eliminateBranchToBranch = removeJumpToNext
       | lbl == lbl' = Label lbl' : removeJumpToNext rest
     removeJumpToNext (x : rest) = x : removeJumpToNext rest
 
--- | Remove dead code after unconditional jumps (until next label).
-removeDeadCode :: [SamInstr] -> [SamInstr]
-removeDeadCode = go
-  where
-    go [] = []
-    go (JUMP lbl : rest) = JUMP lbl : skipUntilLabel rest
-    go (STOP : rest) = STOP : skipUntilLabel rest
-    go (RST : rest) = RST : skipUntilLabel rest
-    go (x : rest) = x : go rest
-
-    skipUntilLabel [] = []
-    skipUntilLabel (l@(Label _) : rest) = l : go rest
-    skipUntilLabel (c@(Comment _) : rest) = c : skipUntilLabel rest
-    skipUntilLabel (Blank : rest) = Blank : skipUntilLabel rest
-    skipUntilLabel (_ : rest) = skipUntilLabel rest  -- Drop unreachable code
-
 -- | Single pass of peephole optimizations
 peepholePass :: [SamInstr] -> [SamInstr]
 peepholePass = \case
@@ -411,6 +395,37 @@ peepholePass = \case
   (PUSHIMM 64 : MOD : rest) -> PUSHIMM 63 : AND : peepholePass rest
   (PUSHIMM 128 : MOD : rest) -> PUSHIMM 127 : AND : peepholePass rest
   (PUSHIMM 256 : MOD : rest) -> PUSHIMM 255 : AND : peepholePass rest
+
+  -- Bitshift optimizations
+  -- Shift by zero is identity
+  (LSHIFT 0 : rest) -> peepholePass rest
+  (RSHIFT 0 : rest) -> peepholePass rest
+
+  -- Constant folding for shifts
+  (PUSHIMM x : LSHIFT n : rest) | n >= 0 && n < 32 -> PUSHIMM (x * (2 ^ n)) : peepholePass rest
+  (PUSHIMM x : RSHIFT n : rest) | n >= 0 && n < 32 -> PUSHIMM (x `div` (2 ^ n)) : peepholePass rest
+
+  -- Consecutive shifts can be combined
+  (LSHIFT a : LSHIFT b : rest) -> LSHIFT (a + b) : peepholePass rest
+  (RSHIFT a : RSHIFT b : rest) -> RSHIFT (a + b) : peepholePass rest
+
+  -- Shift followed by opposite shift (partial cancellation)
+  (LSHIFT a : RSHIFT b : rest) | a == b -> peepholePass rest
+  (RSHIFT a : LSHIFT b : rest) | a == b -> peepholePass rest
+
+  -- Multiplication by power of 2 can use shift
+  (PUSHIMM 4 : TIMES : rest) -> LSHIFT 2 : peepholePass rest
+  (PUSHIMM 8 : TIMES : rest) -> LSHIFT 3 : peepholePass rest
+  (PUSHIMM 16 : TIMES : rest) -> LSHIFT 4 : peepholePass rest
+  (PUSHIMM 32 : TIMES : rest) -> LSHIFT 5 : peepholePass rest
+  (PUSHIMM 64 : TIMES : rest) -> LSHIFT 6 : peepholePass rest
+
+  -- Division by power of 2 can use shift (for non-negative numbers)
+  (PUSHIMM 2 : DIV : rest) -> RSHIFT 1 : peepholePass rest
+  (PUSHIMM 4 : DIV : rest) -> RSHIFT 2 : peepholePass rest
+  (PUSHIMM 8 : DIV : rest) -> RSHIFT 3 : peepholePass rest
+  (PUSHIMM 16 : DIV : rest) -> RSHIFT 4 : peepholePass rest
+  (PUSHIMM 32 : DIV : rest) -> RSHIFT 5 : peepholePass rest
 
   -- Negative multiplication: x * (-1) = -x
   (PUSHIMM (-1) : TIMES : rest) -> PUSHIMM 0 : SWAP : SUB : peepholePass rest

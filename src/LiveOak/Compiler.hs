@@ -9,6 +9,10 @@ module LiveOak.Compiler
   , compileCollectAllErrors
   , compileFile
 
+    -- * SSA-based Compilation
+  , compileWithSSA
+  , compileWithSSAOptimizations
+
     -- * Compilation Stages
   , CompilationStage (..)
 
@@ -27,6 +31,8 @@ import LiveOak.Warnings (collectWarnings)
 import LiveOak.Optimize (optimize)
 import LiveOak.Codegen (generateCode)
 import qualified LiveOak.Peephole as Peephole
+import qualified LiveOak.SSA as SSA
+import qualified LiveOak.SSACodegen as SSACodegen
 
 -- | Compilation stages.
 data CompilationStage
@@ -139,3 +145,58 @@ validateEntrypoint syms = do
     SyntaxError (entryClass ++ "." ++ entryMethod ++ " must be an instance method") 0 0
 
   ok ()
+
+--------------------------------------------------------------------------------
+-- SSA-based Compilation
+--------------------------------------------------------------------------------
+
+-- | Compile using SSA-based code generation.
+-- This path converts to SSA, optimizes in SSA form, and generates code directly from SSA.
+compileWithSSA :: FilePath -> Text -> Result Text
+compileWithSSA path source = do
+  -- Parse program and build symbol table
+  (program, symbols) <- parseProgram path source
+
+  -- Validate entry point
+  validateEntrypoint symbols
+
+  -- Semantic analysis
+  checkProgram program symbols
+
+  -- Convert to SSA
+  let ssaProgram = SSA.toSSA program
+
+  -- Generate code directly from SSA
+  code <- SSACodegen.generateFromSSA ssaProgram symbols
+
+  -- Peephole optimize SAM code
+  let optimizedCode = Peephole.optimizeText code
+
+  return optimizedCode
+
+-- | Compile with full SSA optimization pipeline.
+-- Includes CFG-based optimizations: SCCP, GVN, LICM, DCE
+compileWithSSAOptimizations :: FilePath -> Text -> Result Text
+compileWithSSAOptimizations path source = do
+  -- Parse program and build symbol table
+  (program, symbols) <- parseProgram path source
+
+  -- Validate entry point
+  validateEntrypoint symbols
+
+  -- Semantic analysis
+  checkProgram program symbols
+
+  -- Apply SSA-based optimizations (operates on AST)
+  let optimizedProgram = SSA.optimizeSSA program
+
+  -- Convert optimized AST to SSA
+  let ssaProgram = SSA.toSSA optimizedProgram
+
+  -- Generate code directly from SSA
+  code <- SSACodegen.generateFromSSA ssaProgram symbols
+
+  -- Peephole optimize SAM code
+  let optimizedCode = Peephole.optimizeText code
+
+  return optimizedCode

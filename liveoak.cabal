@@ -34,6 +34,12 @@ library
                     , LiveOak.CFG
                     , LiveOak.Dominance
                     , LiveOak.SSACodegen
+                    , LiveOak.Loop
+                    , LiveOak.SCCP
+                    , LiveOak.GVN
+                    , LiveOak.LICM
+                    , LiveOak.Coalesce
+                    , LiveOak.DCE
                     , LiveOak.StringRuntime
                     , LiveOak.Compiler
                     , LiveOak.Sam
