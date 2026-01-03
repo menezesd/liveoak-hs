@@ -42,6 +42,7 @@ optimizeOnce =
   . DF.eliminateNullChecks
   . DF.eliminateCommonSubexpressions
   . DF.globalValueNumbering
+  . DF.eliminateDeadStores
   . DF.loadStoreForwarding
   . DF.hoistLoopInvariants
   . DF.inlineSmallMethods

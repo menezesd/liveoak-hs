@@ -12,6 +12,7 @@ module LiveOak.DataFlow
   , globalValueNumbering
   , hoistLoopInvariants
   , loadStoreForwarding
+  , eliminateDeadStores
     -- * Method Optimizations
   , inlineSmallMethods
   , eliminateDeadParams
@@ -1150,6 +1151,95 @@ exprUsesVar name = \case
   NewObject _ args _ -> any (exprUsesVar name) args
   FieldAccess target _ _ -> exprUsesVar name target
   _ -> False
+
+--------------------------------------------------------------------------------
+-- Dead Store Elimination
+--------------------------------------------------------------------------------
+
+-- | Eliminate dead stores: assignments to variables that are overwritten
+-- before being read. This is safe at the AST level because we can remove
+-- the entire assignment including the value computation.
+--
+-- A store is dead if:
+-- 1. The variable is assigned again before any read
+-- 2. The assigned expression has no side effects
+-- 3. No control flow (if/while/break/return) occurs between stores
+eliminateDeadStores :: Program -> Program
+eliminateDeadStores (Program classes) = Program (map dseClass classes)
+
+dseClass :: ClassDecl -> ClassDecl
+dseClass cls@ClassDecl{..} = cls { classMethods = map dseMethod classMethods }
+
+dseMethod :: MethodDecl -> MethodDecl
+dseMethod m@MethodDecl{..} = m { methodBody = dseStmt methodBody }
+
+-- | Eliminate dead stores in a statement
+dseStmt :: Stmt -> Stmt
+dseStmt = \case
+  Block stmts pos -> Block (dseBlock stmts) pos
+  If cond th el pos -> If cond (dseStmt th) (dseStmt el) pos
+  While cond body pos -> While cond (dseStmt body) pos
+  s -> s
+
+-- | Eliminate dead stores in a block
+-- Process statements and remove dead assignments
+dseBlock :: [Stmt] -> [Stmt]
+dseBlock = go
+  where
+    go [] = []
+    go [s] = [dseStmt s]
+    go (s1 : s2 : rest) = case (s1, s2) of
+      -- Pattern: x = e1; x = e2  (consecutive assignments to same var)
+      (Assign name1 value1 _, Assign name2 _ _)
+        | name1 == name2, not (hasSideEffects value1) ->
+            go (s2 : rest)  -- Remove dead store s1
+
+      -- Pattern: x = e1; ... ; x = e2 with no reads of x between
+      (Assign name value _, _)
+        | not (hasSideEffects value)
+        , isDeadBeforeRead name (s2 : rest) ->
+            go (s2 : rest)  -- Remove dead store s1
+
+      -- Pattern: var x = e1; x = e2 (init followed by overwrite)
+      (VarDecl name _ (Just value) _, Assign name2 _ _)
+        | name == name2, not (hasSideEffects value) ->
+            -- Keep the declaration but without init, then continue
+            VarDecl name Nothing Nothing 0 : go (s2 : rest)
+
+      -- Pattern: var x = e1; ... ; x = e2 with no reads of x between
+      (VarDecl name _ (Just value) pos, _)
+        | not (hasSideEffects value)
+        , isDeadBeforeRead name (s2 : rest) ->
+            VarDecl name Nothing Nothing pos : go (s2 : rest)
+
+      -- No dead store pattern matched
+      _ -> dseStmt s1 : go (s2 : rest)
+
+-- | Check if a variable is dead (overwritten before read) in the given statements
+-- Returns True if we find an assignment to the variable before any read
+-- Conservative: returns False on control flow (if/while/return/break)
+isDeadBeforeRead :: String -> [Stmt] -> Bool
+isDeadBeforeRead _ [] = False
+isDeadBeforeRead name (s:rest) = case s of
+  -- Found assignment to name - it's dead
+  Assign n _ _ | n == name -> True
+  VarDecl n _ (Just _) _ | n == name -> True
+
+  -- Check if statement reads the variable - if so, not dead
+  Assign _ value _ | exprUsesVar name value -> False
+  VarDecl _ _ (Just value) _ | exprUsesVar name value -> False
+  FieldAssign target _ _ value _ | exprUsesVar name target || exprUsesVar name value -> False
+  Return (Just value) _ | exprUsesVar name value -> False
+  ExprStmt expr _ | exprUsesVar name expr -> False
+
+  -- Control flow - conservatively say not dead
+  If {} -> False
+  While {} -> False
+  Return _ _ -> False
+  Break _ -> False
+
+  -- Other statements without reads - continue checking
+  _ -> isDeadBeforeRead name rest
 
 --------------------------------------------------------------------------------
 -- Memory-to-Register Promotion

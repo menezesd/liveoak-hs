@@ -166,7 +166,7 @@ optimize :: [SamInstr] -> [SamInstr]
 optimize =
     -- Post-processing passes (run once after main optimizations)
     scheduleInstructions
-  . coalesceStackSlots  -- Only coalesces straight-line code (safe)
+  . coalesceStackSlots  -- Stack slot coalescing (currently disabled)
     -- Iterative peephole optimizations
   . go (20 :: Int)
   where
@@ -174,6 +174,8 @@ optimize =
     go n instrs =
       let -- First apply jump threading
           threaded = jumpThread instrs
+          -- Then apply dead store elimination (DISABLED - causes issues)
+          -- deadStoreElim = eliminateDeadStores threaded
           -- Then apply peephole patterns
           optimized = peepholePass threaded
           -- Remove dead code after unconditional jumps
@@ -423,6 +425,51 @@ peepholePass = \case
 
   -- x != y can be rewritten as (x == y); ISNIL
   -- But we don't have a direct pattern for this without more context
+
+  --------------------------------------------------------------------------------
+  -- Comparison Chain Optimizations
+  --------------------------------------------------------------------------------
+
+  -- Pattern: a <= b && b <= c (range check)
+  -- In SAM: a, b, LESS, ISNIL, b, c, LESS, ISNIL, AND
+  -- If we see: LESS; ISNIL; <push b>; <push c>; LESS; ISNIL; AND
+  -- This is hard to optimize without value tracking, keep as is for now
+
+  -- Pattern: CMP-based chain (result is -1, 0, or 1)
+  -- After CMP, we often check ISNEG (for <) or ISNIL (for ==)
+  -- CMP; ISNEG gives true if a < b
+  -- CMP; ISNIL gives true if a == b
+  -- CMP; DUP; ISNEG; SWAP; ISNIL; OR gives true if a <= b (< or ==)
+  (CMP : DUP : ISNEG : SWAP : ISNIL : OR : rest) ->
+    -- This is "less than or equal" - could be simplified with a direct comparison
+    -- But we don't have LESSEQ, so keep as: SWAP; GREATER; ISNIL
+    SWAP : GREATER : ISNIL : peepholePass rest
+
+  (CMP : DUP : ISNIL : SWAP : ISNEG : ISNIL : AND : rest) ->
+    -- This is "greater than": not neg and not zero = positive = a > b
+    GREATER : peepholePass rest
+
+  -- Simplify: CMP; ISNIL -> EQUAL (both check if difference is 0)
+  (CMP : ISNIL : rest) -> EQUAL : peepholePass rest
+
+  -- Simplify: CMP; ISNEG -> LESS (CMP gives negative if a < b)
+  (CMP : ISNEG : rest) -> LESS : peepholePass rest
+
+  -- Simplify: CMP; ISNEG; ISNIL -> LESS; ISNIL (>=)
+  (CMP : ISNEG : ISNIL : rest) -> LESS : ISNIL : peepholePass rest
+
+  -- Double comparison elimination: if we compare same values twice
+  -- x; y; LESS; pop; x; y; GREATER -> x; y; GREATER
+  -- (Requires value tracking, skip for now)
+
+  -- Redundant NOT after comparison: LESS; ISNIL; ISNIL = LESS
+  (LESS : ISNIL : ISNIL : rest) -> LESS : peepholePass rest
+  (GREATER : ISNIL : ISNIL : rest) -> GREATER : peepholePass rest
+  (EQUAL : ISNIL : ISNIL : rest) -> EQUAL : peepholePass rest
+
+  -- Boolean chain: result; ISNIL; JUMPC L is "jump if false"
+  -- result; ISNIL; ISNIL; JUMPC L is "jump if true"
+  -- We can sometimes merge these
 
   -- Default: keep instruction and continue
   (x : rest) -> x : peepholePass rest
