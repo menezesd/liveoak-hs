@@ -27,7 +27,7 @@ import qualified LiveOak.SSA as SSA
 optimize :: Program -> Program
 optimize = go (10 :: Int)
   where
-    go 0 prog = prog  -- Max iterations reached
+    go 0 prog = prog
     go n prog =
       let optimized = optimizeOnce prog
       in if optimized == prog
