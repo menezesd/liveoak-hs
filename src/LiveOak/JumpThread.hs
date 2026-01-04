@@ -27,7 +27,6 @@ module LiveOak.JumpThread
   ) where
 
 import LiveOak.SSATypes
-import LiveOak.CFG
 import LiveOak.SSAUtils (blockMapFromList)
 
 import Data.Map.Strict (Map)
@@ -55,10 +54,10 @@ data JumpThreadResult = JumpThreadResult
 threadJumps :: [SSABlock] -> JumpThreadResult
 threadJumps blocks =
   let blockMap = blockMapFromList blocks
-      -- Build jump target map
+      -- Build jump target map (only for blocks that are safe to thread through)
       targetMap = buildTargetMap blockMap
-      -- Apply threading
-      (threaded, count) = applyThreading blockMap targetMap
+      -- Apply threading and update phi nodes
+      (threaded, count) = applyThreadingWithPhis blockMap targetMap
       -- Remove empty blocks
       (cleaned, eliminated) = removeEmptyBlocks threaded
   in JumpThreadResult
@@ -101,33 +100,106 @@ followChain blockMap visited target
             Nothing -> target
         Nothing -> target
 
--- | Apply jump threading to all blocks
-applyThreading :: Map BlockId SSABlock -> Map BlockId BlockId -> (Map BlockId SSABlock, Int)
-applyThreading blockMap targetMap =
-  let (count, threaded) = Map.mapAccum (threadBlock targetMap) 0 blockMap
-  in (threaded, count)
+-- | Apply jump threading to all blocks, updating phi nodes as needed
+applyThreadingWithPhis :: Map BlockId SSABlock -> Map BlockId BlockId -> (Map BlockId SSABlock, Int)
+applyThreadingWithPhis blockMap targetMap =
+  let -- Build predecessor map BEFORE threading (who jumps to each empty block)
+      predMap = buildPredecessorMap blockMap targetMap
+      -- Thread the jumps in all blocks
+      (count, threaded) = Map.mapAccum (threadBlock targetMap) 0 blockMap
+      -- Update phi nodes for the new predecessors
+      updated = updatePhisForThreading threaded targetMap predMap
+  in (updated, count)
+
+-- | Build map of predecessors for each empty block that will be threaded through
+-- predMap[B] = [P1, P2, ...] means P1, P2, etc. currently jump to B
+-- Only records edges that will ACTUALLY be threaded (not self-loops)
+buildPredecessorMap :: Map BlockId SSABlock -> Map BlockId BlockId -> Map BlockId [BlockId]
+buildPredecessorMap blockMap targetMap =
+  Map.foldlWithKey' addPreds Map.empty blockMap
+  where
+    addPreds acc bid SSABlock{..} =
+      foldl' (addPred bid) acc blockInstrs
+
+    -- Only record if threading would NOT create a self-loop
+    addPred srcBid acc = \case
+      SSAJump target
+        | Just finalTarget <- Map.lookup target targetMap
+        , finalTarget /= srcBid ->  -- Not a self-loop
+            Map.insertWith (++) target [srcBid] acc
+      SSABranch _ t f ->
+        let -- Only add if threading t wouldn't create self-loop
+            acc' = case Map.lookup t targetMap of
+                     Just ft | ft /= srcBid -> Map.insertWith (++) t [srcBid] acc
+                     _ -> acc
+            -- Only add if threading f wouldn't create self-loop
+        in case Map.lookup f targetMap of
+             Just ff | ff /= srcBid -> Map.insertWith (++) f [srcBid] acc'
+             _ -> acc'
+      _ -> acc
+
+-- | Update phi nodes when jumps are threaded
+-- When B1 -> B2 -> B3 becomes B1 -> B3, phi nodes in B3 that expect B2
+-- should now accept values from B1 with the same variable
+updatePhisForThreading :: Map BlockId SSABlock -> Map BlockId BlockId -> Map BlockId [BlockId] -> Map BlockId SSABlock
+updatePhisForThreading blockMap targetMap predMap =
+  Map.map (updateBlockPhis targetMap predMap) blockMap
+
+-- | Update phi nodes in a block for threading
+updateBlockPhis :: Map BlockId BlockId -> Map BlockId [BlockId] -> SSABlock -> SSABlock
+updateBlockPhis targetMap predMap block@SSABlock{..} =
+  if null blockPhis
+  then block
+  else block { blockPhis = map (updatePhi targetMap predMap) blockPhis }
+
+-- | Update a phi node for threading
+-- For each phi arg (B, var) where B was threaded through, add args from B's predecessors
+updatePhi :: Map BlockId BlockId -> Map BlockId [BlockId] -> PhiNode -> PhiNode
+updatePhi targetMap predMap phi@PhiNode{..} =
+  let newArgs = concatMap (expandPhiArg targetMap predMap) phiArgs
+  in phi { phiArgs = newArgs }
+
+-- | Expand a phi argument if blocks were threaded through it
+-- If B is an empty block (in targetMap), add phi args from all of B's predecessors
+expandPhiArg :: Map BlockId BlockId -> Map BlockId [BlockId] -> (BlockId, SSAVar) -> [(BlockId, SSAVar)]
+expandPhiArg _targetMap predMap (intermediateBid, var) =
+  case Map.lookup intermediateBid predMap of
+    Just preds ->
+      -- B is an empty block that was threaded through
+      -- Add args from its predecessors, keep original in case B isn't fully removed
+      (intermediateBid, var) : [(p, var) | p <- preds]
+    Nothing ->
+      -- B is not an empty block, keep as-is
+      [(intermediateBid, var)]
 
 -- | Thread jumps in a single block
 threadBlock :: Map BlockId BlockId -> Int -> SSABlock -> (Int, SSABlock)
 threadBlock targetMap count block@SSABlock{..} =
-  let (newInstrs, c) = threadInstrs targetMap blockInstrs
+  let (newInstrs, c) = threadInstrs blockLabel targetMap blockInstrs
   in (count + c, block { blockInstrs = newInstrs })
 
 -- | Thread jumps in instructions
-threadInstrs :: Map BlockId BlockId -> [SSAInstr] -> ([SSAInstr], Int)
-threadInstrs targetMap = foldr threadInstr ([], 0)
+-- Avoid creating self-loops (block jumping to itself)
+threadInstrs :: BlockId -> Map BlockId BlockId -> [SSAInstr] -> ([SSAInstr], Int)
+threadInstrs currentBlock targetMap = foldr threadInstr ([], 0)
   where
     threadInstr instr (acc, count) =
       case instr of
         SSAJump target ->
           case Map.lookup target targetMap of
-            Just finalTarget | finalTarget /= target ->
+            -- Don't thread if it would create a self-loop
+            Just finalTarget | finalTarget /= target && finalTarget /= currentBlock ->
               (SSAJump finalTarget : acc, count + 1)
             _ -> (instr : acc, count)
 
         SSABranch cond thenTarget elseTarget ->
-          let thenTarget' = Map.findWithDefault thenTarget thenTarget targetMap
-              elseTarget' = Map.findWithDefault elseTarget elseTarget targetMap
+          -- Don't thread targets that would become self-loops
+          let thenTarget' = if Map.findWithDefault thenTarget thenTarget targetMap == currentBlock
+                            then thenTarget  -- Keep original to avoid self-loop
+                            else Map.findWithDefault thenTarget thenTarget targetMap
+              elseTarget' = if Map.findWithDefault elseTarget elseTarget targetMap == currentBlock
+                            then elseTarget  -- Keep original to avoid self-loop
+                            else Map.findWithDefault elseTarget elseTarget targetMap
               changed = (thenTarget' /= thenTarget) || (elseTarget' /= elseTarget)
           in if changed
              then (SSABranch cond thenTarget' elseTarget' : acc, count + 1)
@@ -138,14 +210,27 @@ threadInstrs targetMap = foldr threadInstr ([], 0)
 -- | Remove blocks that are no longer reachable (only contain a jump and have no preds)
 removeEmptyBlocks :: Map BlockId SSABlock -> (Map BlockId SSABlock, Int)
 removeEmptyBlocks blockMap =
-  let -- Find all referenced blocks
-      referenced = collectReferencedBlocks blockMap
+  let -- Find all referenced blocks (by jumps/branches, not phi nodes)
+      referenced = collectReferencedByJumps blockMap
       -- Find empty jump-only blocks
       emptyBlocks = Map.keysSet $ Map.filter isEmptyJumpBlock blockMap
       -- Keep blocks that are referenced or not empty
       toRemove = Set.difference emptyBlocks referenced
       kept = Map.filterWithKey (\k _ -> not (Set.member k toRemove)) blockMap
-  in (kept, Set.size toRemove)
+      -- Clean up phi nodes that reference removed blocks
+      cleaned = Map.map (cleanupPhis toRemove) kept
+  in (cleaned, Set.size toRemove)
+
+-- | Remove phi arguments that reference removed blocks
+cleanupPhis :: Set BlockId -> SSABlock -> SSABlock
+cleanupPhis removed block@SSABlock{..} =
+  if null blockPhis
+  then block
+  else block { blockPhis = map (cleanupPhi removed) blockPhis }
+
+cleanupPhi :: Set BlockId -> PhiNode -> PhiNode
+cleanupPhi removed phi@PhiNode{..} =
+  phi { phiArgs = filter (\(bid, _) -> not (Set.member bid removed)) phiArgs }
 
 -- | Check if a block only contains a jump
 isEmptyJumpBlock :: SSABlock -> Bool
@@ -155,14 +240,13 @@ isEmptyJumpBlock SSABlock{..} =
     SSAJump _ -> True
     _ -> False
 
--- | Collect all block IDs that are referenced by jumps/branches
-collectReferencedBlocks :: Map BlockId SSABlock -> Set BlockId
-collectReferencedBlocks = Map.foldl' addBlockRefs Set.empty
+-- | Collect all block IDs that are referenced by jumps/branches (not phi nodes)
+collectReferencedByJumps :: Map BlockId SSABlock -> Set BlockId
+collectReferencedByJumps = Map.foldl' addBlockRefs Set.empty
   where
     addBlockRefs acc SSABlock{..} =
       let instrRefs = concatMap instrRefs' blockInstrs
-          phiRefs = [bid | phi <- blockPhis, (bid, _) <- phiArgs phi]
-      in foldl' (flip Set.insert) acc (instrRefs ++ phiRefs)
+      in foldl' (flip Set.insert) acc instrRefs
 
     instrRefs' = \case
       SSAJump target -> [target]

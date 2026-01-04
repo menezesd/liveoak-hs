@@ -82,7 +82,7 @@ eliminateBlockDeadStores block@SSABlock{..} =
 
 -- | Find indices of dead stores
 -- A store is dead if a later store to the same location exists
--- with no intervening read or call
+-- with no intervening read, call, or variable reassignment
 findDeadStores :: [(Int, SSAInstr)] -> Set Int
 findDeadStores indexed = go Map.empty Set.empty indexed
   where
@@ -107,16 +107,23 @@ findDeadStores indexed = go Map.empty Set.empty indexed
             -- Can't determine object, conservatively kill all pending stores
             go Map.empty dead rest
 
-      -- Field access: the field is read, remove from pending dead stores
-      SSAAssign _ expr ->
-        let reads = getFieldReads expr
-            lastStore' = foldl' (flip Map.delete) lastStore reads
-        in go lastStore' dead rest
+      -- Assignments: check for calls, field reads, and variable reassignment
+      SSAAssign var expr ->
+        if exprHasCall expr
+        then go Map.empty dead rest  -- Calls can read/write any field
+        else
+          let -- If variable is reassigned, remove all stores through that variable
+              -- (they're to a different object now)
+              varName = varNameString (ssaName var)
+              lastStore' = Map.filterWithKey (\(v, _) _ -> v /= varName) lastStore
+              -- Also remove stores for fields that are read
+              reads = getFieldReads expr
+              lastStore'' = foldl' (flip Map.delete) lastStore' reads
+          in go lastStore'' dead rest
 
       SSAReturn (Just expr) ->
-        let reads = getFieldReads expr
-            lastStore' = foldl' (flip Map.delete) lastStore reads
-        in go lastStore' dead rest
+        -- Return could escape the object, invalidate all stores
+        go Map.empty dead rest
 
       SSABranch cond _ _ ->
         let reads = getFieldReads cond
@@ -125,15 +132,28 @@ findDeadStores indexed = go Map.empty Set.empty indexed
 
       SSAExprStmt expr ->
         -- Expression statement might have side effects
-        case expr of
-          SSACall _ _ -> go Map.empty dead rest  -- Call invalidates all
-          SSAInstanceCall _ _ _ -> go Map.empty dead rest
-          _ ->
-            let reads = getFieldReads expr
-                lastStore' = foldl' (flip Map.delete) lastStore reads
-            in go lastStore' dead rest
+        if exprHasCall expr
+        then go Map.empty dead rest  -- Calls can read/write any field
+        else let reads = getFieldReads expr
+                 lastStore' = foldl' (flip Map.delete) lastStore reads
+             in go lastStore' dead rest
 
-      _ -> go lastStore dead rest
+      -- Jump/branch terminators: stores might be read in successor blocks
+      SSAJump _ -> go Map.empty dead rest
+
+      SSAReturn Nothing -> go lastStore dead rest
+
+-- | Check if an expression contains a call (which could have side effects)
+exprHasCall :: SSAExpr -> Bool
+exprHasCall = \case
+  SSACall _ _ -> True
+  SSAInstanceCall _ _ _ -> True
+  SSANewObject _ _ -> True  -- Constructor can have side effects
+  SSAUnary _ e -> exprHasCall e
+  SSABinary _ l r -> exprHasCall l || exprHasCall r
+  SSATernary c t e -> exprHasCall c || exprHasCall t || exprHasCall e
+  SSAFieldAccess t _ -> exprHasCall t
+  _ -> False
 
 -- | Get the variable name of a target expression (if it's a simple variable)
 getTargetVar :: SSAExpr -> Maybe String

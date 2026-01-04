@@ -1125,13 +1125,13 @@ ssaBasicPipeline =
     ssaDeadCodeElim
   . ssaPeephole
   . ssaCopyProp
-  -- . ssaDSE  -- DISABLED: incorrectly removes needed stores
+  -- . ssaDSE  -- DISABLED: needs alias analysis to be safe
   . strengthReduce
   . licm
   . pre
   . gvn
   . sccp
-  -- . ssaJumpThread  -- DISABLED: causes infinite loops
+  -- . ssaJumpThread  -- DISABLED: needs more work for edge cases with loop back-edges
   . ssaInline
   . ssaTailCallOpt
   . simplifyPhis
