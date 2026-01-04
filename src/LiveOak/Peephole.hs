@@ -213,8 +213,12 @@ buildJumpMap = go
 -- | Resolve chains: if A -> B and B -> C, then A -> C.
 -- Limit iterations to avoid infinite loops on cycles.
 resolveChains :: Map Text Text -> Map Text Text
-resolveChains m = iterate resolveOnce m !! 10
+resolveChains = applyN 10 resolveOnce
   where
+    applyN :: Int -> (a -> a) -> a -> a
+    applyN 0 _ x = x
+    applyN n f x = applyN (n - 1) f $! f x
+
     resolveOnce mp = Map.map (resolve mp) mp
     resolve mp lbl = case Map.lookup lbl mp of
       Just target | target /= lbl -> target
@@ -296,6 +300,19 @@ peepholePass = \case
 
   -- SWAP; SWAP = nothing
   (SWAP : SWAP : rest) -> peepholePass rest
+
+  -- Self-comparison optimizations: DUP; EQUAL always true
+  -- DUP duplicates top of stack, then EQUAL compares two equal values
+  (DUP : EQUAL : rest) -> ADDSP (-1) : PUSHIMM 1 : peepholePass rest
+
+  -- DUP; LESS is always false (x < x)
+  (DUP : LESS : rest) -> ADDSP (-1) : PUSHIMM 0 : peepholePass rest
+
+  -- DUP; GREATER is always false (x > x)
+  (DUP : GREATER : rest) -> ADDSP (-1) : PUSHIMM 0 : peepholePass rest
+
+  -- DUP; SUB = 0 (x - x = 0)
+  (DUP : SUB : rest) -> ADDSP (-1) : PUSHIMM 0 : peepholePass rest
 
   -- Jump to next instruction (need to track labels)
   (JUMP lbl : Label lbl' : rest) | lbl == lbl' -> Label lbl' : peepholePass rest

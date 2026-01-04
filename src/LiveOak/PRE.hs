@@ -19,6 +19,7 @@ module LiveOak.PRE
 import LiveOak.SSATypes
 import LiveOak.CFG
 import LiveOak.Dominance
+import LiveOak.SSAUtils (blockMapFromList)
 import LiveOak.Ast (BinaryOp(..), UnaryOp(..))
 
 import Data.Map.Strict (Map)
@@ -26,6 +27,11 @@ import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.List (foldl')
+
+-- | Safely intersect all sets in a list. Returns empty set for empty list.
+intersectAll :: Ord a => [Set a] -> Set a
+intersectAll [] = Set.empty
+intersectAll (x:xs) = foldl' Set.intersection x xs
 
 --------------------------------------------------------------------------------
 -- Types
@@ -138,7 +144,7 @@ blockKills SSABlock{..} allExprs allPREExprs =
 anticipatable :: CFG -> [SSABlock] -> Map BlockId (Set PREExpr, Set PREExpr)
 anticipatable cfg blocks =
   let allExprs = collectExpressions blocks
-      blockMap = Map.fromList [(blockLabel b, b) | b <- blocks]
+      blockMap = blockMapFromList blocks
       initial = Map.fromList [(blockLabel b, (allExprs, allExprs)) | b <- blocks]
   in iterateBackward cfg blockMap allExprs initial
 
@@ -160,9 +166,7 @@ updateAntBlock cfg blockMap allExprs antSets bid _ =
     Just block ->
       let -- AntOut = intersection of AntIn of successors
           succs = successors cfg bid
-          antOut = if null succs
-                   then Set.empty
-                   else foldl1 Set.intersection [fst $ Map.findWithDefault (Set.empty, Set.empty) s antSets | s <- succs]
+          antOut = intersectAll [fst $ Map.findWithDefault (Set.empty, Set.empty) s antSets | s <- succs]
           -- AntIn = (AntOut - Kill) ∪ Comp
           comp = blockComputes block
           kill = blockKills block Set.empty allExprs
@@ -178,7 +182,7 @@ updateAntBlock cfg blockMap allExprs antSets bid _ =
 available :: CFG -> [SSABlock] -> Map BlockId (Set PREExpr, Set PREExpr)
 available cfg blocks =
   let allExprs = collectExpressions blocks
-      blockMap = Map.fromList [(blockLabel b, b) | b <- blocks]
+      blockMap = blockMapFromList blocks
       initial = Map.fromList [(blockLabel b, (Set.empty, Set.empty)) | b <- blocks]
   in iterateForward cfg blockMap allExprs initial
 
@@ -200,9 +204,7 @@ updateAvailBlock cfg blockMap allExprs availSets bid _ =
     Just block ->
       let -- AvailIn = intersection of AvailOut of predecessors
           preds = predecessors cfg bid
-          availIn = if null preds
-                    then Set.empty
-                    else foldl1 Set.intersection [snd $ Map.findWithDefault (Set.empty, Set.empty) p availSets | p <- preds]
+          availIn = intersectAll [snd $ Map.findWithDefault (Set.empty, Set.empty) p availSets | p <- preds]
           -- AvailOut = (AvailIn - Kill) ∪ Comp
           comp = blockComputes block
           kill = blockKills block Set.empty allExprs

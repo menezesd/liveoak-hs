@@ -260,7 +260,10 @@ validateCFG cfg = concat
 -- to a block with multiple predecessors
 isCriticalEdge :: CFG -> BlockId -> BlockId -> Bool
 isCriticalEdge cfg from to =
-  length (successors cfg from) > 1 && length (predecessors cfg to) > 1
+  hasMultiple (successors cfg from) && hasMultiple (predecessors cfg to)
+  where
+    hasMultiple (_:_:_) = True  -- At least 2 elements
+    hasMultiple _ = False
 
 -- | Find all critical edges in the CFG
 findCriticalEdges :: CFG -> [(BlockId, BlockId)]

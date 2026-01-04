@@ -21,7 +21,7 @@ module LiveOak.RegAlloc
 
 import LiveOak.SSATypes
 import LiveOak.CFG
-import LiveOak.SSAUtils (exprUses, instrUses, blockDefs, blockUses)
+import LiveOak.SSAUtils (exprUses, instrUses, blockDefs, blockUses, blockMapFromList)
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -68,7 +68,7 @@ data RegAllocResult = RegAllocResult
 -- | Compute liveness information
 computeLiveness :: CFG -> [SSABlock] -> LivenessInfo
 computeLiveness cfg blocks =
-  let blockMap = Map.fromList [(blockLabel b, b) | b <- blocks]
+  let blockMap = blockMapFromList blocks
       -- Initialize with empty sets
       initIn = Map.fromList [(blockLabel b, Set.empty) | b <- blocks]
       initOut = Map.fromList [(blockLabel b, Set.empty) | b <- blocks]
@@ -123,7 +123,8 @@ computePerInstrLiveness blockMap liveOut =
 -- | Compute per-instruction liveness for a block
 blockInstrLiveness :: BlockId -> SSABlock -> Set String -> Map (BlockId, Int) (Set String)
 blockInstrLiveness bid SSABlock{..} out =
-  let indexed = zip [length blockInstrs - 1, length blockInstrs - 2..] (reverse blockInstrs)
+  let numInstrs = length blockInstrs
+      indexed = zip [numInstrs - 1, numInstrs - 2..] (reverse blockInstrs)
       (_, result) = foldl' go (out, Map.empty) indexed
   in result
   where

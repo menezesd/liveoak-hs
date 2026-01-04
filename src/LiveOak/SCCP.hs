@@ -17,6 +17,7 @@ module LiveOak.SCCP
 
 import LiveOak.CFG
 import LiveOak.SSATypes
+import LiveOak.SSAUtils (blockMapFromList)
 import LiveOak.Ast (BinaryOp(..), UnaryOp(..))
 
 import Data.Map.Strict (Map)
@@ -115,7 +116,7 @@ data SCCPResult = SCCPResult
 runSCCP :: [VarKey] -> CFG -> [SSABlock] -> SCCPResult
 runSCCP params cfg blocks =
   let entry = cfgEntry cfg
-      blockMap = Map.fromList [(blockLabel b, b) | b <- blocks]
+      blockMap = blockMapFromList blocks
       useMap = buildUseMap blocks
       finalState = execState (sccpLoop cfg blockMap useMap) (initSCCPState entry params)
       allBlocks = Set.fromList $ allBlockIds cfg

@@ -16,6 +16,7 @@ module LiveOak.StrengthReduce
   ) where
 
 import LiveOak.SSATypes
+import LiveOak.SSAUtils (blockMapFromList)
 import LiveOak.CFG
 import LiveOak.Loop
 import LiveOak.Dominance
@@ -73,33 +74,44 @@ findInductionVars :: Loop -> Map BlockId SSABlock -> [InductionVar]
 findInductionVars loop blockMap =
   let bodyBlocks = [b | bid <- Set.toList (loopBody loop),
                        Just b <- [Map.lookup bid blockMap]]
+      -- Build a map of variable definitions for step extraction
+      defMap = buildDefMap bodyBlocks
       -- Find basic IVs first
-      basicIVs = concatMap (findBasicIVs loop) bodyBlocks
+      basicIVs = concatMap (findBasicIVs loop defMap) bodyBlocks
       basicIVNames = Set.fromList [ivVar iv | iv <- basicIVs]
       -- Then find derived IVs
       derivedIVs = concatMap (findDerivedIVs loop basicIVNames) bodyBlocks
   in basicIVs ++ derivedIVs
 
+-- | Build a map from variable names to their defining expressions
+buildDefMap :: [SSABlock] -> Map String SSAExpr
+buildDefMap blocks = Map.fromList
+  [ (ssaName var, expr)
+  | block <- blocks
+  , SSAAssign var expr <- blockInstrs block
+  ]
+
 -- | Find basic induction variables in a block
-findBasicIVs :: Loop -> SSABlock -> [InductionVar]
-findBasicIVs loop SSABlock{..} =
-  mapMaybe (classifyAsBasicIV loop blockLabel) blockPhis
+findBasicIVs :: Loop -> Map String SSAExpr -> SSABlock -> [InductionVar]
+findBasicIVs loop defMap SSABlock{..} =
+  mapMaybe (classifyAsBasicIV loop defMap blockLabel) blockPhis
 
 -- | Classify a phi node as a basic IV
-classifyAsBasicIV :: Loop -> BlockId -> PhiNode -> Maybe InductionVar
-classifyAsBasicIV loop bid PhiNode{..} =
+classifyAsBasicIV :: Loop -> Map String SSAExpr -> BlockId -> PhiNode -> Maybe InductionVar
+classifyAsBasicIV loop defMap bid PhiNode{..} =
   -- A basic IV has:
   -- 1. An initial value from outside the loop
   -- 2. An update of the form iv = iv + constant from inside the loop
   let (outsideArgs, insideArgs) = partitionArgs loop phiArgs
+      phiVarName = ssaName phiVar
   in case (outsideArgs, insideArgs) of
     ([(_, initVar)], [(_, stepVar)]) ->
-      -- Check if stepVar is iv + constant
-      -- (Would need to look up the definition of stepVar)
-      Just $ BasicIV
-        { ivVar = ssaName phiVar
+      -- Look up the definition of stepVar and extract the step
+      let step = extractStep phiVarName (ssaName stepVar) defMap
+      in Just $ BasicIV
+        { ivVar = phiVarName
         , ivInit = SSAUse initVar
-        , ivStep = 1  -- Simplified, would need to extract actual step
+        , ivStep = step
         }
     _ -> Nothing
   where
@@ -108,6 +120,19 @@ classifyAsBasicIV loop bid PhiNode{..} =
       in ( [(p, v) | (p, v) <- args, not (Set.member p loopBlocks)]
          , [(p, v) | (p, v) <- args, Set.member p loopBlocks]
          )
+
+-- | Extract the step value from an IV update expression
+-- Looks for patterns like: stepVar = phiVar + constant or stepVar = phiVar - constant
+extractStep :: String -> String -> Map String SSAExpr -> Int
+extractStep phiVarName stepVarName defMap =
+  case Map.lookup stepVarName defMap of
+    Just (SSABinary Add (SSAUse v) (SSAInt n))
+      | ssaName v == phiVarName -> n
+    Just (SSABinary Add (SSAInt n) (SSAUse v))
+      | ssaName v == phiVarName -> n
+    Just (SSABinary Sub (SSAUse v) (SSAInt n))
+      | ssaName v == phiVarName -> negate n
+    _ -> 1  -- Default to 1 if we can't determine the step
 
 -- | Find derived induction variables
 findDerivedIVs :: Loop -> Set String -> SSABlock -> [InductionVar]
@@ -161,7 +186,7 @@ classifyIV basicIVNames = \case
 -- | Apply strength reduction to loops
 reduceStrength :: CFG -> DomTree -> LoopNest -> [SSABlock] -> StrengthResult
 reduceStrength cfg domTree loops blocks =
-  let blockMap = Map.fromList [(blockLabel b, b) | b <- blocks]
+  let blockMap = blockMapFromList blocks
       -- Process each loop
       (optimized, reductions, newIVs) = foldl' (reduceLoop cfg domTree blockMap)
                                                (blocks, 0, [])

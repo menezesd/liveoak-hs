@@ -83,16 +83,3 @@ analyzeCFG method =
     , cfgaLoops = loops
     }
 
--- | Analyze a CFG from blocks
-analyzeCFGFromBlocks :: BlockId -> [SSABlock] -> CFGAnalysis
-analyzeCFGFromBlocks entry blocks =
-  let cfg = cfgFromBlocks entry blocks
-      domTree = computeDominators cfg
-      domFrontier = computeDomFrontier cfg domTree
-      loops = findLoops cfg domTree
-  in CFGAnalysis
-    { cfgaCFG = cfg
-    , cfgaDomTree = domTree
-    , cfgaDomFrontier = domFrontier
-    , cfgaLoops = loops
-    }

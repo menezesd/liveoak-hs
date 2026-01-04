@@ -17,13 +17,31 @@ module LiveOak.SSAUtils
     -- * Expression Predicates
   , isPure
   , isSimple
-  , exprVars
+
+    -- * Block Utilities
+  , blockMapFromList
+  , BlockMap
   ) where
 
 import LiveOak.SSATypes
+import LiveOak.CFG (BlockId)
 
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
+
+--------------------------------------------------------------------------------
+-- Block Utilities
+--------------------------------------------------------------------------------
+
+-- | Type alias for block maps
+type BlockMap = Map BlockId SSABlock
+
+-- | Build a block map from a list of blocks
+-- This is a common pattern used across optimization modules.
+blockMapFromList :: [SSABlock] -> BlockMap
+blockMapFromList blocks = Map.fromList [(blockLabel b, b) | b <- blocks]
 
 --------------------------------------------------------------------------------
 -- Variable Uses
@@ -122,6 +140,3 @@ isSimple = \case
       SSAUse _ -> True
       _ -> False
 
--- | Get all variables mentioned in an expression (same as exprUses, alias for clarity)
-exprVars :: SSAExpr -> Set String
-exprVars = exprUses

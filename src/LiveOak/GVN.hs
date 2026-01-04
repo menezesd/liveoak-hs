@@ -2,8 +2,34 @@
 {-# LANGUAGE RecordWildCards #-}
 
 -- | Global Value Numbering (GVN).
+--
 -- Eliminates redundant computations by identifying expressions that
--- compute the same value across basic blocks.
+-- compute the same value across basic blocks. Uses dominator tree
+-- for scoping value numbers.
+--
+-- == Algorithm
+--
+-- 1. Traverse blocks in dominator tree order
+-- 2. For each expression, compute a canonical "value number"
+-- 3. If two expressions have the same value number, they compute the same value
+-- 4. Replace redundant computations with references to earlier computations
+--
+-- == Example
+--
+-- @
+-- Before:                After:
+--   x = a + b              x = a + b
+--   y = a + b              y = x      -- Eliminated redundant computation
+--   z = x + y              z = x + x
+-- @
+--
+-- == Handled Cases
+--
+-- * Constant expressions (folded at compile time)
+-- * Commutative operations (a + b == b + a)
+-- * Phi nodes with identical arguments
+-- * Pure expressions only (calls/allocations are not memoized)
+--
 module LiveOak.GVN
   ( -- * GVN Optimization
     runGVN
@@ -12,7 +38,8 @@ module LiveOak.GVN
 
 import LiveOak.CFG
 import LiveOak.Dominance
-import LiveOak.SSATypes (SSABlock(..), SSAInstr(..), SSAExpr(..), PhiNode(..), SSAVar(..), VarKey, varKey, varFromKey)
+import LiveOak.SSATypes (SSABlock(..), SSAInstr(..), SSAExpr(..), PhiNode(..), VarKey, varKey, varFromKey)
+import LiveOak.SSAUtils (blockMapFromList)
 import LiveOak.Ast (BinaryOp(..), UnaryOp(..))
 
 import Data.Map.Strict (Map)
@@ -83,7 +110,7 @@ data GVNResult = GVNResult
 -- | Run GVN on a method
 runGVN :: CFG -> DomTree -> [SSABlock] -> GVNResult
 runGVN cfg domTree blocks =
-  let blockMap = Map.fromList [(blockLabel b, b) | b <- blocks]
+  let blockMap = blockMapFromList blocks
       runner = if hasBackEdge cfg domTree
                then processBlockTreeLocal
                else processBlockTree

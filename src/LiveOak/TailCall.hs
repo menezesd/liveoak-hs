@@ -15,13 +15,7 @@ module LiveOak.TailCall
   ) where
 
 import LiveOak.SSATypes
-import LiveOak.CFG
-
-import Data.Map.Strict (Map)
-import qualified Data.Map.Strict as Map
-import Data.Set (Set)
-import qualified Data.Set as Set
-import Data.List (foldl')
+import LiveOak.CFG (BlockId)
 
 --------------------------------------------------------------------------------
 -- Types
@@ -168,40 +162,3 @@ optimizeInstrs entryBlock tailCalls = go 0
       -- In practice, we'd need to track parameter variables
       SSAAssign (SSAVar ("__param_" ++ show paramIdx) 0 Nothing) expr
 
---------------------------------------------------------------------------------
--- Tail Call Detection for General Calls
---------------------------------------------------------------------------------
-
--- | Analyze a method to find all tail call sites
-analyzeTailCalls :: CFG -> [SSABlock] -> Map BlockId [TailCallInfo]
-analyzeTailCalls cfg blocks =
-  let blockMap = Map.fromList [(blockLabel b, b) | b <- blocks]
-      -- Find blocks that end with a return
-      returnBlocks = [bid | bid <- allBlockIds cfg,
-                           Just b <- [Map.lookup bid blockMap],
-                           endsWithReturn b]
-  in Map.fromList [(bid, []) | bid <- returnBlocks]  -- Placeholder
-  where
-    endsWithReturn SSABlock{..} =
-      case reverse blockInstrs of
-        (SSAReturn _ : _) -> True
-        _ -> False
-
---------------------------------------------------------------------------------
--- Tail Call Marking for Code Generation
---------------------------------------------------------------------------------
-
--- | Mark tail calls in SSA for code generation
--- Returns instructions with tail calls marked (using a special wrapper)
-markTailCalls :: String -> String -> [SSABlock] -> [SSABlock]
-markTailCalls className methodName blocks =
-  let tailCalls = findTailCalls className methodName blocks
-      tailCallSet = Set.fromList [(tcBlock tc, tcInstrIndex tc) | tc <- tailCalls]
-  in map (markBlockTailCalls tailCallSet) blocks
-
--- | Mark tail calls in a block
-markBlockTailCalls :: Set (BlockId, Int) -> SSABlock -> SSABlock
-markBlockTailCalls tailCallSet block@SSABlock{..} =
-  -- For now, we don't modify the instructions, just identify them
-  -- A real implementation would wrap calls in a TailCall marker
-  block

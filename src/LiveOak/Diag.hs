@@ -90,17 +90,19 @@ formatDiagWithSource source d = unlines $ filter (not . null)
 
     sourceLines = T.lines source
 
-    sourceLine
-      | line > 0 && line <= length sourceLines =
-          "   | " ++ T.unpack (sourceLines !! (line - 1))
-      | otherwise = ""
+    -- Safe indexing: get the source line at the given line number
+    getSourceLine = case drop (line - 1) sourceLines of
+      (l:_) | line > 0 -> Just l
+      _ -> Nothing
 
-    caretLine
-      | line > 0 && line <= length sourceLines && col > 0 =
-          "   | " ++ replicate (col - 1) ' ' ++ "^"
-      | line > 0 && line <= length sourceLines =
-          "   | " ++ "^"  -- Point to start if no column info
-      | otherwise = ""
+    sourceLine = case getSourceLine of
+      Just l  -> "   | " ++ T.unpack l
+      Nothing -> ""
+
+    caretLine = case getSourceLine of
+      Just _ | col > 0 -> "   | " ++ replicate (col - 1) ' ' ++ "^"
+      Just _           -> "   | " ++ "^"  -- Point to start if no column info
+      Nothing          -> ""
 
 -- | Warning types (non-fatal issues).
 data Warning
@@ -139,17 +141,19 @@ formatWarningWithSource source w = unlines $ filter (not . null)
 
     sourceLines = T.lines source
 
-    sourceLine
-      | line > 0 && line <= length sourceLines =
-          "   | " ++ T.unpack (sourceLines !! (line - 1))
-      | otherwise = ""
+    -- Safe indexing: get the source line at the given line number
+    getSourceLine = case drop (line - 1) sourceLines of
+      (l:_) | line > 0 -> Just l
+      _ -> Nothing
 
-    caretLine
-      | line > 0 && line <= length sourceLines && col > 0 =
-          "   | " ++ replicate (col - 1) ' ' ++ "^"
-      | line > 0 && line <= length sourceLines =
-          "   | " ++ "^"
-      | otherwise = ""
+    sourceLine = case getSourceLine of
+      Just l  -> "   | " ++ T.unpack l
+      Nothing -> ""
+
+    caretLine = case getSourceLine of
+      Just _ | col > 0 -> "   | " ++ replicate (col - 1) ' ' ++ "^"
+      Just _           -> "   | " ++ "^"
+      Nothing          -> ""
 
 -- | Result type: Either a diagnostic or a successful value.
 type Result a = Either Diag a

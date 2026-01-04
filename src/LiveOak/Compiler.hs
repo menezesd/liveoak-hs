@@ -23,7 +23,6 @@ module LiveOak.Compiler
 import Data.Text (Text)
 import qualified Data.Text.IO as TIO
 
-import LiveOak.Symbol
 import LiveOak.Diag
 import LiveOak.Parser (parseProgram)
 import LiveOak.Semantic (checkProgram, checkProgramCollectErrors)

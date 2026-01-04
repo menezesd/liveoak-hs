@@ -168,16 +168,25 @@ markLive duc initial = go initial (Set.toList initial)
       -- Find the definition of this variable
       case getDef duc var of
         Nothing -> go live worklist  -- External (parameter)
-        Just defSite ->
-          -- Add all variables used in the definition
-          let usedVars = getDefsUsedVars duc defSite
+        Just _defSite ->
+          -- Find all variables that are used where this variable is defined
+          -- We trace back through the use-def chain
+          let usedVars = findUsedInDef duc var
               newVars = Set.difference usedVars live
               live' = Set.union live newVars
           in go live' (worklist ++ Set.toList newVars)
 
-    -- Get variables used in a definition (would need block access)
-    -- Simplified: we mark variables based on what we can determine
-    getDefsUsedVars _ _ = Set.empty  -- Simplified - would need block map
+    -- Find variables used in the definition of a variable
+    -- We look at the uses map to find what variables are used together
+    findUsedInDef chains defVar =
+      -- Get all uses of this variable, then find co-located uses
+      -- This is a conservative approximation - we mark all variables
+      -- that appear in the same blocks where this variable is used
+      let defSites = getUses chains defVar
+      in if Set.null defSites
+         then Set.empty
+         else Set.fromList [v | (v, sites) <- Map.toList (ducUses chains),
+                               not (Set.null (Set.intersection sites defSites))]
 
 -- | Remove dead definitions
 removeDeadDefs :: Set String -> [SSABlock] -> ([SSABlock], Int)
@@ -202,7 +211,9 @@ removeBlockDeadDefs live block@SSABlock{..} =
 filterPhis :: Set String -> [PhiNode] -> ([PhiNode], Int)
 filterPhis live phis =
   let livePhis = filter (isLivePhi live) phis
-  in (livePhis, length phis - length livePhis)
+      totalCount = length phis
+      liveCount = length livePhis
+  in (livePhis, totalCount - liveCount)
   where
     isLivePhi liveSet phi = Set.member (ssaName (phiVar phi)) liveSet
 
@@ -210,7 +221,9 @@ filterPhis live phis =
 filterInstrs :: Set String -> [SSAInstr] -> ([SSAInstr], Int)
 filterInstrs live instrs =
   let liveInstrs = filter (isLiveInstr live) instrs
-  in (liveInstrs, length instrs - length liveInstrs)
+      totalCount = length instrs
+      liveCount = length liveInstrs
+  in (liveInstrs, totalCount - liveCount)
   where
     isLiveInstr liveSet = \case
       SSAAssign var expr ->

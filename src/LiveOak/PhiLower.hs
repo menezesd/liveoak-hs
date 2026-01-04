@@ -20,6 +20,7 @@ module LiveOak.PhiLower
   ) where
 
 import LiveOak.SSATypes
+import LiveOak.SSAUtils (blockMapFromList)
 import qualified LiveOak.CFG as CFG
 import LiveOak.CFG (CFG, BlockId, predecessors, successors)
 
@@ -63,7 +64,7 @@ data LowerResult = LowerResult
 -- Uses CFG.findCriticalEdges for detection, but operates on SSABlocks
 splitCriticalEdgesSSA :: CFG -> [SSABlock] -> (CFG, [SSABlock])
 splitCriticalEdgesSSA cfg blocks =
-  let blockMap = Map.fromList [(blockLabel b, b) | b <- blocks]
+  let blockMap = blockMapFromList blocks
       -- Find all critical edges using CFG's function
       criticalEdges = CFG.findCriticalEdges cfg
       -- Split each edge

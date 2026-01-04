@@ -2,8 +2,40 @@
 {-# LANGUAGE RecordWildCards #-}
 
 -- | Loop Invariant Code Motion (LICM).
+--
 -- Moves computations that don't change within a loop to before the loop,
--- reducing redundant work.
+-- reducing redundant work on each iteration.
+--
+-- == Algorithm
+--
+-- 1. Identify all loops using back-edge detection
+-- 2. For each loop (innermost first):
+--    a. Find the preheader block (single predecessor to loop header)
+--    b. Identify loop-invariant instructions:
+--       - All operands are defined outside the loop, OR
+--       - All operands are themselves loop-invariant
+--    c. Move invariant instructions to the preheader
+--
+-- == Example
+--
+-- @
+-- Before:                      After:
+--   loop:                        preheader:
+--     x = a + b  -- invariant      x = a + b  -- hoisted
+--     y = x * i  -- not invariant  loop:
+--     i = i + 1                      y = x * i
+--     goto loop                      i = i + 1
+--                                    goto loop
+-- @
+--
+-- == Safety Requirements
+--
+-- An instruction can only be hoisted if:
+--
+-- * It is pure (no side effects)
+-- * It dominates all loop exits (will always execute)
+-- * All its operands are available in the preheader
+--
 module LiveOak.LICM
   ( -- * LICM Optimization
     runLICM
@@ -14,7 +46,7 @@ import LiveOak.CFG
 import LiveOak.Dominance
 import LiveOak.Loop
 import LiveOak.SSATypes
-import LiveOak.SSAUtils (blockDefs, isPure)
+import LiveOak.SSAUtils (blockDefs, isPure, blockMapFromList)
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -53,7 +85,7 @@ data LICMResult = LICMResult
 -- | Run LICM on a method
 runLICM :: CFG -> DomTree -> LoopNest -> [SSABlock] -> LICMResult
 runLICM cfg domTree loops blocks =
-  let blockMap = Map.fromList [(blockLabel b, b) | b <- blocks]
+  let blockMap = blockMapFromList blocks
       -- Compute definitions in each loop
       defsMap = Map.mapWithKey (computeLoopDefs blockMap) loops
       initState = LICMState

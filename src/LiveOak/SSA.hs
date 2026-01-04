@@ -30,7 +30,6 @@ module LiveOak.SSA
   ) where
 
 import LiveOak.Ast
-import LiveOak.Types (ValueType)
 import LiveOak.Symbol (ProgramSymbols, lookupClass, lookupField, fieldOffset)
 import LiveOak.SSATypes
 import LiveOak.CFG
@@ -39,6 +38,7 @@ import qualified LiveOak.GVN as GVN
 import qualified LiveOak.LICM as LICM
 import qualified LiveOak.SCCP as SCCP
 import LiveOak.Loop (findLoops)
+import LiveOak.SSAUtils (blockMapFromList)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
@@ -417,7 +417,7 @@ insertPhis cfg domFrontier defSites blocks =
   let -- For each variable, compute blocks that need phi nodes
       phiSites = Map.mapWithKey (computePhiSites domFrontier) defSites
       -- Insert phi nodes into blocks
-      blockMap = Map.fromList [(blockLabel b, b) | b <- blocks]
+      blockMap = blockMapFromList blocks
       blockMap' = Map.foldlWithKey' (insertPhisForVar cfg) blockMap phiSites
   in map snd $ Map.toList blockMap'
 
@@ -470,7 +470,7 @@ renameVariables cfg domTree params blocks =
       initDefs = Map.fromList [(paramName p, SSAVar (paramName p) 0 (Just (paramType p))) | p <- params]
       initState = RenameState initVersions initDefs
       -- Process blocks in dominator tree order
-      blockMap = Map.fromList [(blockLabel b, b) | b <- blocks]
+      blockMap = blockMapFromList blocks
       entry = cfgEntry cfg
       (_, renamedMap) = if Map.member entry blockMap
         then renameBlock cfg domTree entry initState blockMap
@@ -524,7 +524,9 @@ processChild cfg domTree parentState (renSt, blockMap) childId =
 
 -- | Rename phi node definitions
 renamePhistDefs :: RenameState -> [PhiNode] -> (RenameState, [PhiNode])
-renamePhistDefs renSt phis = foldl' renamePhi (renSt, []) phis
+renamePhistDefs renSt phis =
+  let (st', acc) = foldl' renamePhi (renSt, []) phis
+  in (st', reverse acc)  -- Reverse since we cons to front
   where
     renamePhi (st, acc) phi =
       let varName = ssaName (phiVar phi)
@@ -534,11 +536,13 @@ renamePhistDefs renSt phis = foldl' renamePhi (renSt, []) phis
                    , renameCurrentDef = Map.insert varName newVar (renameCurrentDef st)
                    }
           phi' = phi { phiVar = newVar }
-      in (st', acc ++ [phi'])
+      in (st', phi' : acc)  -- O(1) cons instead of O(n) append
 
 -- | Rename instructions
 renameInstrs :: RenameState -> [SSAInstr] -> (RenameState, [SSAInstr])
-renameInstrs renSt instrs = foldl' renameInstr (renSt, []) instrs
+renameInstrs renSt instrs =
+  let (st', acc) = foldl' renameInstr (renSt, []) instrs
+  in (st', reverse acc)  -- Reverse since we cons to front
   where
     renameInstr (st, acc) instr = case instr of
       SSAAssign var expr ->
@@ -549,27 +553,27 @@ renameInstrs renSt instrs = foldl' renameInstr (renSt, []) instrs
             st' = st { renameVersions = Map.insert varName (version + 1) (renameVersions st)
                      , renameCurrentDef = Map.insert varName newVar (renameCurrentDef st)
                      }
-        in (st', acc ++ [SSAAssign newVar expr'])
+        in (st', SSAAssign newVar expr' : acc)
 
       SSAFieldStore target field off value ->
         let target' = renameExpr st target
             value' = renameExpr st value
-        in (st, acc ++ [SSAFieldStore target' field off value'])
+        in (st, SSAFieldStore target' field off value' : acc)
 
       SSAReturn exprOpt ->
         let exprOpt' = fmap (renameExpr st) exprOpt
-        in (st, acc ++ [SSAReturn exprOpt'])
+        in (st, SSAReturn exprOpt' : acc)
 
       SSAJump target ->
-        (st, acc ++ [SSAJump target])
+        (st, SSAJump target : acc)
 
       SSABranch cond t f ->
         let cond' = renameExpr st cond
-        in (st, acc ++ [SSABranch cond' t f])
+        in (st, SSABranch cond' t f : acc)
 
       SSAExprStmt expr ->
         let expr' = renameExpr st expr
-        in (st, acc ++ [SSAExprStmt expr'])
+        in (st, SSAExprStmt expr' : acc)
 
 -- | Rename uses in an expression
 renameExpr :: RenameState -> SSAExpr -> SSAExpr
@@ -648,8 +652,6 @@ ssaDeadCodeElim (SSAProgram classes) =
       SSATernary c t e -> hasSideEffects c || hasSideEffects t || hasSideEffects e
       SSAFieldAccess t _ -> hasSideEffects t
       _ -> False
-
-    varKey v = (ssaName v, ssaVersion v)
 
     collectEssential blocks =
       Set.unions (map blockEssential blocks)
