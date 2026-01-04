@@ -17,9 +17,9 @@ module LiveOak.Validation
   ) where
 
 import LiveOak.Ast (ClassDecl(..), MethodDecl(..))
-import LiveOak.Symbol (ProgramSymbols, MethodSymbol, lookupClass, lookupMethod, expectedUserArgs, numParams)
+import LiveOak.Symbol (ProgramSymbols, lookupClass, lookupMethod, expectedUserArgs, numParams)
 import LiveOak.Diag (Diag(..), Result, ok)
-import Data.List (group, sort)
+import qualified Data.Map.Strict as Map
 
 --------------------------------------------------------------------------------
 -- Constants
@@ -96,6 +96,8 @@ validateNoDuplicates classes =
           dups = findDuplicates fieldNames
       in [SyntaxError ("Duplicate field " ++ f ++ " in class " ++ className) 0 0 | f <- dups]
 
-    -- Find duplicates in a list
+    -- Find duplicates in a list (O(n) using Map)
     findDuplicates :: Ord a => [a] -> [a]
-    findDuplicates xs = [head g | g <- group (sort xs), length g > 1]
+    findDuplicates xs =
+      let counts = Map.fromListWith (+) [(x, 1 :: Int) | x <- xs]
+      in Map.keys $ Map.filter (> 1) counts

@@ -4,6 +4,9 @@
 -- | Function Inlining Optimization.
 -- Replaces function calls with the function body, eliminating call overhead
 -- and enabling further optimizations.
+--
+-- __Status: EXPERIMENTAL__ - This module is not yet integrated into the
+-- optimization pipeline. Return value handling is incomplete.
 module LiveOak.Inline
   ( -- * Inlining
     inlineFunctions

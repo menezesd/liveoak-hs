@@ -4,6 +4,10 @@
 -- | Tail Call Optimization (TCO).
 -- Converts tail-recursive calls into jumps, avoiding stack growth.
 -- A call is in tail position if it's the last thing a function does before returning.
+--
+-- __Status: EXPERIMENTAL__ - This module is not yet integrated into the
+-- optimization pipeline. Parameter update handling is incomplete (mkParamUpdate
+-- creates placeholder variables instead of updating actual parameters).
 module LiveOak.TailCall
   ( -- * Tail Call Optimization
     optimizeTailCalls

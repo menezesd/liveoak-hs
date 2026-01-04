@@ -4,6 +4,9 @@
 -- | Escape Analysis.
 -- Determines whether objects "escape" their allocation site, enabling
 -- stack allocation for non-escaping objects.
+--
+-- __Status: EXPERIMENTAL__ - This module is not yet integrated into the
+-- optimization pipeline. Stack allocation transformation is incomplete.
 module LiveOak.Escape
   ( -- * Escape Analysis
     analyzeEscape

@@ -284,24 +284,26 @@ stmtToBlocks loopExit label = \case
 
 -- | Check if a list of instructions ends with a terminator
 hasTerminator :: [SSAInstr] -> Bool
-hasTerminator [] = False
-hasTerminator instrs = case last instrs of
-  SSAReturn _ -> True
-  SSAJump _ -> True
-  SSABranch _ _ _ -> True
-  _ -> False
+hasTerminator instrs = case reverse instrs of
+  [] -> False
+  (lastInstr:_) -> case lastInstr of
+    SSAReturn _ -> True
+    SSAJump _ -> True
+    SSABranch _ _ _ -> True
+    _ -> False
 
 -- | Add a jump instruction to the end of the last block
 -- Only adds jump if the block doesn't already end with a terminator (Return, Jump, Branch)
 addJumpToEnd :: [SSABlock] -> String -> [SSABlock]
 addJumpToEnd [] target = [SSABlock "empty" [] [SSAJump target]]
-addJumpToEnd blocks target =
-  let (init', last') = (init blocks, last blocks)
-      lastInstrs = blockInstrs last'
-      lastWithJump = if hasTerminator lastInstrs
-                     then last'  -- Don't add jump if already has terminator
-                     else last' { blockInstrs = lastInstrs ++ [SSAJump target] }
-  in init' ++ [lastWithJump]
+addJumpToEnd blocks target = case reverse blocks of
+  [] -> [SSABlock "empty" [] [SSAJump target]]  -- Already handled above, but safe
+  (lastBlock:initRev) ->
+    let lastInstrs = blockInstrs lastBlock
+        lastWithJump = if hasTerminator lastInstrs
+                       then lastBlock  -- Don't add jump if already has terminator
+                       else lastBlock { blockInstrs = lastInstrs ++ [SSAJump target] }
+    in reverse (lastWithJump : initRev)
 
 -- | Update all references to a block label within a block's instructions
 updateBlockRefs :: String -> String -> SSABlock -> SSABlock
