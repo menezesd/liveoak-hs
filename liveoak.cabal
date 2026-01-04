@@ -57,6 +57,11 @@ library
                     , LiveOak.PhiLower
                     , LiveOak.Validation
                     , LiveOak.CFGAnalysis
+                    , LiveOak.DSE
+                    , LiveOak.SROA
+                    , LiveOak.Unroll
+                    , LiveOak.JumpThread
+                    , LiveOak.OptConfig
     build-depends:    base >= 4.17 && < 5
                     , text >= 2.0
                     , megaparsec >= 9.0

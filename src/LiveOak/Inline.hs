@@ -244,21 +244,29 @@ findInlineableCall toInline = \case
 -- For simple functions (single block or straightforward control flow),
 -- we inline by replacing the call with parameter assignments + body + return handling
 inlineCall :: MethodInfo -> Maybe SSAVar -> [SSAExpr] -> Int -> ([SSAInstr], [SSABlock])
-inlineCall info resultVar args _labelCounter =
+inlineCall info resultVar args labelCounter =
   case miBlocks info of
     -- Simple case: single block function (getters, setters, simple computations)
     [SSABlock{..}] ->
       let -- Create parameter assignments (with unique names to avoid conflicts)
-          paramAssigns = zipWith (mkParamAssign _labelCounter) (miParams info) args
+          paramAssigns = zipWith (mkParamAssign labelCounter) (miParams info) args
           -- Create a substitution map from original params to inlined params
           paramSubst = Map.fromList
-            [(ssaName p, inlineParamName _labelCounter p) | p <- miParams info]
+            [(ssaName p, inlineParamName labelCounter p) | p <- miParams info]
           -- Transform body instructions, substituting params and handling returns
           bodyInstrs = concatMap (transformInstr paramSubst resultVar) blockInstrs
       in (paramAssigns ++ bodyInstrs, [])
 
-    -- Multi-block functions: for now, don't inline (would need proper CFG merging)
-    _ -> ([], [])  -- Return empty to skip inlining
+    -- Two-block case: entry + one other (common for simple if-then patterns)
+    [entry@SSABlock{}, other@SSABlock{}] ->
+      inlineMultiBlock info resultVar args labelCounter [entry, other]
+
+    -- Three-block case: entry + then + else (if-then-else patterns)
+    [entry@SSABlock{}, thenB@SSABlock{}, elseB@SSABlock{}] ->
+      inlineMultiBlock info resultVar args labelCounter [entry, thenB, elseB]
+
+    -- More than 3 blocks: skip for now (complex control flow)
+    _ -> ([], [])
   where
     mkParamAssign counter param arg =
       let newName = inlineParamName counter param
@@ -267,6 +275,102 @@ inlineCall info resultVar args _labelCounter =
 
     inlineParamName counter param =
       varName ("__inline_" ++ show counter ++ "_" ++ varNameString (ssaName param))
+
+-- | Inline a multi-block function
+-- Creates new blocks with renamed labels and variables
+inlineMultiBlock :: MethodInfo -> Maybe SSAVar -> [SSAExpr] -> Int -> [SSABlock] -> ([SSAInstr], [SSABlock])
+inlineMultiBlock info resultVar args labelCounter blocks =
+  let -- Create parameter assignments
+      paramAssigns = zipWith (mkParamAssign labelCounter) (miParams info) args
+
+      -- Build substitution maps
+      paramSubst = Map.fromList
+        [(ssaName p, inlineParamName labelCounter p) | p <- miParams info]
+      labelSubst = Map.fromList
+        [(blockLabel b, inlineBlockId labelCounter (blockLabel b)) | b <- blocks]
+      varSubst = buildVarSubst labelCounter blocks
+
+      -- Combined substitution for variables
+      allVarSubst = Map.union paramSubst varSubst
+
+      -- Transform all blocks
+      inlinedBlocks = map (transformBlock allVarSubst labelSubst resultVar) blocks
+  in (paramAssigns, inlinedBlocks)
+  where
+    mkParamAssign counter param arg =
+      let newName = inlineParamName counter param
+          newVar = SSAVar newName (ssaVersion param) (ssaVarType param)
+      in SSAAssign newVar arg
+
+    inlineParamName counter param =
+      varName ("__inline_" ++ show counter ++ "_" ++ varNameString (ssaName param))
+
+-- | Generate inline block ID
+inlineBlockId :: Int -> BlockId -> BlockId
+inlineBlockId counter bid =
+  blockId ("__inline_" ++ show counter ++ "_" ++ blockIdName bid)
+
+-- | Build variable substitution map for all variables defined in blocks
+buildVarSubst :: Int -> [SSABlock] -> Map VarName VarName
+buildVarSubst counter blocks = Map.fromList $ concatMap blockDefs blocks
+  where
+    blockDefs SSABlock{..} =
+      let phiDefs = [(ssaName (phiVar phi), inlineVarName counter (phiVar phi))
+                    | phi <- blockPhis]
+          instrDefs = [(ssaName var, inlineVarName counter var)
+                      | SSAAssign var _ <- blockInstrs]
+      in phiDefs ++ instrDefs
+
+    inlineVarName c var =
+      varName ("__inline_" ++ show c ++ "_" ++ varNameString (ssaName var))
+
+-- | Transform a block for inlining
+transformBlock :: Map VarName VarName -> Map BlockId BlockId -> Maybe SSAVar -> SSABlock -> SSABlock
+transformBlock varSubst labelSubst resultVar SSABlock{..} =
+  SSABlock
+    { blockLabel = Map.findWithDefault blockLabel blockLabel labelSubst
+    , blockPhis = map (transformPhi varSubst labelSubst) blockPhis
+    , blockInstrs = concatMap (transformInstrMulti varSubst labelSubst resultVar) blockInstrs
+    }
+
+-- | Transform a phi node for inlining
+transformPhi :: Map VarName VarName -> Map BlockId BlockId -> PhiNode -> PhiNode
+transformPhi varSubst labelSubst PhiNode{..} =
+  PhiNode
+    { phiVar = substVar varSubst phiVar
+    , phiArgs = [(Map.findWithDefault bid bid labelSubst, substVar varSubst var)
+                | (bid, var) <- phiArgs]
+    }
+
+-- | Transform an instruction for multi-block inlining
+transformInstrMulti :: Map VarName VarName -> Map BlockId BlockId -> Maybe SSAVar -> SSAInstr -> [SSAInstr]
+transformInstrMulti varSubst labelSubst resultVar = \case
+  -- Return with value: assign to result variable
+  SSAReturn (Just expr) ->
+    case resultVar of
+      Just rv -> [SSAAssign rv (substExpr varSubst expr)]
+      Nothing -> []
+
+  -- Return without value: nothing to do
+  SSAReturn Nothing -> []
+
+  -- Jump: rename target
+  SSAJump target ->
+    [SSAJump (Map.findWithDefault target target labelSubst)]
+
+  -- Branch: rename targets
+  SSABranch cond thenT elseT ->
+    [SSABranch (substExpr varSubst cond)
+               (Map.findWithDefault thenT thenT labelSubst)
+               (Map.findWithDefault elseT elseT labelSubst)]
+
+  -- Regular instructions: substitute variables
+  SSAAssign var expr ->
+    [SSAAssign (substVar varSubst var) (substExpr varSubst expr)]
+  SSAFieldStore target field idx val ->
+    [SSAFieldStore (substExpr varSubst target) field idx (substExpr varSubst val)]
+  SSAExprStmt expr ->
+    [SSAExprStmt (substExpr varSubst expr)]
 
 -- | Transform an instruction for inlining
 -- - Substitute parameter references with inlined parameter names

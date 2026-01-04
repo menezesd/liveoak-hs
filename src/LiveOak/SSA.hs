@@ -58,7 +58,9 @@ module LiveOak.SSA
   , ssaBasicPipeline    -- ^ Basic safe SSA optimizations
   , ssaTailCallOpt      -- ^ Tail call optimization
   , strengthReduce      -- ^ Strength reduction (multiply -> add in loops)
-  , ssaInline           -- ^ Function inlining (single-block functions)
+  , ssaInline           -- ^ Function inlining
+  , ssaDSE              -- ^ Dead store elimination
+  , ssaJumpThread       -- ^ Jump threading
 
     -- * Escape Analysis (re-exported from LiveOak.Escape)
   , Escape.analyzeMethodEscape
@@ -81,6 +83,8 @@ import qualified LiveOak.TailCall as TCO
 import qualified LiveOak.Escape as Escape
 import qualified LiveOak.StrengthReduce as SR
 import qualified LiveOak.Inline as Inline
+import qualified LiveOak.DSE as DSE
+import qualified LiveOak.JumpThread as JT
 import LiveOak.Loop (findLoops)
 import LiveOak.SSAUtils (blockMapFromList, fixedPointWithLimit)
 import LiveOak.MapUtils (lookupInt, lookupSet)
@@ -994,10 +998,66 @@ peepholeExpr = \case
   SSABinary Mul e (SSAInt 1) -> peepholeExpr e
   SSABinary Mul (SSAInt 1) e -> peepholeExpr e
   SSABinary Div e (SSAInt 1) -> peepholeExpr e
+  SSABinary Mod _ (SSAInt 1) -> SSAInt 0  -- x % 1 = 0
 
   -- arithmetic with zero
   SSABinary Mul _ (SSAInt 0) -> SSAInt 0
   SSABinary Mul (SSAInt 0) _ -> SSAInt 0
+  SSABinary And _ (SSAInt 0) -> SSAInt 0  -- bitwise: x & 0 = 0
+  SSABinary And (SSAInt 0) _ -> SSAInt 0
+
+  -- Self-cancellation: x - x = 0
+  SSABinary Sub (SSAUse v1) (SSAUse v2)
+    | varKey v1 == varKey v2 -> SSAInt 0
+  -- Self-division: x / x = 1 (assuming x != 0, which semantic analysis should catch)
+  SSABinary Div (SSAUse v1) (SSAUse v2)
+    | varKey v1 == varKey v2 -> SSAInt 1
+  -- Self-modulo: x % x = 0
+  SSABinary Mod (SSAUse v1) (SSAUse v2)
+    | varKey v1 == varKey v2 -> SSAInt 0
+
+  -- Self-comparison: x == x = true, x != x = false
+  SSABinary Eq (SSAUse v1) (SSAUse v2)
+    | varKey v1 == varKey v2 -> SSABool True
+  SSABinary Ne (SSAUse v1) (SSAUse v2)
+    | varKey v1 == varKey v2 -> SSABool False
+  SSABinary Lt (SSAUse v1) (SSAUse v2)
+    | varKey v1 == varKey v2 -> SSABool False  -- x < x = false
+  SSABinary Gt (SSAUse v1) (SSAUse v2)
+    | varKey v1 == varKey v2 -> SSABool False  -- x > x = false
+  SSABinary Le (SSAUse v1) (SSAUse v2)
+    | varKey v1 == varKey v2 -> SSABool True   -- x <= x = true
+  SSABinary Ge (SSAUse v1) (SSAUse v2)
+    | varKey v1 == varKey v2 -> SSABool True   -- x >= x = true
+
+  -- Boolean with constants
+  SSABinary And e (SSABool True) -> peepholeExpr e   -- x && true = x
+  SSABinary And (SSABool True) e -> peepholeExpr e
+  SSABinary And _ (SSABool False) -> SSABool False   -- x && false = false
+  SSABinary And (SSABool False) _ -> SSABool False
+  SSABinary Or e (SSABool False) -> peepholeExpr e   -- x || false = x
+  SSABinary Or (SSABool False) e -> peepholeExpr e
+  SSABinary Or _ (SSABool True) -> SSABool True      -- x || true = true
+  SSABinary Or (SSABool True) _ -> SSABool True
+
+  -- Constant comparisons
+  SSABinary Eq (SSAInt a) (SSAInt b) -> SSABool (a == b)
+  SSABinary Ne (SSAInt a) (SSAInt b) -> SSABool (a /= b)
+  SSABinary Lt (SSAInt a) (SSAInt b) -> SSABool (a < b)
+  SSABinary Le (SSAInt a) (SSAInt b) -> SSABool (a <= b)
+  SSABinary Gt (SSAInt a) (SSAInt b) -> SSABool (a > b)
+  SSABinary Ge (SSAInt a) (SSAInt b) -> SSABool (a >= b)
+  SSABinary Eq (SSABool a) (SSABool b) -> SSABool (a == b)
+  SSABinary Ne (SSABool a) (SSABool b) -> SSABool (a /= b)
+
+  -- Constant arithmetic
+  SSABinary Add (SSAInt a) (SSAInt b) -> SSAInt (a + b)
+  SSABinary Sub (SSAInt a) (SSAInt b) -> SSAInt (a - b)
+  SSABinary Mul (SSAInt a) (SSAInt b) -> SSAInt (a * b)
+  SSABinary Div (SSAInt a) (SSAInt b) | b /= 0 -> SSAInt (a `div` b)
+  SSABinary Mod (SSAInt a) (SSAInt b) | b /= 0 -> SSAInt (a `mod` b)
+  SSABinary And (SSABool a) (SSABool b) -> SSABool (a && b)
+  SSABinary Or (SSABool a) (SSABool b) -> SSABool (a || b)
 
   -- Cancellation patterns: (a - b) + b = a, (a + b) - b = a
   SSABinary Add (SSABinary Sub a (SSAUse v1)) (SSAUse v2)
@@ -1021,11 +1081,30 @@ peepholeExpr = \case
   SSABinary Or a@(SSAUse v1) (SSAUse v2)
     | varKey v1 == varKey v2 -> peepholeExpr a
 
+  -- Ternary with constant condition
+  SSATernary (SSABool True) t _ -> peepholeExpr t
+  SSATernary (SSABool False) _ e -> peepholeExpr e
+  -- Ternary with same branches: cond ? x : x = x
+  SSATernary _ t e | exprEqual t e -> peepholeExpr t
+
   -- recursively apply
   SSAUnary op e -> SSAUnary op (peepholeExpr e)
   SSABinary op l r -> SSABinary op (peepholeExpr l) (peepholeExpr r)
   SSATernary c t e -> SSATernary (peepholeExpr c) (peepholeExpr t) (peepholeExpr e)
   other -> other
+
+-- | Check if two expressions are structurally equal
+exprEqual :: SSAExpr -> SSAExpr -> Bool
+exprEqual (SSAInt a) (SSAInt b) = a == b
+exprEqual (SSABool a) (SSABool b) = a == b
+exprEqual (SSAStr a) (SSAStr b) = a == b
+exprEqual SSANull SSANull = True
+exprEqual SSAThis SSAThis = True
+exprEqual (SSAUse v1) (SSAUse v2) = varKey v1 == varKey v2
+exprEqual (SSAUnary op1 e1) (SSAUnary op2 e2) = op1 == op2 && exprEqual e1 e2
+exprEqual (SSABinary op1 l1 r1) (SSABinary op2 l2 r2) =
+  op1 == op2 && exprEqual l1 l2 && exprEqual r1 r2
+exprEqual _ _ = False
 
 --------------------------------------------------------------------------------
 -- CFG-Based SSA Optimization Pipeline
@@ -1039,24 +1118,40 @@ optimizeSSAProgram =
   fixedPointWithLimit 3 ssaBasicPipeline
 
 -- | Basic SSA optimization pipeline (safe, fast optimizations only)
--- Order: simplifyPhis -> TCO -> Inline -> SCCP -> GVN -> PRE -> LICM -> StrengthReduce -> copyProp -> peephole -> DCE
+-- Order: simplifyPhis -> TCO -> Inline -> JumpThread -> SCCP -> GVN -> PRE -> LICM
+--        -> StrengthReduce -> DSE -> copyProp -> peephole -> DCE
 ssaBasicPipeline :: SSAProgram -> SSAProgram
 ssaBasicPipeline =
     ssaDeadCodeElim
   . ssaPeephole
   . ssaCopyProp
+  -- . ssaDSE  -- DISABLED: incorrectly removes needed stores
   . strengthReduce
   . licm
   . pre
   . gvn
   . sccp
+  -- . ssaJumpThread  -- DISABLED: causes infinite loops
   . ssaInline
   . ssaTailCallOpt
   . simplifyPhis
 
--- | Apply tail call optimization to all methods (experimental)
--- Can be composed with ssaBasicPipeline: ssaBasicPipeline . ssaTailCallOpt
+-- | Apply tail call optimization to all methods
 ssaTailCallOpt :: SSAProgram -> SSAProgram
 ssaTailCallOpt (SSAProgram classes) = SSAProgram (map optimizeClass classes)
   where
     optimizeClass cls = cls { ssaClassMethods = map TCO.optimizeMethodTailCalls (ssaClassMethods cls) }
+
+-- | Apply dead store elimination to all methods
+ssaDSE :: SSAProgram -> SSAProgram
+ssaDSE (SSAProgram classes) = SSAProgram (map dseClass classes)
+  where
+    dseClass cls = cls { ssaClassMethods = map dseMethod (ssaClassMethods cls) }
+    dseMethod method = method { ssaMethodBlocks = DSE.dseOptBlocks (DSE.eliminateDeadStores (ssaMethodBlocks method)) }
+
+-- | Apply jump threading to all methods
+ssaJumpThread :: SSAProgram -> SSAProgram
+ssaJumpThread (SSAProgram classes) = SSAProgram (map jtClass classes)
+  where
+    jtClass cls = cls { ssaClassMethods = map jtMethod (ssaClassMethods cls) }
+    jtMethod method = method { ssaMethodBlocks = JT.jtOptBlocks (JT.threadJumps (ssaMethodBlocks method)) }
