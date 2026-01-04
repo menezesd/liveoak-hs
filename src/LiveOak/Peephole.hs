@@ -173,13 +173,18 @@ tshow = T.pack . show
 optimizeText :: Text -> Text
 optimizeText = emitSam . optimize . parseSam
 
+-- | Maximum iterations for peephole optimization.
+-- Most code stabilizes within 5-10 iterations.
+maxPeepholeIterations :: Int
+maxPeepholeIterations = 20
+
 -- | Apply peephole optimizations until no more changes
 optimize :: [SamInstr] -> [SamInstr]
 optimize =
     -- Post-processing passes (run once after main optimizations)
     scheduleInstructions
     -- Iterative peephole optimizations
-  . go (20 :: Int)
+  . go maxPeepholeIterations
   where
     go 0 instrs = instrs  -- Max iterations reached
     go n instrs =

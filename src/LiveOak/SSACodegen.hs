@@ -480,10 +480,11 @@ emitSSAExpr = \case
 
   SSANewObject cn args -> do
     syms <- asks scgSymbols
-    let nFields = case lookupClass cn syms of
-          Just cs -> length (csFieldOrder cs)
-          Nothing -> 1
-        hasCtor = maybe False (isJust . lookupMethod cn) (lookupClass cn syms)
+    cs <- case lookupClass cn syms of
+      Just cs -> return cs
+      Nothing -> throwError $ D.ResolveError ("Unknown class in new expression: " ++ cn) 0 0
+    let nFields = length (csFieldOrder cs)
+        hasCtor = isJust (lookupMethod cn cs)
     -- Allocate object (heap initialized to 0)
     emit $ "PUSHIMM " <> tshow nFields <> "\n"
     emit "MALLOC\n"

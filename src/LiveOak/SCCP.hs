@@ -168,15 +168,23 @@ runSCCP params cfg blocks =
     , sccpDeadBlocks = dead
     }
 
--- | Main SCCP loop - process worklists until empty
+-- | Maximum iterations for SCCP fixed-point computation.
+-- Most programs converge within a few hundred iterations.
+maxSCCPIterations :: Int
+maxSCCPIterations = 10000
+
+-- | Main SCCP loop - process worklists until empty or iteration limit
 sccpLoop :: CFG -> Map BlockId SSABlock -> Map VarKey (Set BlockId) -> SCCP ()
-sccpLoop cfg blockMap useMap = do
-  -- Process CFG worklist
-  cfgDone <- processCFGWorklist cfg blockMap
-  -- Process SSA worklist
-  ssaDone <- processSSAWorklist cfg blockMap useMap
-  -- Continue until both worklists are empty
-  unless (cfgDone && ssaDone) $ sccpLoop cfg blockMap useMap
+sccpLoop cfg blockMap useMap = go maxSCCPIterations
+  where
+    go 0 = return ()  -- Max iterations reached
+    go n = do
+      -- Process CFG worklist
+      cfgDone <- processCFGWorklist cfg blockMap
+      -- Process SSA worklist
+      ssaDone <- processSSAWorklist cfg blockMap useMap
+      -- Continue until both worklists are empty
+      unless (cfgDone && ssaDone) $ go (n - 1)
 
 -- | Process CFG edge worklist
 processCFGWorklist :: CFG -> Map BlockId SSABlock -> SCCP Bool

@@ -96,6 +96,9 @@ foldExpr expr = case expr of
       -- Double negation elimination: --x = x, !!x = x
       (Neg, Unary Neg inner _) -> inner
       (Not, Unary Not inner _) -> inner
+      -- De Morgan's laws: !(a && b) = !a || !b, !(a || b) = !a && !b
+      (Not, Binary And a b p) -> Binary Or (Unary Not a p) (Unary Not b p) pos
+      (Not, Binary Or a b p)  -> Binary And (Unary Not a p) (Unary Not b p) pos
       _                        -> Unary op e' pos
 
   -- Binary operations

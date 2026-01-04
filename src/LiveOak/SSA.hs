@@ -65,6 +65,7 @@ import LiveOak.CFG
 import LiveOak.Dominance
 import qualified LiveOak.GVN as GVN
 import qualified LiveOak.LICM as LICM
+import qualified LiveOak.PRE as PRE
 import qualified LiveOak.SCCP as SCCP
 import LiveOak.Loop (findLoops)
 import LiveOak.SSAUtils (blockMapFromList, fixedPointWithLimit)
@@ -449,7 +450,7 @@ insertPhis cfg domFrontier defSites blocks =
       -- Insert phi nodes into blocks
       blockMap = blockMapFromList blocks
       blockMap' = Map.foldlWithKey' (insertPhisForVar cfg) blockMap phiSites
-  in map snd $ Map.toList blockMap'
+  in Map.elems blockMap'
 
 -- | Compute where phi nodes are needed for a variable using dominance frontiers
 computePhiSites :: DomFrontier -> String -> Set BlockId -> Set BlockId
@@ -512,7 +513,7 @@ renameVariables cfg domTree params blocks =
       finalMap = foldl' (\m bid -> case Map.lookup bid blockMap of
                           Nothing -> m
                           Just b -> Map.insert bid b m) renamedMap unreached
-  in map snd $ Map.toList finalMap
+  in Map.elems finalMap
 
 -- | State for variable renaming
 data RenameState = RenameState
@@ -867,6 +868,24 @@ licmMethod method =
   in method { ssaMethodBlocks = LICM.licmOptBlocks licmResult }
 
 --------------------------------------------------------------------------------
+-- PRE Wrapper
+--------------------------------------------------------------------------------
+
+-- | Partial redundancy elimination on SSA program
+pre :: SSAProgram -> SSAProgram
+pre (SSAProgram classes) = SSAProgram (map preClass classes)
+
+preClass :: SSAClass -> SSAClass
+preClass c = c { ssaClassMethods = map preMethod (ssaClassMethods c) }
+
+preMethod :: SSAMethod -> SSAMethod
+preMethod method =
+  let cfg = buildCFG method
+      domTree = computeDominators cfg
+      preResult = PRE.eliminatePartialRedundancy cfg domTree (ssaMethodBlocks method)
+  in method { ssaMethodBlocks = PRE.preOptBlocks preResult }
+
+--------------------------------------------------------------------------------
 -- Phi Simplification
 --------------------------------------------------------------------------------
 
@@ -885,10 +904,12 @@ simplifyPhis (SSAProgram classes) =
       in b { blockPhis = newPhis, blockInstrs = newInstrs }
 
     processPhi (phis, copies) phi =
-      let args = map snd (phiArgs phi)
-      in if not (null args) && all (== head args) (tail args)
-         then (phis, (phiVar phi, head args) : copies)
-         else (phi : phis, copies)
+      case map snd (phiArgs phi) of
+        -- All phi arguments are the same variable - replace with copy
+        (first:rest) | all (== first) rest ->
+          (phis, (phiVar phi, first) : copies)
+        -- Keep the phi node
+        _ -> (phi : phis, copies)
 
 --------------------------------------------------------------------------------
 -- SSA Peephole Optimization
@@ -971,12 +992,14 @@ optimizeSSAProgram ssaProg =
   fixedPointWithLimit 3 ssaBasicPipeline ssaProg
 
 -- | Basic SSA optimization pipeline (safe, fast optimizations only)
+-- Order: simplifyPhis -> SCCP -> GVN -> PRE -> LICM -> copyProp -> peephole -> DCE
 ssaBasicPipeline :: SSAProgram -> SSAProgram
 ssaBasicPipeline =
     ssaDeadCodeElim
   . ssaPeephole
   . ssaCopyProp
   . licm
+  . pre
   . gvn
   . sccp
   . simplifyPhis
