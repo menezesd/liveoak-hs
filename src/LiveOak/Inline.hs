@@ -203,26 +203,29 @@ inlineInMethod toInline method =
 -- | Inline calls in blocks
 inlineInBlocks :: Map String MethodInfo -> Int -> [SSABlock] -> ([SSABlock], Int)
 inlineInBlocks toInline labelCounter blocks =
-  foldl' inlineBlock ([], 0) blocks
+  let (accRev, count) = foldl' inlineBlock ([], 0) blocks
+  in (reverse accRev, count)
   where
     inlineBlock (acc, count) block =
       let (block', newBlocks, c) = inlineBlockCalls toInline labelCounter block
-      in (acc ++ [block'] ++ newBlocks, count + c)
+          -- Prepend in reverse order: newBlocks then block'
+      in (reverse newBlocks ++ (block' : acc), count + c)
 
 -- | Inline calls in a single block
 inlineBlockCalls :: Map String MethodInfo -> Int -> SSABlock -> (SSABlock, [SSABlock], Int)
 inlineBlockCalls toInline labelCounter block@SSABlock{..} =
-  let (instrs', newBlocks, count) = foldl' inlineInstr ([], [], 0) blockInstrs
-  in (block { blockInstrs = instrs' }, newBlocks, count)
+  let (instrsRev, blocksRev, count) = foldl' inlineInstr ([], [], 0) blockInstrs
+  in (block { blockInstrs = reverse instrsRev }, reverse blocksRev, count)
   where
     inlineInstr (acc, blocks, count) instr =
       case findInlineableCall toInline instr of
         Just (methodInfo, resultVar, args) ->
           -- Inline this call
           let (inlinedInstrs, newBlocks') = inlineCall methodInfo resultVar args labelCounter
-          in (acc ++ inlinedInstrs, blocks ++ newBlocks', count + 1)
+              -- Prepend inlined instructions in reverse order
+          in (reverse inlinedInstrs ++ acc, reverse newBlocks' ++ blocks, count + 1)
         Nothing ->
-          (acc ++ [instr], blocks, count)
+          (instr : acc, blocks, count)
 
 -- | Find an inlineable call in an instruction
 findInlineableCall :: Map String MethodInfo -> SSAInstr -> Maybe (MethodInfo, Maybe SSAVar, [SSAExpr])

@@ -320,30 +320,17 @@ emitTerminator currentBlock term = do
 
     TermReturn exprOpt -> do
       returnSlot <- asks scgReturnSlotOffset
-      handled <- case exprOpt of
-        Just expr -> emitTailCallIfPossible expr
-        Nothing -> return False
-      unless handled $ do
-        case exprOpt of
-          Just expr -> do
-            emitSSAExpr expr
-            emit $ "STOREOFF " <> tshow returnSlot <> "\n"
-          Nothing -> do
-            emit "PUSHIMM 0\n"
-            emit $ "STOREOFF " <> tshow returnSlot <> "\n"
-        clsName <- asks scgClassName
-        methName <- asks scgMethodName
-        let retLabel = T.pack clsName <> "_" <> T.pack methName <> "_return"
-        emit $ "JUMP " <> retLabel <> "\n"
-
--- | Attempt tail-call optimization in a return. Returns True if handled.
--- Temporarily disable SSA TCO to stabilize stack correctness.
-emitTailCallIfPossible :: SSAExpr -> SSACodegen Bool
-emitTailCallIfPossible _ = return False
-
--- | Emit a tail call by rewriting params/this in-place and jumping to TCO label.
-emitTailCallSSA :: MethodSymbol -> String -> MethodSymbol -> [SSAExpr] -> Maybe SSAExpr -> SSACodegen ()
-emitTailCallSSA _ _ _ _ _ = return ()  -- currently unused (TCO disabled)
+      case exprOpt of
+        Just expr -> do
+          emitSSAExpr expr
+          emit $ "STOREOFF " <> tshow returnSlot <> "\n"
+        Nothing -> do
+          emit "PUSHIMM 0\n"
+          emit $ "STOREOFF " <> tshow returnSlot <> "\n"
+      clsName <- asks scgClassName
+      methName <- asks scgMethodName
+      let retLabel = T.pack clsName <> "_" <> T.pack methName <> "_return"
+      emit $ "JUMP " <> retLabel <> "\n"
 
 -- | Find a method in all classes (used as fallback when type inference fails)
 -- Returns the first class that has a method with the given name
@@ -473,15 +460,17 @@ emitSSAExpr = \case
     syms <- asks scgSymbols
     typeEnv <- asks scgTypeEnv
     className <- asks scgClassName
+    -- Resolve method label with qualified class name
+    -- Priority: 1) infer from target type, 2) search all classes, 3) current class
     let methodLabel = case target of
-          SSAThis -> T.pack className <> "_" <> T.pack method  -- 'this' is current class
+          SSAThis -> T.pack className <> "_" <> T.pack method
           _ -> case inferSSAExprClassWithCtx (Just className) syms typeEnv target of
                  Just cn -> T.pack cn <> "_" <> T.pack method
-                 Nothing ->
-                   -- Fallback: search all classes for this method
-                   case findMethodInClasses syms method of
-                     Just cn -> T.pack cn <> "_" <> T.pack method
-                     Nothing -> T.pack method  -- Last resort: bare name
+                 Nothing -> case findMethodInClasses syms method of
+                   Just cn -> T.pack cn <> "_" <> T.pack method
+                   -- Fallback: assume method is in current class (for recursive calls
+                   -- or when type inference fails but method is local)
+                   Nothing -> T.pack className <> "_" <> T.pack method
     emit $ "JSR " <> methodLabel <> "\n"
     emit "UNLINK\n"
     -- Clean up arguments: after UNLINK, stack is [return_value, this, args...]

@@ -2,7 +2,36 @@
 {-# LANGUAGE RecordWildCards #-}
 
 -- | Static Single Assignment (SSA) form for LiveOak.
--- Each variable is assigned exactly once, with phi functions at join points.
+--
+-- == Overview
+-- SSA form ensures each variable is assigned exactly once, with phi functions
+-- at control flow join points to merge values from different paths.
+--
+-- == Algorithm (CFG-based SSA Construction)
+--
+-- 1. Create initial basic blocks with simple SSA naming (version 0)
+-- 2. Build Control Flow Graph (CFG) from blocks
+-- 3. Compute dominator tree and dominance frontiers
+-- 4. Identify all variable definition sites
+-- 5. Insert phi nodes at iterated dominance frontiers (where multiple defs meet)
+-- 6. Rename variables using dominator tree traversal
+--
+-- == Example
+--
+-- @
+-- // Original code:         // SSA form:
+-- x = 1;                    x_1 = 1
+-- if (cond) {               if (cond) goto L1 else goto L2
+--   x = 2;                L1: x_2 = 2; goto L3
+-- }                       L2: goto L3
+-- return x;               L3: x_3 = phi(x_2, x_1)
+--                             return x_3
+-- @
+--
+-- == References
+-- * Cytron et al., "Efficiently Computing Static Single Assignment Form and
+--   the Control Dependence Graph", TOPLAS 1991
+--
 module LiveOak.SSA
   ( -- * SSA Types (re-exported from SSATypes)
     SSAProgram(..)

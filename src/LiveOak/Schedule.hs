@@ -26,6 +26,8 @@ import LiveOak.SSAUtils (exprUses, instrUses, instrDefs)
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.IntMap.Strict (IntMap)
+import qualified Data.IntMap.Strict as IntMap
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.List (foldl', sortBy, partition)
@@ -283,12 +285,14 @@ scheduleBlock :: ([SSABlock], Int) -> SSABlock -> ([SSABlock], Int)
 scheduleBlock (acc, saved) block@SSABlock{..} =
   let -- Split into schedulable and non-schedulable parts
       (nonTerm, term) = splitTerm blockInstrs
+      -- Build an IntMap for safe O(1) lookup by index
+      instrMap = IntMap.fromList $ zip [0..] nonTerm
       -- Build dependency graph
       depGraph = buildDepGraph nonTerm
       -- Schedule
       schedule = listSchedule depGraph
-      -- Reorder instructions
-      scheduled = [nonTerm !! i | i <- schedule]
+      -- Reorder instructions using safe lookup
+      scheduled = mapMaybe (`IntMap.lookup` instrMap) schedule
       -- Estimate cycles saved
       origLen = estimateCycles depGraph [0..length nonTerm - 1]
       newLen = estimateCycles depGraph schedule

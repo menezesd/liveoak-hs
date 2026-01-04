@@ -2,8 +2,48 @@
 {-# LANGUAGE RecordWildCards #-}
 
 -- | Sparse Conditional Constant Propagation (SCCP).
--- A powerful optimization that combines constant propagation with
--- reachability analysis to eliminate dead code and propagate constants.
+--
+-- == Overview
+-- SCCP combines constant propagation with reachability analysis to:
+--
+-- * Propagate constants through the program
+-- * Eliminate unreachable code (dead branches)
+-- * Simplify conditional jumps with known conditions
+--
+-- == Algorithm (Two-Worklist Approach)
+--
+-- SCCP uses a lattice with three levels:
+--
+-- @
+--        Top (undefined/never executed)
+--         |
+--    Constant values
+--         |
+--      Bottom (overdefined/varying)
+-- @
+--
+-- The algorithm maintains two worklists:
+--
+-- 1. __CFG Worklist__: Edges to be marked executable
+-- 2. __SSA Worklist__: Variables whose uses need re-evaluation
+--
+-- @
+-- while worklists not empty:
+--   if CFG edge (u,v) in CFG worklist:
+--     mark edge executable
+--     if v not yet visited: evaluate block v
+--     else: re-evaluate phi nodes in v for new edge
+--   if variable x in SSA worklist:
+--     re-evaluate all uses of x in executable blocks
+-- @
+--
+-- == Key Properties
+--
+-- * Only evaluates reachable code (conditional branches with constant
+--   conditions only add one successor edge)
+-- * Reaches fixed point in O(instructions × lattice height) time
+-- * Monotonic: values only move down the lattice (Top → Const → Bottom)
+--
 module LiveOak.SCCP
   ( -- * SCCP Optimization
     runSCCP

@@ -41,13 +41,19 @@ data CompilationStage
   | StageCodegen   -- ^ Generating code
   deriving (Eq, Show)
 
--- | Compile source text to SAM assembly.
-compile :: FilePath -> Text -> Result Text
-compile path source = fst <$> compileWithWarnings path source
+-- | Compilation configuration.
+data CompileConfig = CompileConfig
+  { ccOptimizeSSA :: !Bool      -- ^ Apply SSA-level optimizations
+  }
 
--- | Compile source text to SAM assembly, also returning warnings.
-compileWithWarnings :: FilePath -> Text -> Result (Text, [Warning])
-compileWithWarnings path source = do
+-- | Default configuration: SSA optimizations enabled.
+defaultConfig :: CompileConfig
+defaultConfig = CompileConfig { ccOptimizeSSA = True }
+
+-- | Core compilation pipeline with configuration.
+-- All compilation functions route through this to avoid duplication.
+compileCore :: CompileConfig -> FilePath -> Text -> Result (Text, [Warning])
+compileCore config path source = do
   -- Parse program and build symbol table
   (program, symbols) <- parseProgram path source
 
@@ -60,16 +66,29 @@ compileWithWarnings path source = do
   -- Collect warnings
   let warnings = collectWarnings program symbols
 
-  -- Use SSA-based codegen with SSA optimizations
+  -- AST optimization and SSA conversion
   let optimizedProgram = optimize symbols program
       ssaProg = SSA.toSSAWithCFG symbols optimizedProgram
-      optimizedSSA = SSA.optimizeSSAProgram ssaProg
-  code <- SSACodegen.generateFromSSA optimizedSSA symbols
+      -- Apply SSA optimizations if configured
+      finalSSA = if ccOptimizeSSA config
+                 then SSA.optimizeSSAProgram ssaProg
+                 else ssaProg
+
+  -- Code generation
+  code <- SSACodegen.generateFromSSA finalSSA symbols
 
   -- Peephole optimize SAM code
   let optimizedCode = Peephole.optimizeText code
 
   return (optimizedCode, warnings)
+
+-- | Compile source text to SAM assembly.
+compile :: FilePath -> Text -> Result Text
+compile path source = fst <$> compileWithWarnings path source
+
+-- | Compile source text to SAM assembly, also returning warnings.
+compileWithWarnings :: FilePath -> Text -> Result (Text, [Warning])
+compileWithWarnings = compileCore defaultConfig
 
 -- | Compile and collect ALL errors instead of stopping at first.
 -- Returns either (code, warnings) on success, or list of all errors on failure.
@@ -101,45 +120,14 @@ compileFile path = do
 -- SSA-based Compilation
 --------------------------------------------------------------------------------
 
--- | Compile using SSA-based code generation (SSACodegen fully debugged).
--- SSACodegen bugs fixed:
---  ✓ Method epilogue: JUMPIND -> RST
---  ✓ Stack offsets: totalParams includes 'this'
---  ✓ Stack discipline: Don't pop after STOREOFF
---  ✓ Return values: Don't pop after storing in return slot
---  ✓ Local cleanup: Pop locals before UNLINK
--- SSA conversion issues:
---  ✓ Fixed: While loop blocks now created in correct order
---  ✓ Fixed: Statements after control flow placed correctly
---  ✗ Remaining: While loops need CFG-based SSA with proper phi node renaming
--- Status: SSACodegen works perfectly; basic SSA conversion needs phi nodes for loops.
+-- | Compile using SSA-based code generation without SSA-level optimizations.
+-- Useful for debugging or when SSA optimizations cause issues.
 compileWithSSA :: FilePath -> Text -> Result Text
-compileWithSSA path source = do
-  (program, symbols) <- parseProgram path source
-  validateEntrypoint symbols
-  checkProgram program symbols
-  let optimizedProgram = optimize symbols program
-      ssaProg = SSA.toSSAWithCFG symbols optimizedProgram
-  code <- SSACodegen.generateFromSSA ssaProg symbols
-  let optimizedCode = Peephole.optimizeText code
-  return optimizedCode
+compileWithSSA path source =
+  fst <$> compileCore (CompileConfig { ccOptimizeSSA = False }) path source
 
--- | Compile with SSA optimization pipeline (EXPERIMENTAL - has runtime issues).
--- Infrastructure status:
---  ✓ Field offset resolution via symbol table threading
---  ✓ Method labels qualified with class names
---  ✓ Type tracking through SSA transformations
---  ✓ Stack offset calculations fixed (totalParams includes 'this')
---  ✓ Method epilogue fixed (JUMPIND -> RST)
---  ✗ Return value handling needs debugging (values incorrect)
+-- | Compile with full SSA optimization pipeline.
+-- This is equivalent to the default compile, but explicit about SSA opts.
 compileWithSSAOptimizations :: FilePath -> Text -> Result Text
-compileWithSSAOptimizations path source = do
-  (program, symbols) <- parseProgram path source
-  validateEntrypoint symbols
-  checkProgram program symbols
-  let optimizedProgram = optimize symbols program
-      ssaProg = SSA.toSSAWithCFG symbols optimizedProgram
-      optimizedSSA = SSA.optimizeSSAProgram ssaProg
-  code <- SSACodegen.generateFromSSA optimizedSSA symbols
-  let optimizedCode = Peephole.optimizeText code
-  return optimizedCode
+compileWithSSAOptimizations path source =
+  fst <$> compileCore defaultConfig path source
