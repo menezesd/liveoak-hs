@@ -19,6 +19,7 @@ module LiveOak.PRE
 import LiveOak.SSATypes
 import LiveOak.CFG
 import LiveOak.Dominance
+import LiveOak.Ast (BinaryOp(..), UnaryOp(..))
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -340,6 +341,25 @@ applyPRE insertions deletions = map applyToBlock
       | name == "False" = SSABool False
       | otherwise = SSAUse (SSAVar name 0 Nothing)
 
-    -- These would need proper parsing, simplified here
-    readOp _ = undefined  -- Would parse operator string
-    readUnaryOp _ = undefined
+    -- Parse operator strings back to operators
+    readOp s = case s of
+      "Add" -> Add
+      "Sub" -> Sub
+      "Mul" -> Mul
+      "Div" -> Div
+      "Mod" -> Mod
+      "And" -> And
+      "Or"  -> Or
+      "Eq"  -> Eq
+      "Ne"  -> Ne
+      "Lt"  -> Lt
+      "Le"  -> Le
+      "Gt"  -> Gt
+      "Ge"  -> Ge
+      "Concat" -> Concat
+      _ -> Add  -- Fallback (should not happen)
+
+    readUnaryOp s = case s of
+      "Neg" -> Neg
+      "Not" -> Not
+      _ -> Neg  -- Fallback (should not happen)

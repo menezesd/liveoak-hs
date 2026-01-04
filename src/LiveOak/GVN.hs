@@ -12,7 +12,7 @@ module LiveOak.GVN
 
 import LiveOak.CFG
 import LiveOak.Dominance
-import LiveOak.SSATypes
+import LiveOak.SSATypes (SSABlock(..), SSAInstr(..), SSAExpr(..), PhiNode(..), SSAVar(..), VarKey, varKey, varFromKey)
 import LiveOak.Ast (BinaryOp(..), UnaryOp(..))
 
 import Data.Map.Strict (Map)
@@ -28,14 +28,7 @@ import Control.Monad.State.Strict
 -- | Value number
 type ValueNum = Int
 
-varKey :: SSAVar -> VarKey
-varKey v = (ssaName v, ssaVersion v)
-
-varFromKey :: VarKey -> SSAVar
-varFromKey (name, version) = SSAVar name version Nothing
-
 -- | Expression key for value numbering (normalized form)
-type VarKey = (String, Int)
 
 data ExprKey
   = KeyInt !Int

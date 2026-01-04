@@ -34,7 +34,6 @@ import qualified LiveOak.Diag as D
 import LiveOak.StringRuntime (emitStringRuntime, strConcatLabel, strReverseLabel, strRepeatLabel, strCompareLabel)
 import LiveOak.SSATypeInfer (TypeEnv, buildTypeEnv, inferSSAExprClass, inferSSAExprClassWithCtx, inferSSAExprType)
 import LiveOak.Types (ValueType(..), Type(..), ofPrimitive)
-import LiveOak.Types (ValueType(..), Type(..), ofPrimitive)
 
 --------------------------------------------------------------------------------
 -- Code Generation Types
@@ -118,12 +117,12 @@ generateMethodFromCFG = generateMethodSSA
 generateMethodSSA :: ProgramSymbols -> String -> SSAMethod -> Result Text
 generateMethodSSA syms clsName method@SSAMethod{..} = do
   let cfg = buildCFG method
-      methodSymbol = case lookupClass clsName syms >>= lookupMethod ssaMethodName of
-        Just ms -> ms
-        Nothing -> error ("Unknown method symbol for " ++ clsName ++ "." ++ ssaMethodName)
+  methodSymbol <- case lookupClass clsName syms >>= lookupMethod ssaMethodName of
+    Just ms -> return ms
+    Nothing -> D.resolveErr ("Unknown method symbol for " ++ clsName ++ "." ++ ssaMethodName) 0 0
 
-      -- Compute phi copies to insert in predecessor blocks
-      phiCopies = computePhiCopies cfg (ssaMethodBlocks)
+  -- Compute phi copies to insert in predecessor blocks
+  let phiCopies = computePhiCopies cfg (ssaMethodBlocks)
 
       -- Build type environment for this method
       typeEnv = buildTypeEnv ssaMethodBlocks syms ssaMethodClassName ssaMethodParams

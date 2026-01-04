@@ -611,8 +611,6 @@ fillPhiArg predId renSt phi =
 -- SSA Optimizations
 --------------------------------------------------------------------------------
 
-type VarKey = (String, Int)
-
 -- | Dead code elimination on SSA
 ssaDeadCodeElim :: SSAProgram -> SSAProgram
 ssaDeadCodeElim (SSAProgram classes) =

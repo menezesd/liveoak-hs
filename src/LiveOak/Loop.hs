@@ -30,6 +30,8 @@ import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.List (foldl')
+import qualified Data.List as List
+import Data.Ord (comparing)
 
 --------------------------------------------------------------------------------
 -- Types
@@ -148,12 +150,8 @@ findParent loops headers myHeader loop =
       -- Find the smallest (innermost) containing loop
       parent = case candidates of
         [] -> Nothing
-        cs -> Just $ fst $ minimumBy (\(_, l1) (_, l2) ->
-                compare (Set.size (loopBody l1)) (Set.size (loopBody l2))) cs
+        cs -> Just $ fst $ List.minimumBy (comparing (Set.size . loopBody . snd)) cs
   in loop { loopParent = parent }
-  where
-    minimumBy f (x:xs) = foldl' (\a b -> if f a b == LT then a else b) x xs
-    minimumBy _ [] = error "minimumBy: empty list"
 
 -- | Update children based on parent relationships
 updateChildren :: LoopNest -> LoopNest
@@ -203,10 +201,7 @@ innerMostLoop loops bid =
   let containing = [l | l <- Map.elems loops, Set.member bid (loopBody l)]
   in case containing of
     [] -> Nothing
-    ls -> Just $ maximumBy (\l1 l2 -> compare (loopNestDepth l1) (loopNestDepth l2)) ls
-  where
-    maximumBy f (x:xs) = foldl' (\a b -> if f a b == GT then a else b) x xs
-    maximumBy _ [] = error "maximumBy: empty list"
+    ls -> Just $ List.maximumBy (comparing loopNestDepth) ls
 
 -- | Get all blocks in a loop (including nested loops)
 loopBlocks :: Loop -> [BlockId]

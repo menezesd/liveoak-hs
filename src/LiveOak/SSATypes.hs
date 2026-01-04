@@ -12,6 +12,11 @@ module LiveOak.SSATypes
   , SSAExpr(..)
   , PhiNode(..)
   , SSAVar(..)
+
+    -- * Variable Key
+  , VarKey
+  , varKey
+  , varFromKey
   ) where
 
 import LiveOak.Ast (UnaryOp, BinaryOp, ReturnSig)
@@ -89,3 +94,18 @@ data SSAClass = SSAClass
 data SSAProgram = SSAProgram
   { ssaClasses :: ![SSAClass]
   } deriving (Eq, Show)
+
+--------------------------------------------------------------------------------
+-- Variable Key
+--------------------------------------------------------------------------------
+
+-- | A key for identifying SSA variables (name, version)
+type VarKey = (String, Int)
+
+-- | Create a VarKey from an SSAVar
+varKey :: SSAVar -> VarKey
+varKey v = (ssaName v, ssaVersion v)
+
+-- | Create an SSAVar from a VarKey (with no type info)
+varFromKey :: VarKey -> SSAVar
+varFromKey (name, version) = SSAVar name version Nothing

@@ -34,6 +34,7 @@ data LICMState = LICMState
   { licmHoisted :: ![(BlockId, SSAInstr)]  -- ^ Instructions hoisted (preheader, instr)
   , licmBlockMap :: !(Map BlockId SSABlock) -- ^ Block map (mutable)
   , licmDefsInLoop :: !(Map BlockId (Set String))  -- ^ Definitions in each loop
+  , licmUsedPreheaders :: !(Set.Set BlockId) -- ^ Preheaders used for hoisting
   } deriving (Show)
 
 type LICM a = State LICMState a
@@ -59,6 +60,7 @@ runLICM cfg domTree loops blocks =
         { licmHoisted = []
         , licmBlockMap = blockMap
         , licmDefsInLoop = defsMap
+        , licmUsedPreheaders = Set.empty
         }
       -- Process loops from innermost to outermost
       sortedLoops = sortLoopsByDepth loops
@@ -68,7 +70,7 @@ runLICM cfg domTree loops blocks =
   in LICMResult
     { licmOptBlocks = resultBlocks
     , licmHoistedCount = length (licmHoisted finalState)
-    , licmNewPreheaders = []  -- TODO: track created preheaders
+    , licmNewPreheaders = Set.toList (licmUsedPreheaders finalState)
     }
 
 -- | Sort loops by depth (innermost first)
@@ -100,10 +102,15 @@ processLoop cfg domTree loop = do
       hoistInvariantCode cfg domTree loop ph defs
 
 -- | Get or create a preheader for a loop
+-- Note: Currently only uses existing preheaders. Creating new ones would require
+-- CFG modification which is not implemented yet.
 getOrCreatePreheader :: CFG -> Loop -> LICM (Maybe BlockId)
 getOrCreatePreheader _cfg loop =
   case loopPreheader loop of
-    Just ph -> return (Just ph)
+    Just ph -> do
+      -- Track that we're using this preheader for hoisting
+      modify $ \s -> s { licmUsedPreheaders = Set.insert ph (licmUsedPreheaders s) }
+      return (Just ph)
     Nothing -> do
       -- Would need to create preheader by splitting edges
       -- For now, skip loops without preheaders

@@ -74,10 +74,6 @@ buildTypeEnv blocks syms className params = go seedEnv
                         else acc
       _ -> acc
 
--- | Get variable key for type environment
-varKey :: SSAVar -> (String, Int)
-varKey v = (ssaName v, ssaVersion v)
-
 -- | Check if variable has type annotation
 varHasType :: SSAVar -> Bool
 varHasType v = case ssaVarType v of

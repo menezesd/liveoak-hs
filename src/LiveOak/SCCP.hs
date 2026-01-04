@@ -77,8 +77,6 @@ meet _ _ = Bottom  -- Different types
 -- SCCP State
 --------------------------------------------------------------------------------
 
-type VarKey = (String, Int)
-
 -- | SCCP analysis state
 data SCCPState = SCCPState
   { sccpValues :: !(Map VarKey LatticeValue)  -- ^ Lattice value for each SSA variable
@@ -344,9 +342,6 @@ evaluateUses cfg blockMap useMap var = do
 --------------------------------------------------------------------------------
 -- Helper Functions
 --------------------------------------------------------------------------------
-
-varKey :: SSAVar -> VarKey
-varKey v = (ssaName v, ssaVersion v)
 
 buildUseMap :: [SSABlock] -> Map VarKey (Set BlockId)
 buildUseMap blocks = foldl' addBlock Map.empty blocks

@@ -29,6 +29,7 @@ import LiveOak.Parser (parseProgram)
 import LiveOak.Semantic (checkProgram, checkProgramCollectErrors)
 import LiveOak.Warnings (collectWarnings)
 import LiveOak.Optimize (optimize)
+import LiveOak.Validation (validateEntrypoint, validateEntrypointErrors)
 import qualified LiveOak.Peephole as Peephole
 import qualified LiveOak.SSA as SSA
 import qualified LiveOak.SSACodegen as SSACodegen
@@ -40,14 +41,6 @@ data CompilationStage
   | StageParse     -- ^ Parsing program
   | StageCodegen   -- ^ Generating code
   deriving (Eq, Show)
-
--- | Entry class name.
-entryClass :: String
-entryClass = "Main"
-
--- | Entry method name.
-entryMethod :: String
-entryMethod = "main"
 
 -- | Compile source text to SAM assembly.
 compile :: FilePath -> Text -> Result Text
@@ -99,53 +92,11 @@ compileCollectAllErrors path source =
                      in Right (optimizedCode, collectWarnings program symbols)
          else Left allErrors
 
--- | Validate entry point, returning list of errors.
-validateEntrypointErrors :: ProgramSymbols -> [Diag]
-validateEntrypointErrors syms =
-  case lookupClass entryClass syms of
-    Nothing -> [ResolveError ("Missing " ++ entryClass ++ " class") 0 0]
-    Just mainClass ->
-      case lookupMethod entryMethod mainClass of
-        Nothing -> [ResolveError (entryClass ++ "." ++ entryMethod ++ " method not found") 0 0]
-        Just mainMethod ->
-          let userArgs = expectedUserArgs mainMethod
-              argErr = if userArgs /= 0
-                       then [SyntaxError (entryClass ++ "." ++ entryMethod ++ " must not have parameters") 0 0]
-                       else []
-              instanceErr = if numParams mainMethod <= 0
-                            then [SyntaxError (entryClass ++ "." ++ entryMethod ++ " must be an instance method") 0 0]
-                            else []
-          in argErr ++ instanceErr
-
 -- | Compile a file to SAM assembly.
 compileFile :: FilePath -> IO (Result Text)
 compileFile path = do
   source <- TIO.readFile path
   return $ compile path source
-
--- | Validate that the entry point exists.
-validateEntrypoint :: ProgramSymbols -> Result ()
-validateEntrypoint syms = do
-  -- Check Main class exists
-  mainClass <- case lookupClass entryClass syms of
-    Nothing -> resolveErr ("Missing " ++ entryClass ++ " class") 0 0
-    Just cs -> ok cs
-
-  -- Check main method exists
-  mainMethod <- case lookupMethod entryMethod mainClass of
-    Nothing -> resolveErr (entryClass ++ "." ++ entryMethod ++ " method not found") 0 0
-    Just ms -> ok ms
-
-  -- Check main has correct signature (no user parameters)
-  let userArgs = expectedUserArgs mainMethod
-  require (userArgs == 0) $
-    SyntaxError (entryClass ++ "." ++ entryMethod ++ " must not have parameters") 0 0
-
-  -- Check main is an instance method (has 'this')
-  require (numParams mainMethod > 0) $
-    SyntaxError (entryClass ++ "." ++ entryMethod ++ " must be an instance method") 0 0
-
-  ok ()
 
 --------------------------------------------------------------------------------
 -- SSA-based Compilation

@@ -112,19 +112,9 @@ checkStmt ctx@CheckCtx{..} = \case
 
   Assign name value pos -> do
     checkExpr ctx value
-    case lookupVar name ctxMethod of
+    case lookupVarOrField ctx name of
       Just vs -> checkAssignable ctx (vsType vs) value pos
-      Nothing ->
-        -- Check if it's a field of 'this'
-        case lookupVar "this" ctxMethod of
-          Just thisVs -> case typeClassName (vsType thisVs) of
-            Just cn -> case lookupClass cn ctxSymbols of
-              Just cs -> case lookupField name cs of
-                Just fv -> checkAssignable ctx (vsType fv) value pos
-                Nothing -> resolveErr ("Undeclared variable: " ++ name) pos 0
-              Nothing -> resolveErr ("Undeclared variable: " ++ name) pos 0
-            Nothing -> resolveErr ("Undeclared variable: " ++ name) pos 0
-          Nothing -> resolveErr ("Undeclared variable: " ++ name) pos 0
+      Nothing -> resolveErr ("Undeclared variable: " ++ name) pos 0
 
   FieldAssign target field _ value pos -> do
     checkExpr ctx target
@@ -205,22 +195,9 @@ checkExpr ctx@CheckCtx{..} = \case
   This _      -> ok ()
 
   Var name pos ->
-    case lookupVar name ctxMethod of
+    case lookupVarOrField ctx name of
       Just _  -> ok ()
-      Nothing ->
-        -- Check if it's a field of 'this'
-        case lookupVar "this" ctxMethod of
-          Just thisVs -> case typeClassName (vsType thisVs) of
-            Just cn -> case lookupClass cn ctxSymbols of
-              Just cs -> case lookupField name cs of
-                Just _  -> ok ()
-                Nothing -> checkGlobalMethod name pos
-              Nothing -> checkGlobalMethod name pos
-            Nothing -> checkGlobalMethod name pos
-          Nothing -> checkGlobalMethod name pos
-    where
-      -- Check if the name is a method call without parentheses (unlikely, but be lenient)
-      checkGlobalMethod n p = resolveErr ("Undeclared variable: " ++ n) p 0
+      Nothing -> resolveErr ("Undeclared variable: " ++ name) pos 0
 
   Unary _ expr _ -> checkExpr ctx expr
 
@@ -280,19 +257,9 @@ inferType ctx@CheckCtx{..} = \case
   StrLit _ _  -> ok (Just TString)
   NullLit _   -> ok Nothing  -- null has no primitive type
 
-  Var name _ -> case lookupVar name ctxMethod of
+  Var name _ -> case lookupVarOrField ctx name of
     Just vs -> ok $ primitiveType (vsType vs)
-    Nothing ->
-      -- Check if it's a field of 'this'
-      case lookupVar "this" ctxMethod of
-        Just thisVs -> case typeClassName (vsType thisVs) of
-          Just cn -> case lookupClass cn ctxSymbols of
-            Just cs -> case lookupField name cs of
-              Just vs -> ok $ primitiveType (vsType vs)
-              Nothing -> ok Nothing
-            Nothing -> ok Nothing
-          Nothing -> ok Nothing
-        Nothing -> ok Nothing
+    Nothing -> ok Nothing
 
   This _ -> ok Nothing  -- 'this' is an object
 
@@ -370,19 +337,9 @@ inferClassName ctx@CheckCtx{..} = \case
     Just vs -> ok $ typeClassName (vsType vs)
     Nothing -> ok Nothing
 
-  Var name _ -> case lookupVar name ctxMethod of
+  Var name _ -> case lookupVarOrField ctx name of
     Just vs -> ok $ typeClassName (vsType vs)
-    Nothing ->
-      -- Check if it's a field of 'this'
-      case lookupVar "this" ctxMethod of
-        Just thisVs -> case typeClassName (vsType thisVs) of
-          Just cn -> case lookupClass cn ctxSymbols of
-            Just cs -> case lookupField name cs of
-              Just vs -> ok $ typeClassName (vsType vs)
-              Nothing -> ok Nothing
-            Nothing -> ok Nothing
-          Nothing -> ok Nothing
-        Nothing -> ok Nothing
+    Nothing -> ok Nothing
 
   NewObject cn _ _ -> ok (Just cn)
 
@@ -443,3 +400,23 @@ checkMethodCall ctx@CheckCtx{..} className methodName args pos = do
   let params = drop 1 (msParams ms)  -- drop implicit 'this'
   zipWithM_ (\p a -> checkAssignable ctx (vsType p) a pos) params args
   ok ms
+
+--------------------------------------------------------------------------------
+-- Lookup Helpers
+--------------------------------------------------------------------------------
+
+-- | Look up a variable or field by name.
+-- First checks local variables/parameters, then fields of 'this'.
+lookupVarOrField :: CheckCtx -> String -> Maybe VarSymbol
+lookupVarOrField CheckCtx{..} name =
+  case lookupVar name ctxMethod of
+    Just vs -> Just vs
+    Nothing -> lookupThisField ctxMethod ctxSymbols name
+
+-- | Look up a field on 'this' object.
+lookupThisField :: MethodSymbol -> ProgramSymbols -> String -> Maybe VarSymbol
+lookupThisField method syms fieldName = do
+  thisVs <- lookupVar "this" method
+  cn <- typeClassName (vsType thisVs)
+  cs <- lookupClass cn syms
+  lookupField fieldName cs
