@@ -178,8 +178,8 @@ hoistInstr fromBlock toBlock instr = do
 -- | Split instructions into non-terminators and terminator
 splitInstrsTerm :: [SSAInstr] -> ([SSAInstr], [SSAInstr])
 splitInstrsTerm instrs =
-  let (rev, term) = span (not . isTerm) (reverse instrs)
-  in (reverse (rev ++ term), [])  -- Simplified: don't move past terminator
+  let (nonTerm, term) = break isTerm instrs
+  in (nonTerm, term)
   where
     isTerm (SSAJump _) = True
     isTerm (SSABranch _ _ _) = True

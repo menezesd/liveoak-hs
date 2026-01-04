@@ -16,7 +16,7 @@ module LiveOak.SSATypeInfer
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, mapMaybe)
 import Data.List (foldl')
 
 import LiveOak.SSATypes
@@ -52,7 +52,16 @@ buildTypeEnv blocks syms className params = go seedEnv
       in if env' == env then env else go env'
 
     buildBlockEnv env acc SSABlock{..} =
-      foldl' (buildInstrEnv env) acc blockInstrs
+      let acc' = foldl' (buildPhiEnv env) acc blockPhis
+      in foldl' (buildInstrEnv env) acc' blockInstrs
+
+    buildPhiEnv env acc PhiNode{..} =
+      case ssaVarType phiVar of
+        Just t -> Map.insert (varKey phiVar) t acc
+        Nothing ->
+          case mapMaybe (getVarType env . snd) phiArgs of
+            (t:ts) | all (== t) ts -> Map.insert (varKey phiVar) t acc
+            _ -> acc
 
     buildInstrEnv env acc = \case
       SSAAssign var expr ->

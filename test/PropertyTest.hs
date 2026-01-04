@@ -337,12 +337,6 @@ genSamInstr labels = oneof
   , return "STOREIND"
   ]
 
-genLabel :: Gen Text
-genLabel = do
-  prefix <- elements ["loop", "end", "label", "method", "if", "else"]
-  n <- choose (0, 100 :: Int)
-  return $ prefix <> "_" <> T.pack (show n)
-
 --------------------------------------------------------------------------------
 -- AST Optimizer Properties
 --------------------------------------------------------------------------------
@@ -706,7 +700,7 @@ genConstantArithmetic = do
 
 -- | Boolean expressions with constants should be folded
 prop_booleanFolding :: Property
-prop_booleanFolding = forAll genConstantBoolean $ \(expr, expected) ->
+prop_booleanFolding = forAll genConstantBoolean $ \(expr, _expected) ->
   let code = wrapInMainBool expr
   in case compile "fold" code of
     Left _ -> discard
@@ -727,7 +721,7 @@ genConstantBoolean = elements
 
 -- | Comparison expressions with constants should be folded
 prop_comparisonFolding :: Property
-prop_comparisonFolding = forAll genConstantComparison $ \(expr, expected) ->
+prop_comparisonFolding = forAll genConstantComparison $ \(expr, _expected) ->
   let code = wrapInMainBool expr
   in case compile "fold" code of
     Left _ -> discard
@@ -828,7 +822,9 @@ prop_zeroValues =
         , ("(5 * 0)", 0)
         , ("(0 - 0)", 0)
         ]
-  in conjoin [ testExpr expr expected | (expr, expected) <- tests ]
+      tests' :: [(Text, Int)]
+      tests' = tests
+  in conjoin [ testExpr expr expected | (expr, expected) <- tests' ]
   where
     testExpr expr expected =
       let code = wrapInMain expr

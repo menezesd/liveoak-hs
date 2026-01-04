@@ -139,14 +139,14 @@ methodToSSA syms clsName MethodDecl{..} =
     ensureTerminator bs =
       let (initBs, lastB) = (init bs, last bs)
           lastInstrs = blockInstrs lastB
-          hasTerminator = case lastInstrs of
+          blockHasTerminator = case lastInstrs of
             [] -> False
             instrs -> case last instrs of
               SSAReturn _ -> True
               SSAJump _ -> True
               SSABranch _ _ _ -> True
               _ -> False
-          fixedLast = if hasTerminator
+          fixedLast = if blockHasTerminator
                       then lastB
                       else lastB { blockInstrs = lastInstrs ++ [SSAReturn Nothing] }
       in initBs ++ [fixedLast]
@@ -484,13 +484,13 @@ renameVariables cfg domTree params blocks =
       -- Process blocks in dominator tree order
       blockMap = Map.fromList [(blockLabel b, b) | b <- blocks]
       entry = cfgEntry cfg
-      (finalState, renamedMap) = if Map.member entry blockMap
+      (_, renamedMap) = if Map.member entry blockMap
         then renameBlock cfg domTree entry initState blockMap
         else (initState, blockMap)  -- Entry doesn't exist, skip renaming
       -- Process any unreachable blocks that weren't renamed
-      allBlockIds = Map.keysSet blockMap
+      blockIds = Map.keysSet blockMap
       renamedBlockIds = Map.keysSet renamedMap
-      unreached = Set.toList $ Set.difference allBlockIds renamedBlockIds
+      unreached = Set.toList $ Set.difference blockIds renamedBlockIds
       finalMap = foldl' (\m bid -> case Map.lookup bid blockMap of
                           Nothing -> m
                           Just b -> Map.insert bid b m) renamedMap unreached
@@ -518,20 +518,21 @@ renameBlock cfg domTree blockId renSt blockMap =
           blockMap1 = Map.insert blockId renamedBlock blockMap
           -- Fill in phi arguments in successor blocks
           blockMap2 = foldl' (fillPhiArgs blockId renSt2) blockMap1 (successors cfg blockId)
-          -- Process children in a dominator tree
-          -- Do NOT thread renaming state across siblings; each child starts
-          -- from the current block's state to avoid leaking definitions.
-          (_, blockMap3) = foldl' (processChild cfg domTree renSt2)
-                                  (renSt2, blockMap2)
-                                  (domChildren domTree blockId)
-      in (renSt2, blockMap3)
+          -- Process children in a dominator tree.
+          -- Thread version counters across siblings, but keep parent defs.
+          (renSt3, blockMap3) = foldl' (processChild cfg domTree renSt2)
+                                        (renSt2, blockMap2)
+                                        (domChildren domTree blockId)
+      in (renSt3, blockMap3)
 
 -- | Process a child in the dominator tree
 processChild :: CFG -> DomTree -> RenameState -> (RenameState, Map BlockId SSABlock) -> BlockId
             -> (RenameState, Map BlockId SSABlock)
 processChild cfg domTree parentState (renSt, blockMap) childId =
-  let (_, blockMap') = renameBlock cfg domTree childId parentState blockMap
-  in (renSt, blockMap')
+  let childState = parentState { renameVersions = renameVersions renSt }
+      (childState', blockMap') = renameBlock cfg domTree childId childState blockMap
+      renSt' = parentState { renameVersions = renameVersions childState' }
+  in (renSt', blockMap')
 
 -- | Rename phi node definitions
 renamePhistDefs :: RenameState -> [PhiNode] -> (RenameState, [PhiNode])
@@ -664,12 +665,6 @@ getVarType v = case ssaVarType v of
   Just t -> t
   Nothing -> error $ "SSA: Missing type for parameter " ++ ssaName v
 
--- | Convert SSA blocks to a statement
--- After coalescing, phi nodes are effectively gone or handled as regular assignments.
--- This function now just concatenates instructions from all blocks.
-blocksToStmt :: [SSABlock] -> [Stmt]
-blocksToStmt blocks = concatMap blockToStmts blocks
-
 -- | Convert a single block to statements
 blockToStmts :: SSABlock -> [Stmt]
 blockToStmts SSABlock{..} = map instrToStmt blockInstrs
@@ -709,60 +704,100 @@ ssaExprToExpr = \case
 -- SSA Optimizations
 --------------------------------------------------------------------------------
 
+type VarKey = (String, Int)
+
 -- | Dead code elimination on SSA
 ssaDeadCodeElim :: SSAProgram -> SSAProgram
 ssaDeadCodeElim (SSAProgram classes) =
   SSAProgram [c { ssaClassMethods = map elimMethod (ssaClassMethods c) } | c <- classes]
   where
     elimMethod m =
-      let used = collectUsed (ssaMethodBlocks m)
-          blocks' = map (elimBlock used) (ssaMethodBlocks m)
+      let blocks = ssaMethodBlocks m
+          defMap = buildDefMap blocks
+          live = propagateLive defMap (collectEssential blocks)
+          blocks' = map (elimBlock live) blocks
       in m { ssaMethodBlocks = blocks' }
 
-    elimBlock used b = b
-      { blockPhis = filter (isUsed used . phiVar) (blockPhis b)
-      , blockInstrs = filter (instrIsUsed used) (blockInstrs b)
+    elimBlock live b = b
+      { blockPhis = filter (isLive live . phiVar) (blockPhis b)
+      , blockInstrs = filter (instrIsLive live) (blockInstrs b)
       }
 
-    isUsed used v = Set.member (ssaName v, ssaVersion v) used
+    isLive live v = Set.member (varKey v) live
 
-    instrIsUsed _ (SSAReturn _) = True
-    instrIsUsed _ (SSAJump _) = True
-    instrIsUsed _ (SSABranch _ _ _) = True
-    instrIsUsed _ (SSAFieldStore _ _ _ _) = True
-    instrIsUsed _ (SSAExprStmt _) = True
-    instrIsUsed used (SSAAssign v _) = isUsed used v
+    instrIsLive _ (SSAReturn _) = True
+    instrIsLive _ (SSAJump _) = True
+    instrIsLive _ (SSABranch _ _ _) = True
+    instrIsLive _ (SSAFieldStore _ _ _ _) = True
+    instrIsLive _ (SSAExprStmt _) = True
+    instrIsLive live (SSAAssign v e) = isLive live v || hasSideEffects e
 
--- | Collect all used SSA variables
-collectUsed :: [SSABlock] -> Set (String, Int)
-collectUsed blocks = Set.unions (map blockUsed blocks)
-  where
-    blockUsed b = Set.unions $
-      map phiUsed (blockPhis b) ++ map instrUsed (blockInstrs b)
+    -- | Check if expression has side effects (method calls, object creation)
+    hasSideEffects :: SSAExpr -> Bool
+    hasSideEffects = \case
+      SSACall _ _ -> True          -- Method call on self
+      SSAInstanceCall _ _ _ -> True  -- Method call on instance
+      SSANewObject _ _ -> True      -- Constructor call
+      SSAUnary _ e -> hasSideEffects e
+      SSABinary _ l r -> hasSideEffects l || hasSideEffects r
+      SSATernary c t e -> hasSideEffects c || hasSideEffects t || hasSideEffects e
+      SSAFieldAccess t _ -> hasSideEffects t
+      _ -> False
 
-    phiUsed phi = Set.unions [varUsed v | (_, v) <- phiArgs phi]
+    varKey v = (ssaName v, ssaVersion v)
 
-    instrUsed = \case
-      SSAAssign _ e -> exprUsed e
-      SSAFieldStore t _ _ v -> Set.union (exprUsed t) (exprUsed v)
-      SSAReturn (Just e) -> exprUsed e
-      SSAReturn Nothing -> Set.empty
-      SSAJump _ -> Set.empty
-      SSABranch c _ _ -> exprUsed c
-      SSAExprStmt e -> exprUsed e
+    collectEssential blocks =
+      Set.unions (map blockEssential blocks)
+      where
+        blockEssential SSABlock{..} =
+          Set.unions (map instrEssential blockInstrs)
+        instrEssential = \case
+          SSAReturn (Just e) -> exprUses e
+          SSAReturn Nothing -> Set.empty
+          SSABranch c _ _ -> exprUses c
+          SSAFieldStore t _ _ v -> Set.union (exprUses t) (exprUses v)
+          SSAExprStmt e -> exprUses e
+          SSAAssign _ e | hasSideEffects e -> exprUses e
+          _ -> Set.empty
 
-    exprUsed = \case
-      SSAUse v -> varUsed v
-      SSAUnary _ e -> exprUsed e
-      SSABinary _ l r -> Set.union (exprUsed l) (exprUsed r)
-      SSATernary c t e -> Set.unions [exprUsed c, exprUsed t, exprUsed e]
-      SSACall _ args -> Set.unions (map exprUsed args)
-      SSAInstanceCall t _ args -> Set.unions (exprUsed t : map exprUsed args)
-      SSANewObject _ args -> Set.unions (map exprUsed args)
-      SSAFieldAccess t _ -> exprUsed t
+    exprUses = \case
+      SSAUse v -> Set.singleton (varKey v)
+      SSAUnary _ e -> exprUses e
+      SSABinary _ l r -> Set.union (exprUses l) (exprUses r)
+      SSATernary c t e -> Set.unions [exprUses c, exprUses t, exprUses e]
+      SSACall _ args -> Set.unions (map exprUses args)
+      SSAInstanceCall t _ args -> Set.unions (exprUses t : map exprUses args)
+      SSANewObject _ args -> Set.unions (map exprUses args)
+      SSAFieldAccess t _ -> exprUses t
       _ -> Set.empty
 
-    varUsed v = Set.singleton (ssaName v, ssaVersion v)
+    -- Use Either: Left = phi inputs, Right = expression
+    buildDefMap blocks =
+      let phiDefs =
+            [ (varKey (phiVar phi), Left (map snd (phiArgs phi)))
+            | b <- blocks
+            , phi <- blockPhis b
+            ]
+          instrDefs =
+            [ (varKey v, Right e)
+            | b <- blocks
+            , SSAAssign v e <- blockInstrs b
+            ]
+      in foldl' (\m (k, v) -> Map.insert k v m) Map.empty (phiDefs ++ instrDefs)
+
+    propagateLive defMap initial =
+      go initial (Set.toList initial)
+      where
+        go live [] = live
+        go live (k:ks) =
+          case Map.lookup k defMap of
+            Nothing -> go live ks
+            Just def ->
+              let used = case def of
+                    Right e -> exprUses e
+                    Left vars -> Set.fromList (map varKey vars)
+                  new = Set.difference used live
+              in go (Set.union live new) (ks ++ Set.toList new)
 
 -- | Copy propagation on SSA
 ssaCopyProp :: SSAProgram -> SSAProgram
@@ -782,12 +817,9 @@ ssaCopyProp (SSAProgram classes) =
       ]
 
     substBlock copies b = b
-      { blockPhis = map (substPhi copies) (blockPhis b)
+      { blockPhis = blockPhis b  -- Don't substitute phi inputs (they refer to end-of-predecessor values)
       , blockInstrs = map (substInstr copies) (blockInstrs b)
       }
-
-    substPhi copies phi = phi
-      { phiArgs = [(l, substVar copies v) | (l, v) <- phiArgs phi] }
 
     substInstr copies = \case
       SSAAssign v e -> SSAAssign v (substExpr copies e)
@@ -797,10 +829,13 @@ ssaCopyProp (SSAProgram classes) =
       SSAExprStmt e -> SSAExprStmt (substExpr copies e)
       i -> i
 
-    substVar copies v =
-      case Map.lookup (ssaName v, ssaVersion v) copies of
-        Just src -> substVar copies src  -- Transitive
-        Nothing -> v
+    substVar copies v = go Set.empty v
+      where
+        go seen var
+          | Set.member (ssaName var, ssaVersion var) seen = var  -- Cycle detected, stop
+          | otherwise = case Map.lookup (ssaName var, ssaVersion var) copies of
+              Just src -> go (Set.insert (ssaName var, ssaVersion var) seen) src  -- Transitive
+              Nothing -> var
 
     substExpr copies = \case
       SSAUse v -> SSAUse (substVar copies v)
@@ -841,17 +876,19 @@ sccp (SSAProgram classes) =
 sccpMethod :: SSAMethod -> SSAMethod
 sccpMethod method =
   let cfg = buildCFG method
-      sccpResult = SCCP.runSCCP cfg (ssaMethodBlocks method)
+      -- Method parameters should be treated as unknown (Bottom)
+      paramKeys = [(ssaName p, ssaVersion p) | p <- ssaMethodParams method]
+      sccpResult = SCCP.runSCCP paramKeys cfg (ssaMethodBlocks method)
       constMap = Map.mapMaybe SCCP.getConstant (SCCP.sccpConstValues sccpResult)
       blocks' = map (applyConstPropagation constMap) (ssaMethodBlocks method)
       liveBlocks = filter (\b -> Set.member (blockLabel b) (SCCP.sccpReachableBlocks sccpResult)) blocks'
   in method { ssaMethodBlocks = liveBlocks }
 
-applyConstPropagation :: Map String SSAExpr -> SSABlock -> SSABlock
+applyConstPropagation :: Map VarKey SSAExpr -> SSABlock -> SSABlock
 applyConstPropagation consts block =
   block { blockInstrs = map (sccpSubstInstr consts) (blockInstrs block) }
 
-sccpSubstInstr :: Map String SSAExpr -> SSAInstr -> SSAInstr
+sccpSubstInstr :: Map VarKey SSAExpr -> SSAInstr -> SSAInstr
 sccpSubstInstr consts = \case
   SSAAssign v e -> SSAAssign v (sccpSubstExpr consts e)
   SSAFieldStore t f off val -> SSAFieldStore (sccpSubstExpr consts t) f off (sccpSubstExpr consts val)
@@ -860,9 +897,9 @@ sccpSubstInstr consts = \case
   SSAExprStmt e -> SSAExprStmt (sccpSubstExpr consts e)
   i -> i
 
-sccpSubstExpr :: Map String SSAExpr -> SSAExpr -> SSAExpr
+sccpSubstExpr :: Map VarKey SSAExpr -> SSAExpr -> SSAExpr
 sccpSubstExpr consts = \case
-  SSAUse v -> case Map.lookup (ssaName v) consts of
+  SSAUse v -> case Map.lookup (ssaName v, ssaVersion v) consts of
                 Just replacement -> replacement
                 Nothing -> SSAUse v
   SSAUnary op e -> SSAUnary op (sccpSubstExpr consts e)
@@ -1022,15 +1059,17 @@ stackAllocate (SSAProgram classes) = SSAProgram (map saClass classes)
 -- The caller can then decide to use SSACodegen or fromSSA.
 optimizeSSAProgram :: SSAProgram -> SSAProgram
 optimizeSSAProgram ssaProg =
-  -- Run a very limited cleanup pipeline (just 2 iterations max)
-  -- Disable expensive optimizations that may cause issues
-  fixedPointWithLimit 2 ssaBasicPipeline ssaProg
+  fixedPointWithLimit 3 ssaBasicPipeline ssaProg
 
 -- | Basic SSA optimization pipeline (safe, fast optimizations only)
 ssaBasicPipeline :: SSAProgram -> SSAProgram
 ssaBasicPipeline =
     ssaDeadCodeElim
+  . ssaPeephole
   . ssaCopyProp
+  . licm
+  . gvn
+  . sccp
   . simplifyPhis
 
 -- | Full CFG-based SSA optimization.
@@ -1043,27 +1082,12 @@ optimizeSSA syms prog =
       optimized = optimizeSSAProgram ssaProg
   in fromSSA optimized
 
--- | Apply an optimization pass until a fixed point is reached or max iterations exceeded.
-fixedPoint :: Eq a => (a -> a) -> a -> a
-fixedPoint f x = fixedPointWithLimit 10 f x
-
 -- | Apply optimization with explicit iteration limit.
 fixedPointWithLimit :: Eq a => Int -> (a -> a) -> a -> a
 fixedPointWithLimit 0 _ x = x  -- Max iterations reached
 fixedPointWithLimit n f x =
   let x' = f x
   in if x' == x then x else fixedPointWithLimit (n - 1) f x'
-
--- | The main pipeline of optimizations that can be run iteratively.
-ssaCleanupPipeline :: SSAProgram -> SSAProgram
-ssaCleanupPipeline =
-    gvn
-  . sccp
-  . licm
-  . ssaDeadCodeElim
-  . ssaCopyProp
-  . simplifyPhis
-  . ssaPeephole
 
 -- | SSA optimization pipeline (old, kept for reference)
 ssaOptPipeline :: SSAProgram -> SSAProgram

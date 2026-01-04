@@ -29,7 +29,6 @@ import LiveOak.Parser (parseProgram)
 import LiveOak.Semantic (checkProgram, checkProgramCollectErrors)
 import LiveOak.Warnings (collectWarnings)
 import LiveOak.Optimize (optimize)
-import LiveOak.Codegen (generateCode)
 import qualified LiveOak.Peephole as Peephole
 import qualified LiveOak.SSA as SSA
 import qualified LiveOak.SSACodegen as SSACodegen
@@ -69,11 +68,11 @@ compileWithWarnings path source = do
   -- Collect warnings
   let warnings = collectWarnings program symbols
 
-  -- Use SSA-based codegen
+  -- Use SSA-based codegen with SSA optimizations
   let optimizedProgram = optimize symbols program
-      ssaProg = SSA.toSSA symbols optimizedProgram
-      -- TEMPORARILY DISABLED: optimizedSSA = SSA.optimizeSSAProgram ssaProg
-  code <- SSACodegen.generateFromSSA ssaProg symbols
+      ssaProg = SSA.toSSAWithCFG symbols optimizedProgram
+      optimizedSSA = SSA.optimizeSSAProgram ssaProg
+  code <- SSACodegen.generateFromSSA optimizedSSA symbols
 
   -- Peephole optimize SAM code
   let optimizedCode = Peephole.optimizeText code
@@ -92,7 +91,7 @@ compileCollectAllErrors path source =
           allErrors = entryErrors ++ semanticErrors
       in if null allErrors
          then let optimizedProgram = optimize symbols program
-                  ssaProg = SSA.toSSA symbols optimizedProgram
+                  ssaProg = SSA.toSSAWithCFG symbols optimizedProgram
               in case SSACodegen.generateFromSSA ssaProg symbols of
                    Left codegenErr -> Left [codegenErr]
                    Right code ->
@@ -170,7 +169,7 @@ compileWithSSA path source = do
   validateEntrypoint symbols
   checkProgram program symbols
   let optimizedProgram = optimize symbols program
-      ssaProg = SSA.toSSA symbols optimizedProgram
+      ssaProg = SSA.toSSAWithCFG symbols optimizedProgram
   code <- SSACodegen.generateFromSSA ssaProg symbols
   let optimizedCode = Peephole.optimizeText code
   return optimizedCode
@@ -189,7 +188,7 @@ compileWithSSAOptimizations path source = do
   validateEntrypoint symbols
   checkProgram program symbols
   let optimizedProgram = optimize symbols program
-      ssaProg = SSA.toSSA symbols optimizedProgram
+      ssaProg = SSA.toSSAWithCFG symbols optimizedProgram
       optimizedSSA = SSA.optimizeSSAProgram ssaProg
   code <- SSACodegen.generateFromSSA optimizedSSA symbols
   let optimizedCode = Peephole.optimizeText code

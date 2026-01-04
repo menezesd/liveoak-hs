@@ -17,7 +17,8 @@ import LiveOak.Ast (BinaryOp(..), UnaryOp(..))
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Control.Monad (forM)
+import Data.List (sortOn)
+import Control.Monad (forM, foldM)
 import Control.Monad.State.Strict
 
 --------------------------------------------------------------------------------
@@ -27,16 +28,24 @@ import Control.Monad.State.Strict
 -- | Value number
 type ValueNum = Int
 
+varKey :: SSAVar -> VarKey
+varKey v = (ssaName v, ssaVersion v)
+
+varFromKey :: VarKey -> SSAVar
+varFromKey (name, version) = SSAVar name version Nothing
+
 -- | Expression key for value numbering (normalized form)
+type VarKey = (String, Int)
+
 data ExprKey
   = KeyInt !Int
   | KeyBool !Bool
   | KeyNull
   | KeyStr !String
-  | KeyVar !String            -- Variable use
+  | KeyVar !VarKey            -- Variable use
   | KeyUnary !UnaryOp !ValueNum
   | KeyBinary !BinaryOp !ValueNum !ValueNum
-  | KeyPhi ![ValueNum]        -- Phi with value numbers of args
+  | KeyPhi ![(BlockId, ValueNum)] -- Phi with (predecessor, value number)
   | KeyCall !String ![ValueNum]  -- Function call (not memoized)
   deriving (Eq, Ord, Show)
 
@@ -44,10 +53,12 @@ data ExprKey
 data GVNState = GVNState
   { gvnNextNum :: !ValueNum                   -- ^ Next available value number
   , gvnExprToNum :: !(Map ExprKey ValueNum)   -- ^ Expression -> value number
-  , gvnVarToNum :: !(Map String ValueNum)     -- ^ Variable -> its value number
+  , gvnVarToNum :: !(Map VarKey ValueNum)     -- ^ Variable -> its value number
   , gvnNumToExpr :: !(Map ValueNum SSAExpr)   -- ^ Value number -> canonical expression
-  , gvnNumToVar :: !(Map ValueNum String)     -- ^ Value number -> canonical variable
-  , gvnReplacements :: !(Map String String)   -- ^ Variable -> replacement variable
+  , gvnNumToVar :: !(Map ValueNum VarKey)     -- ^ Value number -> canonical variable
+  , gvnReplacements :: !(Map VarKey VarKey)   -- ^ Variable -> replacement variable
+  , gvnAllReplacements :: !(Map VarKey VarKey) -- ^ All replacements (global)
+  , gvnElimCount :: !Int                      -- ^ Count of eliminated expressions
   } deriving (Show)
 
 type GVN a = State GVNState a
@@ -61,6 +72,8 @@ initGVNState = GVNState
   , gvnNumToExpr = Map.empty
   , gvnNumToVar = Map.empty
   , gvnReplacements = Map.empty
+  , gvnAllReplacements = Map.empty
+  , gvnElimCount = 0
   }
 
 --------------------------------------------------------------------------------
@@ -71,37 +84,99 @@ initGVNState = GVNState
 data GVNResult = GVNResult
   { gvnOptBlocks :: ![SSABlock]              -- ^ Optimized blocks
   , gvnEliminated :: !Int                    -- ^ Number of eliminated expressions
-  , gvnReplacementMap :: !(Map String String) -- ^ Replacements made
+  , gvnReplacementMap :: !(Map VarKey VarKey) -- ^ Replacements made
   } deriving (Show)
 
 -- | Run GVN on a method
 runGVN :: CFG -> DomTree -> [SSABlock] -> GVNResult
 runGVN cfg domTree blocks =
   let blockMap = Map.fromList [(blockLabel b, b) | b <- blocks]
-      -- Process blocks in dominator tree order (preorder)
-      order = domTreePreorder domTree (cfgEntry cfg)
-      (optimized, finalState) = runState (processBlocks blockMap order) initGVNState
-      numElim = Map.size (gvnReplacements finalState)
+      runner = if hasBackEdge cfg domTree
+               then processBlockTreeLocal
+               else processBlockTree
+      (optimized, finalState) =
+        runState (runner blockMap domTree (cfgEntry cfg)) initGVNState
   in GVNResult
     { gvnOptBlocks = optimized
-    , gvnEliminated = numElim
-    , gvnReplacementMap = gvnReplacements finalState
+    , gvnEliminated = gvnElimCount finalState
+    , gvnReplacementMap = gvnAllReplacements finalState
     }
 
--- | Get dominator tree preorder traversal
-domTreePreorder :: DomTree -> BlockId -> [BlockId]
-domTreePreorder domTree root = go root
+hasBackEdge :: CFG -> DomTree -> Bool
+hasBackEdge cfg domTree =
+  any isBackEdge [(from, to) | from <- allBlockIds cfg, to <- successors cfg from]
   where
-    go bid = bid : concatMap go (domChildren domTree bid)
+    isBackEdge (from, to) = dominates domTree to from
 
--- | Process blocks in dominator tree order
-processBlocks :: Map BlockId SSABlock -> [BlockId] -> GVN [SSABlock]
-processBlocks blockMap order = do
-  results <- forM order $ \bid ->
-    case Map.lookup bid blockMap of
-      Just block -> Just <$> processBlock block
-      Nothing -> return Nothing
-  return $ [b | Just b <- results]
+-- | Process blocks in dominator tree order with scoped state.
+-- Definitions in a block are visible to dominated children, but not siblings.
+processBlockTree :: Map BlockId SSABlock -> DomTree -> BlockId -> GVN [SSABlock]
+processBlockTree blockMap domTree bid = do
+  stBefore <- get
+  case Map.lookup bid blockMap of
+    Nothing -> return []
+    Just block -> do
+      block' <- processBlock block
+      stAfter <- get
+      let children = domChildren domTree bid
+      (childBlocks, stGlobal) <- foldM (processChild blockMap domTree stAfter)
+                                            ([], stAfter)
+                                            children
+      let stRestore = mergeScopedState stBefore stGlobal
+      put stRestore
+      return (block' : childBlocks)
+
+processBlockTreeLocal :: Map BlockId SSABlock -> DomTree -> BlockId -> GVN [SSABlock]
+processBlockTreeLocal blockMap domTree bid = do
+  stBefore <- get
+  let baseState = resetLocalState stBefore
+  put baseState
+  case Map.lookup bid blockMap of
+    Nothing -> do
+      put stBefore
+      return []
+    Just block -> do
+      block' <- processBlock block
+      stAfter <- get
+      let baseForChild = resetLocalState stAfter
+          children = domChildren domTree bid
+      (childBlocks, stGlobal) <- foldM (processChildLocal blockMap domTree baseForChild)
+                                            ([], baseForChild)
+                                            children
+      let stRestore = mergeScopedState stBefore stGlobal
+      put stRestore
+      return (block' : childBlocks)
+
+mergeScopedState :: GVNState -> GVNState -> GVNState
+mergeScopedState scoped global = scoped
+  { gvnNextNum = gvnNextNum global
+  , gvnAllReplacements = gvnAllReplacements global
+  , gvnElimCount = gvnElimCount global
+  }
+
+processChild :: Map BlockId SSABlock -> DomTree -> GVNState -> ([SSABlock], GVNState) -> BlockId
+             -> GVN ([SSABlock], GVNState)
+processChild blockMap domTree baseState (acc, stGlobal) childId = do
+  put (mergeScopedState baseState stGlobal)
+  blocks' <- processBlockTree blockMap domTree childId
+  stAfter <- get
+  return (acc ++ blocks', stAfter)
+
+processChildLocal :: Map BlockId SSABlock -> DomTree -> GVNState -> ([SSABlock], GVNState) -> BlockId
+                  -> GVN ([SSABlock], GVNState)
+processChildLocal blockMap domTree baseState (acc, stGlobal) childId = do
+  put (mergeScopedState baseState stGlobal)
+  blocks' <- processBlockTreeLocal blockMap domTree childId
+  stAfter <- get
+  return (acc ++ blocks', stAfter)
+
+resetLocalState :: GVNState -> GVNState
+resetLocalState st = st
+  { gvnExprToNum = Map.empty
+  , gvnVarToNum = Map.empty
+  , gvnNumToVar = Map.empty
+  , gvnReplacements = Map.empty
+  }
 
 -- | Process a single block
 processBlock :: SSABlock -> GVN SSABlock
@@ -120,10 +195,12 @@ processBlock SSABlock{..} = do
 processPhi :: PhiNode -> GVN PhiNode
 processPhi phi@PhiNode{..} = do
   -- Get value numbers for all arguments
-  argNums <- forM phiArgs $ \(_, argVar) -> do
-    getOrCreateVarNum (ssaName argVar)
+  argNums <- forM phiArgs $ \(predId, argVar) -> do
+    getOrCreateVarNum (varKey argVar)
+      >>= \num -> return (predId, num)
+  let argNums' = sortOn fst argNums
   -- Create phi key
-  let key = KeyPhi argNums
+  let key = KeyPhi argNums'
   -- Check if we've seen this phi before
   existing <- gets (Map.lookup key . gvnExprToNum)
   case existing of
@@ -131,17 +208,17 @@ processPhi phi@PhiNode{..} = do
       -- This phi computes the same value as another expression
       existingVar <- gets (Map.lookup num . gvnNumToVar)
       case existingVar of
-        Just v | v /= ssaName phiVar -> do
+        Just v | v /= varKey phiVar -> do
           -- Replace this variable with the existing one
-          recordReplacement (ssaName phiVar) v
+          recordReplacement (varKey phiVar) v
           -- But still assign the same value number
-          setVarNum (ssaName phiVar) num
-        _ -> setVarNum (ssaName phiVar) num
+          setVarNum (varKey phiVar) num
+        _ -> setVarNum (varKey phiVar) num
     Nothing -> do
       -- New value - assign fresh number
       num <- freshValueNum
       recordExpr key num (SSAUse phiVar)
-      setVarNum (ssaName phiVar) num
+      setVarNum (varKey phiVar) num
   return phi
 
 -- | Process an instruction
@@ -153,16 +230,16 @@ processInstr = \case
     -- Check if we can replace with existing variable
     existingVar <- gets (Map.lookup num . gvnNumToVar)
     case existingVar of
-      Just v | v /= ssaName var -> do
+      Just v | v /= varKey var -> do
         -- This computes the same value as v
-        recordReplacement (ssaName var) v
-        setVarNum (ssaName var) num
+        recordReplacement (varKey var) v
+        setVarNum (varKey var) num
         -- Keep the assignment but mark it for potential DCE
         return $ SSAAssign var expr'
       _ -> do
-        setVarNum (ssaName var) num
+        setVarNum (varKey var) num
         -- Record this as the canonical variable for this value number
-        modify $ \s -> s { gvnNumToVar = Map.insert num (ssaName var) (gvnNumToVar s) }
+        modify $ \s -> s { gvnNumToVar = Map.insert num (varKey var) (gvnNumToVar s) }
         return $ SSAAssign var expr'
 
   SSAReturn mexpr -> do
@@ -215,13 +292,13 @@ valueNumberExpr expr = case expr of
 
   SSAUse var -> do
     -- Check for replacement
-    repl <- gets (Map.lookup (ssaName var) . gvnReplacements)
+    repl <- gets (Map.lookup (varKey var) . gvnReplacements)
     case repl of
       Just v -> do
         num <- getOrCreateVarNum v
-        return (SSAUse (var { ssaName = v }), num)
+        return (SSAUse (varFromKey v), num)
       Nothing -> do
-        num <- getOrCreateVarNum (ssaName var)
+        num <- getOrCreateVarNum (varKey var)
         return (expr, num)
 
   SSAUnary op e -> do
@@ -233,7 +310,7 @@ valueNumberExpr expr = case expr of
         -- Can we replace with a variable?
         mvar <- gets (Map.lookup num . gvnNumToVar)
         case mvar of
-          Just v -> return (SSAUse (SSAVar v 0 Nothing), num)
+          Just v -> return (SSAUse (varFromKey v), num)
           Nothing -> return (SSAUnary op e', num)
       Nothing -> do
         -- Try to fold constants
@@ -257,7 +334,7 @@ valueNumberExpr expr = case expr of
       Just num -> do
         mvar <- gets (Map.lookup num . gvnNumToVar)
         case mvar of
-          Just v -> return (SSAUse (SSAVar v 0 Nothing), num)
+          Just v -> return (SSAUse (varFromKey v), num)
           Nothing -> return (SSABinary op l'' r'', num)
       Nothing -> do
         -- Try to fold constants
@@ -357,7 +434,7 @@ freshValueNum = do
   return num
 
 -- | Get or create a value number for a variable
-getOrCreateVarNum :: String -> GVN ValueNum
+getOrCreateVarNum :: VarKey -> GVN ValueNum
 getOrCreateVarNum var = do
   existing <- gets (Map.lookup var . gvnVarToNum)
   case existing of
@@ -368,7 +445,7 @@ getOrCreateVarNum var = do
       return num
 
 -- | Set the value number for a variable
-setVarNum :: String -> ValueNum -> GVN ()
+setVarNum :: VarKey -> ValueNum -> GVN ()
 setVarNum var num = do
   modify $ \s -> s { gvnVarToNum = Map.insert var num (gvnVarToNum s) }
 
@@ -392,6 +469,10 @@ recordExpr key num expr = do
     }
 
 -- | Record a variable replacement
-recordReplacement :: String -> String -> GVN ()
+recordReplacement :: VarKey -> VarKey -> GVN ()
 recordReplacement from to = do
-  modify $ \s -> s { gvnReplacements = Map.insert from to (gvnReplacements s) }
+  modify $ \s -> s
+    { gvnReplacements = Map.insert from to (gvnReplacements s)
+    , gvnAllReplacements = Map.insert from to (gvnAllReplacements s)
+    , gvnElimCount = gvnElimCount s + 1
+    }

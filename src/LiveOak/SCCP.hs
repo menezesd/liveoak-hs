@@ -77,19 +77,22 @@ meet _ _ = Bottom  -- Different types
 -- SCCP State
 --------------------------------------------------------------------------------
 
+type VarKey = (String, Int)
+
 -- | SCCP analysis state
 data SCCPState = SCCPState
-  { sccpValues :: !(Map String LatticeValue)  -- ^ Lattice value for each SSA variable
+  { sccpValues :: !(Map VarKey LatticeValue)  -- ^ Lattice value for each SSA variable
   , sccpExecBlocks :: !(Set BlockId)          -- ^ Executable blocks
   , sccpExecEdges :: !(Set (BlockId, BlockId)) -- ^ Executable edges
-  , sccpSSAWorklist :: ![String]              -- ^ SSA variable worklist
+  , sccpSSAWorklist :: ![VarKey]              -- ^ SSA variable worklist
   , sccpCFGWorklist :: ![(BlockId, BlockId)]  -- ^ CFG edge worklist
   } deriving (Show)
 
 -- | Initial SCCP state
-initSCCPState :: BlockId -> SCCPState
-initSCCPState entry = SCCPState
-  { sccpValues = Map.empty
+-- Parameters are initialized to Bottom (unknown/varying values)
+initSCCPState :: BlockId -> [VarKey] -> SCCPState
+initSCCPState entry params = SCCPState
+  { sccpValues = Map.fromList [(p, Bottom) | p <- params]
   , sccpExecBlocks = Set.empty
   , sccpExecEdges = Set.empty
   , sccpSSAWorklist = []
@@ -104,17 +107,19 @@ type SCCP a = State SCCPState a
 
 -- | Result of SCCP analysis
 data SCCPResult = SCCPResult
-  { sccpConstValues :: !(Map String LatticeValue)  -- ^ Constant values found
+  { sccpConstValues :: !(Map VarKey LatticeValue)  -- ^ Constant values found
   , sccpReachableBlocks :: !(Set BlockId)          -- ^ Reachable blocks
   , sccpDeadBlocks :: ![BlockId]                   -- ^ Unreachable blocks
   } deriving (Show)
 
 -- | Run SCCP on a method
-runSCCP :: CFG -> [SSABlock] -> SCCPResult
-runSCCP cfg blocks =
+-- Takes a list of parameter variable keys (version 0) to initialize as Bottom
+runSCCP :: [VarKey] -> CFG -> [SSABlock] -> SCCPResult
+runSCCP params cfg blocks =
   let entry = cfgEntry cfg
       blockMap = Map.fromList [(blockLabel b, b) | b <- blocks]
-      finalState = execState (sccpLoop cfg blockMap) (initSCCPState entry)
+      useMap = buildUseMap blocks
+      finalState = execState (sccpLoop cfg blockMap useMap) (initSCCPState entry params)
       allBlocks = Set.fromList $ allBlockIds cfg
       reachable = sccpExecBlocks finalState
       dead = Set.toList $ Set.difference allBlocks reachable
@@ -125,14 +130,14 @@ runSCCP cfg blocks =
     }
 
 -- | Main SCCP loop - process worklists until empty
-sccpLoop :: CFG -> Map BlockId SSABlock -> SCCP ()
-sccpLoop cfg blockMap = do
+sccpLoop :: CFG -> Map BlockId SSABlock -> Map VarKey (Set BlockId) -> SCCP ()
+sccpLoop cfg blockMap useMap = do
   -- Process CFG worklist
   cfgDone <- processCFGWorklist cfg blockMap
   -- Process SSA worklist
-  ssaDone <- processSSAWorklist cfg blockMap
+  ssaDone <- processSSAWorklist cfg blockMap useMap
   -- Continue until both worklists are empty
-  unless (cfgDone && ssaDone) $ sccpLoop cfg blockMap
+  unless (cfgDone && ssaDone) $ sccpLoop cfg blockMap useMap
 
 -- | Process CFG edge worklist
 processCFGWorklist :: CFG -> Map BlockId SSABlock -> SCCP Bool
@@ -162,23 +167,23 @@ processCFGWorklist cfg blockMap = do
       return False  -- Not done
 
 -- | Process SSA variable worklist
-processSSAWorklist :: CFG -> Map BlockId SSABlock -> SCCP Bool
-processSSAWorklist cfg blockMap = do
+processSSAWorklist :: CFG -> Map BlockId SSABlock -> Map VarKey (Set BlockId) -> SCCP Bool
+processSSAWorklist cfg blockMap useMap = do
   st <- get
   case sccpSSAWorklist st of
     [] -> return True  -- Done
     (var:rest) -> do
       put st { sccpSSAWorklist = rest }
       -- Re-evaluate uses of this variable
-      evaluateUses cfg blockMap var
+      evaluateUses cfg blockMap useMap var
       return False  -- Not done
 
 -- | Evaluate a block for the first time
 evaluateBlock :: CFG -> SSABlock -> SCCP ()
 evaluateBlock cfg SSABlock{..} = do
-  -- Evaluate phi nodes
+  -- Evaluate phi nodes using only executable incoming edges
   forM_ blockPhis $ \phi -> do
-    evaluatePhi phi
+    evaluatePhi blockLabel phi
   -- Evaluate instructions
   forM_ blockInstrs $ \instr -> do
     evaluateInstr instr
@@ -192,28 +197,30 @@ evaluatePhisForEdge from SSABlock{..} = do
     -- Only consider the argument from the new edge
     case lookup from (phiArgs phi) of
       Just argVar -> do
-        argVal <- getVarValue (ssaName argVar)
-        oldVal <- getVarValue (ssaName $ phiVar phi)
+        argVal <- getVarValue (varKey argVar)
+        oldVal <- getVarValue (varKey $ phiVar phi)
         let newVal = meet oldVal argVal
         when (newVal /= oldVal) $ do
-          setVarValue (ssaName $ phiVar phi) newVal
+          setVarValue (varKey $ phiVar phi) newVal
       Nothing -> return ()
 
 -- | Evaluate a phi node
-evaluatePhi :: PhiNode -> SCCP ()
-evaluatePhi PhiNode{..} = do
-  -- Meet values from all phi arguments
-  -- (simplified: we should only consider executable incoming edges)
-  vals <- forM phiArgs $ \(_, argVar) -> getVarValue (ssaName argVar)
-  let result = foldl' meet Top vals
-  setVarValue (ssaName phiVar) result
+evaluatePhi :: BlockId -> PhiNode -> SCCP ()
+evaluatePhi blockId PhiNode{..} = do
+  execEdges <- gets sccpExecEdges
+  vals <- forM phiArgs $ \(pred, argVar) ->
+    if Set.member (pred, blockId) execEdges
+      then Just <$> getVarValue (varKey argVar)
+      else return Nothing
+  let result = foldl' meet Top [v | Just v <- vals]
+  setVarValue (varKey phiVar) result
 
 -- | Evaluate an instruction
 evaluateInstr :: SSAInstr -> SCCP ()
 evaluateInstr = \case
   SSAAssign var expr -> do
     val <- evaluateExpr expr
-    setVarValue (ssaName var) val
+    setVarValue (varKey var) val
   _ -> return ()  -- Other instructions don't define values we track
 
 -- | Evaluate the terminator to determine executable edges
@@ -251,7 +258,7 @@ evaluateExpr = \case
   SSAStr _ -> return Bottom  -- Strings not tracked
   SSAThis -> return Bottom   -- 'this' is unknown
 
-  SSAUse var -> getVarValue (ssaName var)
+  SSAUse var -> getVarValue (varKey var)
 
   SSAUnary op e -> do
     val <- evaluateExpr e
@@ -322,65 +329,76 @@ evaluateBinary Ne ConstNull ConstNull = ConstBool False
 evaluateBinary _ _ _ = Bottom
 
 -- | Re-evaluate all uses of a variable
-evaluateUses :: CFG -> Map BlockId SSABlock -> String -> SCCP ()
-evaluateUses _cfg blockMap var = do
-  -- Find all blocks that use this variable and re-evaluate
-  forM_ (Map.elems blockMap) $ \block -> do
-    execBlocks <- gets sccpExecBlocks
-    when (Set.member (blockLabel block) execBlocks) $ do
-      -- Check if block uses this variable
-      when (usesVar var block) $ do
-        evaluateBlock' block
-  where
-    usesVar v SSABlock{..} =
-      any (usesVarInPhi v) blockPhis || any (usesVarInInstr v) blockInstrs
-
-    usesVarInPhi v PhiNode{..} =
-      any (\(_, argVar) -> ssaName argVar == v) phiArgs
-
-    usesVarInInstr v = \case
-      SSAAssign _ expr -> usesVarInExpr v expr
-      SSAReturn (Just expr) -> usesVarInExpr v expr
-      SSABranch cond _ _ -> usesVarInExpr v cond
-      SSAFieldStore target _ _ value ->
-        usesVarInExpr v target || usesVarInExpr v value
-      SSAExprStmt expr -> usesVarInExpr v expr
-      _ -> False
-
-    usesVarInExpr v = \case
-      SSAUse var' -> ssaName var' == v
-      SSAUnary _ e -> usesVarInExpr v e
-      SSABinary _ l r -> usesVarInExpr v l || usesVarInExpr v r
-      SSATernary c t e -> usesVarInExpr v c || usesVarInExpr v t || usesVarInExpr v e
-      SSACall _ args -> any (usesVarInExpr v) args
-      SSAInstanceCall target _ args ->
-        usesVarInExpr v target || any (usesVarInExpr v) args
-      SSANewObject _ args -> any (usesVarInExpr v) args
-      SSAFieldAccess target _ -> usesVarInExpr v target
-      _ -> False
-
--- | Re-evaluate a block (just instructions, not phis)
-evaluateBlock' :: SSABlock -> SCCP ()
-evaluateBlock' SSABlock{..} = do
-  forM_ blockInstrs evaluateInstr
+evaluateUses :: CFG -> Map BlockId SSABlock -> Map VarKey (Set BlockId) -> VarKey -> SCCP ()
+evaluateUses cfg blockMap useMap var = do
+  case Map.lookup var useMap of
+    Nothing -> return ()
+    Just blocks -> do
+      execBlocks <- gets sccpExecBlocks
+      forM_ (Set.toList blocks) $ \bid ->
+        case Map.lookup bid blockMap of
+          Just block | Set.member (blockLabel block) execBlocks ->
+            evaluateBlock cfg block
+          _ -> return ()
 
 --------------------------------------------------------------------------------
 -- Helper Functions
 --------------------------------------------------------------------------------
 
+varKey :: SSAVar -> VarKey
+varKey v = (ssaName v, ssaVersion v)
+
+buildUseMap :: [SSABlock] -> Map VarKey (Set BlockId)
+buildUseMap blocks = foldl' addBlock Map.empty blocks
+  where
+    addBlock acc SSABlock{..} =
+      let bid = blockLabel
+          uses = phiUses blockPhis ++ concatMap instrUses blockInstrs
+      in foldl' (addUse bid) acc uses
+
+    addUse bid acc v = Map.insertWith Set.union v (Set.singleton bid) acc
+
+    phiUses phis =
+      [ varKey v
+      | phi <- phis
+      , (_, v) <- phiArgs phi
+      ]
+
+    instrUses = \case
+      SSAAssign _ e -> exprUses e
+      SSAReturn (Just e) -> exprUses e
+      SSABranch c _ _ -> exprUses c
+      SSAFieldStore t _ _ v -> exprUses t ++ exprUses v
+      SSAExprStmt e -> exprUses e
+      _ -> []
+
+    exprUses = \case
+      SSAUse v -> [varKey v]
+      SSAUnary _ e -> exprUses e
+      SSABinary _ l r -> exprUses l ++ exprUses r
+      SSATernary c t e -> exprUses c ++ exprUses t ++ exprUses e
+      SSACall _ args -> concatMap exprUses args
+      SSAInstanceCall t _ args -> exprUses t ++ concatMap exprUses args
+      SSANewObject _ args -> concatMap exprUses args
+      SSAFieldAccess t _ -> exprUses t
+      _ -> []
+
 -- | Get the lattice value of a variable
-getVarValue :: String -> SCCP LatticeValue
+getVarValue :: VarKey -> SCCP LatticeValue
 getVarValue var = do
   vals <- gets sccpValues
   return $ Map.findWithDefault Top var vals
 
 -- | Set the lattice value of a variable
-setVarValue :: String -> LatticeValue -> SCCP ()
+-- Uses meet to ensure monotonicity: values can only move down the lattice
+-- (Top -> Const -> Bottom), never up. This makes SCCP robust against SSA violations.
+setVarValue :: VarKey -> LatticeValue -> SCCP ()
 setVarValue var val = do
   oldVal <- getVarValue var
-  when (val /= oldVal) $ do
+  let newVal = meet oldVal val  -- Ensure we only move down the lattice
+  when (newVal /= oldVal) $ do
     modify $ \s -> s
-      { sccpValues = Map.insert var val (sccpValues s)
+      { sccpValues = Map.insert var newVal (sccpValues s)
       , sccpSSAWorklist = var : sccpSSAWorklist s
       }
 
