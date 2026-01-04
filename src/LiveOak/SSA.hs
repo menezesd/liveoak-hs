@@ -129,14 +129,33 @@ methodToSSA syms clsName MethodDecl{..} =
       paramVars = [SSAVar (paramName p) 0 (Just (paramType p)) | p <- methodParams]
       initDefs = Map.fromList [(paramName p, SSAVar (paramName p) 0 (Just (paramType p))) | p <- methodParams]
       st = initState { currentDefs = initDefs }
-      (blocks, _) = runState (stmtToBlocks "entry" methodBody) st
+      (rawBlocks, _) = runState (stmtToBlocks Nothing "entry" methodBody) st
+      -- Ensure the last block has a terminator (add implicit return if needed)
+      blocks = ensureTerminator rawBlocks
   in SSAMethod clsName methodName paramVars methodReturnSig blocks "entry"
+  where
+    -- Add an implicit return to the last block if it doesn't have a terminator
+    ensureTerminator [] = []
+    ensureTerminator bs =
+      let (initBs, lastB) = (init bs, last bs)
+          lastInstrs = blockInstrs lastB
+          hasTerminator = case lastInstrs of
+            [] -> False
+            instrs -> case last instrs of
+              SSAReturn _ -> True
+              SSAJump _ -> True
+              SSABranch _ _ _ -> True
+              _ -> False
+          fixedLast = if hasTerminator
+                      then lastB
+                      else lastB { blockInstrs = lastInstrs ++ [SSAReturn Nothing] }
+      in initBs ++ [fixedLast]
 
 -- | Convert a statement to SSA blocks
-stmtToBlocks :: String -> Stmt -> SSAConv [SSABlock]
-stmtToBlocks label = \case
+stmtToBlocks :: Maybe String -> String -> Stmt -> SSAConv [SSABlock]
+stmtToBlocks loopExit label = \case
   Block stmts _ -> do
-    (instrs, blocks) <- stmtsToInstrs stmts
+    (instrs, blocks) <- stmtsToInstrs loopExit stmts
     -- Merge instructions with first block if possible
     case (instrs, blocks) of
       ([], []) -> return [SSABlock label [] []]
@@ -203,8 +222,8 @@ stmtToBlocks label = \case
     joinLabel <- freshBlock
 
     -- Convert branches
-    thenBlocks <- stmtToBlocks thenLabel th
-    elseBlocks <- stmtToBlocks elseLabel el
+    thenBlocks <- stmtToBlocks loopExit thenLabel th
+    elseBlocks <- stmtToBlocks loopExit elseLabel el
 
     -- Add jumps to join at end of branches
     let thenBlocks' = addJumpToEnd thenBlocks joinLabel
@@ -226,7 +245,7 @@ stmtToBlocks label = \case
     let headerBlock = SSABlock headerLabel [] [SSABranch ssaCond bodyLabel exitLabel]
 
     -- Body block
-    bodyBlocks <- stmtToBlocks bodyLabel body
+    bodyBlocks <- stmtToBlocks (Just exitLabel) bodyLabel body
     let bodyBlocks' = addJumpToEnd bodyBlocks headerLabel
 
     -- Entry jumps to header
@@ -236,19 +255,33 @@ stmtToBlocks label = \case
     return $ whileEntryBlock : headerBlock : bodyBlocks' ++ [exitBlock]
 
   Break _ -> do
-    -- Note: proper break handling requires knowing the enclosing loop
-    return [SSABlock label [] []]
+    case loopExit of
+      Just exitLabel -> return [SSABlock label [] [SSAJump exitLabel]]
+      Nothing -> return [SSABlock label [] []]
 
   ExprStmt expr _ -> do
     ssaExpr <- exprToSSA expr
     return [SSABlock label [] [SSAExprStmt ssaExpr]]
 
+-- | Check if a list of instructions ends with a terminator
+hasTerminator :: [SSAInstr] -> Bool
+hasTerminator [] = False
+hasTerminator instrs = case last instrs of
+  SSAReturn _ -> True
+  SSAJump _ -> True
+  SSABranch _ _ _ -> True
+  _ -> False
+
 -- | Add a jump instruction to the end of the last block
+-- Only adds jump if the block doesn't already end with a terminator (Return, Jump, Branch)
 addJumpToEnd :: [SSABlock] -> String -> [SSABlock]
 addJumpToEnd [] target = [SSABlock "empty" [] [SSAJump target]]
 addJumpToEnd blocks target =
   let (init', last') = (init blocks, last blocks)
-      lastWithJump = last' { blockInstrs = blockInstrs last' ++ [SSAJump target] }
+      lastInstrs = blockInstrs last'
+      lastWithJump = if hasTerminator lastInstrs
+                     then last'  -- Don't add jump if already has terminator
+                     else last' { blockInstrs = lastInstrs ++ [SSAJump target] }
   in init' ++ [lastWithJump]
 
 -- | Update all references to a block label within a block's instructions
@@ -267,29 +300,46 @@ updateBlockRefs oldLabel newLabel block =
 -- | Convert statements to instructions
 -- When we hit a control-flow statement (if/while), we need to ensure remaining
 -- statements are placed correctly after the control flow, not mixed into the entry block.
-stmtsToInstrs :: [Stmt] -> SSAConv ([SSAInstr], [SSABlock])
-stmtsToInstrs stmts = go stmts []
+stmtsToInstrs :: Maybe String -> [Stmt] -> SSAConv ([SSAInstr], [SSABlock])
+stmtsToInstrs loopExit stmts = go stmts []
   where
     go [] instrs = return (reverse instrs, [])
     go (stmt:rest) instrs = do
       tempLabel <- freshBlock
-      blocks <- stmtToBlocks tempLabel stmt
+      blocks <- stmtToBlocks loopExit tempLabel stmt
       case blocks of
-        [SSABlock _ [] newInstrs] ->
-          -- Simple statement - accumulate instructions
-          go rest (reverse newInstrs ++ instrs)
+        [SSABlock _ [] newInstrs]
+          -- Check if this block ends with a terminator (Return/Jump/Branch)
+          -- If so, stop processing - remaining statements are dead code
+          | hasTerminator newInstrs ->
+              return (reverse (reverse newInstrs ++ instrs), [])
+          | otherwise ->
+              -- Simple statement - accumulate instructions
+              go rest (reverse newInstrs ++ instrs)
         _ -> do
           -- Control flow statement - stop accumulating, create continuation blocks
           if null rest
             then return (reverse instrs, blocks)
             else do
-              -- Create a new block for remaining statements
-              nextLabel <- freshBlock
+              -- Process remaining statements
               (nextInstrs, nextBlocks) <- go rest []
-              let contBlock = SSABlock nextLabel [] nextInstrs : nextBlocks
-              -- Link last block of control flow to continuation
-              let linkedBlocks = addJumpToEnd blocks nextLabel
-              return (reverse instrs, linkedBlocks ++ contBlock)
+              case (nextInstrs, nextBlocks) of
+                -- If continuation is pure control flow with no instructions,
+                -- link directly to first block of continuation instead of creating empty intermediate block
+                ([], b:bs) ->
+                  let linkedBlocks = addJumpToEnd blocks (blockLabel b)
+                  in return (reverse instrs, linkedBlocks ++ (b:bs))
+                -- Otherwise create a continuation block with instructions
+                _ -> do
+                  nextLabel <- freshBlock
+                  let linkedBlocks = addJumpToEnd blocks nextLabel
+                      contBlock = SSABlock nextLabel [] nextInstrs
+                  case nextBlocks of
+                    b:bs ->
+                      let contBlocks = addJumpToEnd [contBlock] (blockLabel b)
+                      in return (reverse instrs, linkedBlocks ++ contBlocks ++ (b:bs))
+                    [] ->
+                      return (reverse instrs, linkedBlocks ++ [contBlock])
 
 -- | Convert an expression to SSA
 exprToSSA :: Expr -> SSAConv SSAExpr

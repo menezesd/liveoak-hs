@@ -10,7 +10,7 @@ module LiveOak.SSACodegen
   , generateMethodFromCFG
   ) where
 
-import Control.Monad (forM, forM_, when)
+import Control.Monad (forM, forM_, when, unless)
 import Control.Monad.State.Strict
 import Control.Monad.Reader
 import Control.Monad.Except
@@ -28,11 +28,13 @@ import Data.Maybe (isJust)
 import LiveOak.Ast (UnaryOp(..), BinaryOp(..))
 import LiveOak.SSATypes
 import LiveOak.CFG
-import LiveOak.Symbol (ProgramSymbols, lookupClass, csFieldOrder, lookupMethod, fieldOffset)
+import LiveOak.Symbol (ProgramSymbols(..), MethodSymbol, VarSymbol, lookupClass, lookupField, csFieldOrder, lookupMethod, fieldOffset, csName, numParams, numLocals, msName, msParams, msLocals, vsName, vsType, stackAddress)
 import LiveOak.Diag (Diag, Result)
 import qualified LiveOak.Diag as D
-import LiveOak.StringRuntime (emitStringRuntime)
-import LiveOak.SSATypeInfer (TypeEnv, buildTypeEnv, inferSSAExprClass)
+import LiveOak.StringRuntime (emitStringRuntime, strConcatLabel, strReverseLabel, strRepeatLabel, strCompareLabel)
+import LiveOak.SSATypeInfer (TypeEnv, buildTypeEnv, inferSSAExprClass, inferSSAExprClassWithCtx, inferSSAExprType)
+import LiveOak.Types (ValueType(..), Type(..), ofPrimitive)
+import LiveOak.Types (ValueType(..), Type(..), ofPrimitive)
 
 --------------------------------------------------------------------------------
 -- Code Generation Types
@@ -50,6 +52,7 @@ data SSACodegenCtx = SSACodegenCtx
   { scgSymbols :: !ProgramSymbols
   , scgClassName :: !String
   , scgMethodName :: !String
+  , scgMethodSymbol :: !MethodSymbol
   , scgCFG :: !CFG
   , scgPhiCopies :: !(Map BlockId [(BlockId, String, String)])
     -- ^ For each block, copies to insert before jump: (target, destVar, srcVar)
@@ -115,33 +118,41 @@ generateMethodFromCFG = generateMethodSSA
 generateMethodSSA :: ProgramSymbols -> String -> SSAMethod -> Result Text
 generateMethodSSA syms clsName method@SSAMethod{..} = do
   let cfg = buildCFG method
+      methodSymbol = case lookupClass clsName syms >>= lookupMethod ssaMethodName of
+        Just ms -> ms
+        Nothing -> error ("Unknown method symbol for " ++ clsName ++ "." ++ ssaMethodName)
 
       -- Compute phi copies to insert in predecessor blocks
       phiCopies = computePhiCopies cfg (ssaMethodBlocks)
 
       -- Build type environment for this method
-      typeEnv = buildTypeEnv ssaMethodBlocks syms ssaMethodClassName
+      typeEnv = buildTypeEnv ssaMethodBlocks syms ssaMethodClassName ssaMethodParams
 
-      -- totalParams includes 'this' (like traditional codegen)
-      totalParams = 1 + length ssaMethodParams
+      totalParams = numParams methodSymbol
       returnSlotOffset = -(3 + totalParams)
-      -- Parameters: this at index 0, user params follow
-      paramSlots = Map.fromList $
-        ("this", -(2 + totalParams) + 0) :
-        zip (map ssaName ssaMethodParams) [-(2 + totalParams) + 1 + i | i <- [0..]]
+      paramSlots = Map.fromList
+        [ (vsName v, stackAddress totalParams v)
+        | v <- msParams methodSymbol
+        ]
+      baseLocalSlots = Map.fromList
+        [ (vsName v, stackAddress totalParams v)
+        | v <- msLocals methodSymbol
+        ]
+      baseLocalCount = numLocals methodSymbol
 
       allVars = collectAllVars ssaMethodBlocks
-      paramNames = Set.fromList $ "this" : map ssaName ssaMethodParams
-      localVars = sort $ Set.toList $ Set.difference allVars paramNames
-      localSlots = Map.fromList $ zip localVars [1..]
+      baseNames = Set.fromList (Map.keys paramSlots ++ Map.keys baseLocalSlots)
+      extraVars = sort $ Set.toList $ Set.difference allVars baseNames
+      extraSlots = Map.fromList $ zip extraVars [baseLocalCount + 1 ..]
 
-      varSlots = Map.union paramSlots localSlots
-      localCount = length localVars
+      varSlots = Map.unions [paramSlots, baseLocalSlots, extraSlots]
+      localCount = baseLocalCount + length extraVars
 
       ctx = SSACodegenCtx
         { scgSymbols = syms
         , scgClassName = clsName
         , scgMethodName = ssaMethodName
+        , scgMethodSymbol = methodSymbol
         , scgCFG = cfg
         , scgPhiCopies = phiCopies
         , scgTypeEnv = typeEnv
@@ -162,6 +173,7 @@ generateMethodSSA syms clsName method@SSAMethod{..} = do
 emitMethodCFG :: SSAMethod -> SSACodegen ()
 emitMethodCFG SSAMethod{..} = do
   clsName <- asks scgClassName
+  currentMs <- asks scgMethodSymbol
 
   -- Emit method label
   let label = T.pack clsName <> "_" <> T.pack ssaMethodName
@@ -174,6 +186,12 @@ emitMethodCFG SSAMethod{..} = do
   localCount <- asks scgLocalCount
   when (localCount > 0) $
     emit $ "ADDSP " <> tshow localCount <> "\n"
+
+  -- Tail-call entry point (after prologue)
+  cls <- asks scgClassName
+  meth <- asks scgMethodName
+  let tcoLabel = methodTCOLabelText cls meth
+  emit $ tcoLabel <> ":\n"
 
   cfg <- asks scgCFG
 
@@ -212,7 +230,8 @@ collectAllVars blocks = Set.unions $ map blockVars blocks
 emitBlock :: CFGBlock -> SSACodegen ()
 emitBlock CFGBlock{..} = do
   -- Emit block label
-  emit $ T.pack cfgBlockId <> ":\n"
+  blockLabel <- blockLabelText cfgBlockId
+  emit $ blockLabel <> ":\n"
 
   -- Emit phi node copies (from predecessors that jump here)
   -- Note: actual phi copies are inserted in predecessor terminators
@@ -231,7 +250,6 @@ emitInstr = \case
     emitSSAExpr expr
     slot <- getVarSlot (ssaName var)
     emit $ "STOREOFF " <> tshow slot <> "\n"
-    -- Don't pop - leave value on stack (will be cleaned up at return)
 
   SSAFieldStore target _field off value -> do
     emitSSAExpr target
@@ -271,31 +289,83 @@ emitTerminator currentBlock term = do
         destSlot <- getVarSlot dest
         emit $ "PUSHOFF " <> tshow srcSlot <> "\n"
         emit $ "STOREOFF " <> tshow destSlot <> "\n"
-      emit $ "JUMP " <> T.pack target <> "\n"
+      targetLabel <- blockLabelText target
+      emit $ "JUMP " <> targetLabel <> "\n"
 
     TermBranch cond thenBlock elseBlock -> do
       emitSSAExpr cond
+      -- Condition expression produces a boolean (0=false, 1=true)
+      -- JUMPC jumps if top of stack is non-zero (true)
+      -- We want to jump to elseBlock if condition is FALSE, so invert with ISNIL
       emit "ISNIL\n"
-      emit $ "JUMPC " <> T.pack elseBlock <> "\n"
-      -- Insert phi copies for then block
+      -- JUMPC pops the condition value. If false, jump to elseCopyLabel to perform phi copies.
+      elseCopyLabel <- freshLabel "else_copies"
+      emit $ "JUMPC " <> elseCopyLabel <> "\n"
+      -- True branch: perform phi copies for thenBlock before jumping.
       forM_ [(d, s) | (t, d, s) <- copies, t == thenBlock] $ \(dest, src) -> do
         srcSlot <- getVarSlot src
         destSlot <- getVarSlot dest
         emit $ "PUSHOFF " <> tshow srcSlot <> "\n"
         emit $ "STOREOFF " <> tshow destSlot <> "\n"
-      emit $ "JUMP " <> T.pack thenBlock <> "\n"
+      thenLabel <- blockLabelText thenBlock
+      emit $ "JUMP " <> thenLabel <> "\n"
+      -- False branch: perform phi copies for elseBlock before jumping there.
+      emit $ elseCopyLabel <> ":\n"
+      forM_ [(d, s) | (t, d, s) <- copies, t == elseBlock] $ \(dest, src) -> do
+        srcSlot <- getVarSlot src
+        destSlot <- getVarSlot dest
+        emit $ "PUSHOFF " <> tshow srcSlot <> "\n"
+        emit $ "STOREOFF " <> tshow destSlot <> "\n"
+      elseLabel <- blockLabelText elseBlock
+      emit $ "JUMP " <> elseLabel <> "\n"
 
     TermReturn exprOpt -> do
       returnSlot <- asks scgReturnSlotOffset
-      case exprOpt of
-        Just expr -> emitSSAExpr expr
-        Nothing -> emit "PUSHIMM 0\n"
-      emit $ "STOREOFF " <> tshow returnSlot <> "\n"
-      -- Don't pop - value stays on stack until return label pops locals
-      clsName <- asks scgClassName
-      methName <- asks scgMethodName
-      let retLabel = T.pack clsName <> "_" <> T.pack methName <> "_return"
-      emit $ "JUMP " <> retLabel <> "\n"
+      handled <- case exprOpt of
+        Just expr -> emitTailCallIfPossible expr
+        Nothing -> return False
+      unless handled $ do
+        case exprOpt of
+          Just expr -> do
+            emitSSAExpr expr
+            emit $ "STOREOFF " <> tshow returnSlot <> "\n"
+          Nothing -> do
+            emit "PUSHIMM 0\n"
+            emit $ "STOREOFF " <> tshow returnSlot <> "\n"
+        clsName <- asks scgClassName
+        methName <- asks scgMethodName
+        let retLabel = T.pack clsName <> "_" <> T.pack methName <> "_return"
+        emit $ "JUMP " <> retLabel <> "\n"
+
+-- | Attempt tail-call optimization in a return. Returns True if handled.
+-- Temporarily disable SSA TCO to stabilize stack correctness.
+emitTailCallIfPossible :: SSAExpr -> SSACodegen Bool
+emitTailCallIfPossible _ = return False
+
+-- | Emit a tail call by rewriting params/this in-place and jumping to TCO label.
+emitTailCallSSA :: MethodSymbol -> String -> MethodSymbol -> [SSAExpr] -> Maybe SSAExpr -> SSACodegen ()
+emitTailCallSSA _ _ _ _ _ = return ()  -- currently unused (TCO disabled)
+
+-- | Find a method in all classes (used as fallback when type inference fails)
+-- Returns the first class that has a method with the given name
+findMethodInClasses :: ProgramSymbols -> String -> Maybe String
+findMethodInClasses syms methodName =
+  let classes = Map.elems (psClasses syms)
+      classesWithMethod = filter hasMethod classes
+      hasMethod cs = isJust (lookupMethod methodName cs)
+  in case classesWithMethod of
+       (cs:_) -> Just (csName cs)
+       [] -> Nothing
+
+-- | Clean up leftover values from expression evaluation
+-- After an expression result is consumed (e.g., via STOREOFF), clean up
+-- any temporary values left on the stack (like method call arguments)
+-- Note: Only top-level method calls leave garbage; sub-expressions are consumed
+emitExprCleanup :: SSAExpr -> SSACodegen ()
+emitExprCleanup = \case
+  SSACall _ args -> emit $ "ADDSP " <> tshow (negate $ length args + 1) <> "\n"
+  SSAInstanceCall _ _ args -> emit $ "ADDSP " <> tshow (negate $ length args + 1) <> "\n"
+  _ -> return ()  -- Other expressions don't leave garbage on stack
 
 --------------------------------------------------------------------------------
 -- Expression Code Generation
@@ -325,19 +395,41 @@ emitSSAExpr = \case
     emit $ "PUSHOFF " <> tshow slot <> "\n"
 
   SSAUnary op e -> do
+    syms <- asks scgSymbols
+    typeEnv <- asks scgTypeEnv
+    let exprType = inferSSAExprType syms typeEnv e
     emitSSAExpr e
     case op of
       Neg -> do
-        emit "PUSHIMM 0\n"
-        emit "SWAP\n"
-        emit "SUB\n"
+        case exprType of
+          Just t | t == ofPrimitive TString -> emitSSAStringReverse
+          _ -> do
+            emit "PUSHIMM 0\n"
+            emit "SWAP\n"
+            emit "SUB\n"
       Not ->
         emit "ISNIL\n"
 
   SSABinary op l r -> do
-    emitSSAExpr l
-    emitSSAExpr r
-    emitBinaryOp op
+    syms <- asks scgSymbols
+    typeEnv <- asks scgTypeEnv
+    methSym <- asks scgMethodSymbol
+    clsName <- asks scgClassName
+    let lType = inferSSAExprType syms typeEnv l
+        rType = inferSSAExprType syms typeEnv r
+    case stringBinaryEmitterSSA syms methSym clsName typeEnv op lType rType l r of
+      Just emitter -> emitter
+      Nothing -> case op of
+        And -> emitShortCircuitAnd l r
+        Or  -> emitShortCircuitOr l r
+        Concat -> do
+          emitSSAExpr l
+          emitSSAExpr r
+          emitSSAStringConcat
+        _ -> do
+          emitSSAExpr l
+          emitSSAExpr r
+          emitBinaryOp op
 
   SSATernary cond thenE elseE -> do
     elseLabel <- freshLabel "else"
@@ -368,7 +460,10 @@ emitSSAExpr = \case
           Nothing -> T.pack name  -- Fallback
     emit $ "JSR " <> methodLabel <> "\n"
     emit "UNLINK\n"
-    emit $ "ADDSP " <> tshow (negate $ length args + 1) <> "\n"  -- +1 for 'this', return slot stays
+    -- Clean up arguments: after UNLINK, stack is [return_value, this, args...]
+    -- We want to keep return_value (at bottom) and pop this+args (on top)
+    let nArgs = length args + 1  -- +1 for 'this'
+    emit $ "ADDSP " <> tshow (negate nArgs) <> "\n"
 
   SSAInstanceCall target method args -> do
     emit "PUSHIMM 0\n"  -- Return slot
@@ -381,12 +476,19 @@ emitSSAExpr = \case
     className <- asks scgClassName
     let methodLabel = case target of
           SSAThis -> T.pack className <> "_" <> T.pack method  -- 'this' is current class
-          _ -> case inferSSAExprClass syms typeEnv target of
+          _ -> case inferSSAExprClassWithCtx (Just className) syms typeEnv target of
                  Just cn -> T.pack cn <> "_" <> T.pack method
-                 Nothing -> T.pack method  -- Fallback to bare name
+                 Nothing ->
+                   -- Fallback: search all classes for this method
+                   case findMethodInClasses syms method of
+                     Just cn -> T.pack cn <> "_" <> T.pack method
+                     Nothing -> T.pack method  -- Last resort: bare name
     emit $ "JSR " <> methodLabel <> "\n"
     emit "UNLINK\n"
-    emit $ "ADDSP " <> tshow (negate $ length args + 1) <> "\n"  -- +1 for 'this', return slot stays
+    -- Clean up arguments: after UNLINK, stack is [return_value, this, args...]
+    -- We want to keep return_value (at bottom) and pop this+args (on top)
+    let nArgs = length args + 1  -- +1 for 'this'
+    emit $ "ADDSP " <> tshow (negate nArgs) <> "\n"
 
   SSANewObject cn args -> do
     syms <- asks scgSymbols
@@ -417,13 +519,17 @@ emitSSAExpr = \case
     -- Infer target class and look up field offset
     syms <- asks scgSymbols
     typeEnv <- asks scgTypeEnv
-    let offset = case inferSSAExprClass syms typeEnv target of
-          Just className -> case lookupClass className syms of
+    className <- asks scgClassName
+    let targetClass = case target of
+          SSAThis -> Just className  -- Use current class for 'this'
+          _ -> inferSSAExprClassWithCtx (Just className) syms typeEnv target
+        offset = case targetClass of
+          Just cn -> case lookupClass cn syms of
             Just cs -> case fieldOffset field cs of
               Just off -> off
-              Nothing -> 0  -- Field not found, use 0
-            Nothing -> 0  -- Class not found, use 0
-          Nothing -> 0  -- Can't infer type, use 0
+              Nothing -> 0  -- Field not found, default to 0
+            Nothing -> 0  -- Class not found, default to 0
+          Nothing -> 0  -- Can't infer type, default to 0
     emit $ "PUSHIMM " <> tshow offset <> "\n"
     emit "ADD\n"
     emit "PUSHIND\n"
@@ -439,12 +545,166 @@ emitBinaryOp = \case
   Eq  -> emit "EQUAL\n"
   Ne  -> do emit "EQUAL\n"; emit "ISNIL\n"
   Lt  -> emit "LESS\n"
-  Le  -> emit "LESSEQ\n"
+  Le  -> do emit "GREATER\n"; emit "ISNIL\n"
   Gt  -> emit "GREATER\n"
-  Ge  -> emit "GREATEREQ\n"
+  Ge  -> do emit "LESS\n"; emit "ISNIL\n"
   And -> emit "AND\n"
   Or  -> emit "OR\n"
   Concat -> emit "ADD\n"  -- String concatenation uses ADD in SAM
+
+-- | Short-circuit AND for SSA expressions
+emitShortCircuitAnd :: SSAExpr -> SSAExpr -> SSACodegen ()
+emitShortCircuitAnd l r = do
+  falseLabel <- freshLabel "and_false"
+  endLabel <- freshLabel "and_end"
+  emitSSAExpr l
+  emit "ISNIL\n"
+  emit $ "JUMPC " <> falseLabel <> "\n"
+  emitSSAExpr r
+  emit "ISNIL\n"
+  emit $ "JUMPC " <> falseLabel <> "\n"
+  emit "PUSHIMM 1\n"
+  emit $ "JUMP " <> endLabel <> "\n"
+  emit $ falseLabel <> ":\n"
+  emit "PUSHIMM 0\n"
+  emit $ endLabel <> ":\n"
+
+-- | Short-circuit OR for SSA expressions
+emitShortCircuitOr :: SSAExpr -> SSAExpr -> SSACodegen ()
+emitShortCircuitOr l r = do
+  trueLabel <- freshLabel "or_true"
+  falseLabel <- freshLabel "or_false"
+  endLabel <- freshLabel "or_end"
+  emitSSAExpr l
+  emit "ISNIL\n"
+  emit $ "JUMPC " <> trueLabel <> "_check\n"
+  emit "PUSHIMM 1\n"
+  emit $ "JUMP " <> endLabel <> "\n"
+  emit $ trueLabel <> "_check:\n"
+  emitSSAExpr r
+  emit "ISNIL\n"
+  emit $ "JUMPC " <> falseLabel <> "\n"
+  emit "PUSHIMM 1\n"
+  emit $ "JUMP " <> endLabel <> "\n"
+  emit $ falseLabel <> ":\n"
+  emit "PUSHIMM 0\n"
+  emit $ endLabel <> ":\n"
+
+-- | Choose string-aware emitter when either operand is a string.
+stringBinaryEmitterSSA :: ProgramSymbols -> MethodSymbol -> String -> TypeEnv -> BinaryOp -> Maybe ValueType -> Maybe ValueType -> SSAExpr -> SSAExpr -> Maybe (SSACodegen ())
+stringBinaryEmitterSSA syms methSym currentClass tenv op lType rType l r
+  | isString && op `elem` [Eq, Ne, Lt, Gt] = Just $ do
+      emitSSAExpr l
+      emitSSAExpr r
+      emitSSAStringCompare op
+  | isString && op == Add = Just $ do
+      emitSSAExpr l
+      emitSSAExpr r
+      emitSSAStringConcat
+  | lType == Just (ofPrimitive TString) && rType == Just (ofPrimitive TInt) =
+      Just $ do
+        emitSSAExpr l
+        emitSSAExpr r
+        emitSSAStringRepeat False
+  | lType == Just (ofPrimitive TInt) && rType == Just (ofPrimitive TString) =
+      Just $ do
+        emitSSAExpr l
+        emitSSAExpr r
+        emitSSAStringRepeat True
+  | otherwise = Nothing
+  where
+    isString =
+      lType == Just (ofPrimitive TString)
+        || rType == Just (ofPrimitive TString)
+        || isStringLiteral l || isStringLiteral r
+        || isConcatExpr l || isConcatExpr r
+        || isStringVarUse l || isStringVarUse r
+        || isStringFieldUse l || isStringFieldUse r
+
+    isStringLiteral = \case
+      SSAStr _ -> True
+      _ -> False
+
+    isConcatExpr = \case
+      SSABinary Add l1 r1 ->
+        let lt' = inferSSAExprType syms tenv l1
+            rt' = inferSSAExprType syms tenv r1
+        in lt' == Just (ofPrimitive TString) || rt' == Just (ofPrimitive TString) || isStringLiteral l1 || isStringLiteral r1
+      _ -> False
+
+    isStringVarUse = \case
+      SSAUse v ->
+        case inferSSAExprType syms tenv (SSAUse v) of
+          Just t -> t == ofPrimitive TString
+          Nothing -> lookupVarType (ssaName v)
+      _ -> False
+
+    isStringFieldUse = \case
+      SSAFieldAccess target field ->
+        let targetClass = case target of
+              SSAThis -> Just currentClass
+              _ -> inferSSAExprClassWithCtx (Just currentClass) syms tenv target
+        in case targetClass of
+             Just cn -> case lookupClass cn syms >>= lookupField field of
+               Just vs -> vsType vs == ofPrimitive TString
+               Nothing -> False
+             Nothing -> False
+      _ -> False
+
+    lookupVarType name =
+      let paramType = [vsType vs | vs <- msParams methSym, vsName vs == name]
+          localType = [vsType vs | vs <- msLocals methSym, vsName vs == name]
+          candidate = paramType ++ localType
+      in case candidate of
+           (t:_) -> t == ofPrimitive TString
+           _ -> False
+
+-- | Emit string comparison using runtime helper.
+emitSSAStringCompare :: BinaryOp -> SSACodegen ()
+emitSSAStringCompare op = do
+  emit "LINK\n"
+  emit $ "JSR " <> strCompareLabel <> "\n"
+  emit "UNLINK\n"
+  emit "ADDSP -1\n"
+  case op of
+    Eq -> do
+      emit "PUSHIMM 0\n"
+      emit "EQUAL\n"
+    Ne -> do
+      emit "PUSHIMM 0\n"
+      emit "EQUAL\n"
+      emit "ISNIL\n"
+    Lt -> do
+      emit "PUSHIMM -1\n"
+      emit "EQUAL\n"
+    Gt -> do
+      emit "PUSHIMM 1\n"
+      emit "EQUAL\n"
+    _ -> return ()
+
+-- | Emit string concatenation using runtime helper.
+emitSSAStringConcat :: SSACodegen ()
+emitSSAStringConcat = do
+  emit "LINK\n"
+  emit $ "JSR " <> strConcatLabel <> "\n"
+  emit "UNLINK\n"
+  emit "ADDSP -1\n"
+
+-- | Emit string repetition (string * int).
+emitSSAStringRepeat :: Bool -> SSACodegen ()
+emitSSAStringRepeat swapOperands = do
+  when swapOperands $ emit "SWAP\n"
+  emit "LINK\n"
+  emit $ "JSR " <> strRepeatLabel <> "\n"
+  emit "UNLINK\n"
+  emit "ADDSP -1\n"
+
+-- | Emit string reverse (~str).
+emitSSAStringReverse :: SSACodegen ()
+emitSSAStringReverse = do
+  emit "LINK\n"
+  emit $ "JSR " <> strReverseLabel <> "\n"
+  emit "UNLINK\n"
 
 --------------------------------------------------------------------------------
 -- Phi Node Handling
@@ -478,13 +738,31 @@ blockPhiCopies _cfg SSABlock{..} =
 emit :: Text -> SSACodegen ()
 emit t = modify $ \s -> s { scgCode = scgCode s <> B.fromText t }
 
+-- | Generate predictable TCO entry label.
+methodTCOLabelText :: String -> String -> Text
+methodTCOLabelText clsName methName = T.pack clsName <> "_" <> T.pack methName <> "_tco"
+
+-- | Generate a method-specific prefix for block labels.
+methodLabelPrefixText :: SSACodegen Text
+methodLabelPrefixText = do
+  cls <- asks scgClassName
+  meth <- asks scgMethodName
+  return $ T.pack cls <> "_" <> T.pack meth
+
+-- | Qualify a block label with the current method to avoid collisions.
+blockLabelText :: BlockId -> SSACodegen Text
+blockLabelText bid = do
+  prefix <- methodLabelPrefixText
+  return $ prefix <> "__" <> T.pack bid
+
 -- | Generate a fresh label
 freshLabel :: Text -> SSACodegen Text
 freshLabel prefix = do
   st <- get
   let n = scgLabelCounter st
   put st { scgLabelCounter = n + 1 }
-  return $ prefix <> "_" <> T.pack (show n)
+  methodPrefix <- methodLabelPrefixText
+  return $ methodPrefix <> "_" <> prefix <> "_" <> T.pack (show n)
 
 -- | Get stack slot for a variable
 getVarSlot :: String -> SSACodegen Int

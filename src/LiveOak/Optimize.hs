@@ -19,18 +19,19 @@ module LiveOak.Optimize
   ) where
 
 import LiveOak.Ast
+import LiveOak.Symbol (ProgramSymbols)
 import qualified LiveOak.DataFlow as DF
 
 -- | Apply all optimizations to a program.
 -- Runs multiple passes until the program stabilizes or max iterations reached.
-optimize :: Program -> Program
-optimize = id
+optimize :: ProgramSymbols -> Program -> Program
+optimize _syms = id
 
 -- | Single pass of all optimizations.
-optimizeOnce :: Program -> Program
-optimizeOnce =
+optimizeOnce :: ProgramSymbols -> Program -> Program
+optimizeOnce syms =
     eliminateDeadCode
-  . DF.optimizeSSADataFlow
+  . DF.optimizeSSADataFlow syms
   . DF.optimizeASTDataFlow
   . constantFold
 

@@ -9,6 +9,7 @@ import System.Directory (listDirectory, doesFileExist)
 import System.FilePath ((</>), takeExtension, takeBaseName, replaceExtension)
 import Data.List (sort)
 import Control.Monad (forM)
+import Control.Exception (try, SomeException)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
 
@@ -31,14 +32,18 @@ executionTests = testGroup "Execution" $
   [ testCase "All programs with .expected files execute correctly" $ do
       files <- getLoFilesWithExpected validProgramsDir
       results <- forM files $ \file -> do
-        result <- runSimulatorTest file
+        putStrLn $ "Testing " ++ takeBaseName file
+        result <- try (runSimulatorTestThrows file) :: IO (Either SomeException ())
+        case result of
+          Left e -> putStrLn $ "  FAILED: " ++ show e
+          Right () -> putStrLn "  OK"
         return (file, result)
-      let failures = [(f, err) | (f, Left err) <- results]
-      if null failures
+      let failedTests = [(f, show err) | (f, Left err) <- results]
+      if null failedTests
         then return ()
         else assertFailure $ unlines $
           "The following programs failed execution:" :
-          [takeBaseName f ++ ": " ++ err | (f, err) <- failures]
+          [takeBaseName f ++ ": " ++ err | (f, err) <- failedTests]
   ]
 
 -- | Get all .lo files that have corresponding .expected files.
@@ -72,6 +77,14 @@ runSimulatorTest loFile = do
           if result == expectedInt
             then return $ Right ()
             else return $ Left $ "Expected " ++ show expectedInt ++ " but got " ++ show result
+
+-- | Run a simulator test, throwing exceptions on failure.
+runSimulatorTestThrows :: FilePath -> IO ()
+runSimulatorTestThrows loFile = do
+  result <- runSimulatorTest loFile
+  case result of
+    Left err -> error err
+    Right () -> return ()
 
 -- | Show a SAM error as a string.
 showSamError :: SamError -> String

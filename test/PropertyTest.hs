@@ -14,6 +14,7 @@ import System.IO.Unsafe (unsafePerformIO)
 
 import LiveOak.Types
 import LiveOak.Ast
+import LiveOak.Symbol (ProgramSymbols, emptySymbols)
 import LiveOak.Parser (parseProgram)
 import LiveOak.Peephole (parseSam, optimize, emitSam, SamInstr(..))
 import qualified LiveOak.Optimize as Opt
@@ -357,9 +358,9 @@ prop_constFoldInt = forAll arbitrary $ \(n :: Int) ->
 
 -- | Optimizing the AST twice should give the same result
 prop_optimizerIdempotent :: Property
-prop_optimizerIdempotent = forAll genSimpleProgram $ \prog ->
-  let opt1 = Opt.optimize prog
-      opt2 = Opt.optimize opt1
+prop_optimizerIdempotent = forAll genSimpleProgWithSymbols $ \(prog, syms) ->
+  let opt1 = Opt.optimize syms prog
+      opt2 = Opt.optimize syms opt1
   in opt1 == opt2
 
 -- | Generate a simple valid program
@@ -379,6 +380,14 @@ genSimpleProgram = do
         , classMethods = [mainMethod]
         }
   return $ Program [mainClass]
+
+-- | Generate a simple program with its symbol table
+genSimpleProgWithSymbols :: Gen (Program, ProgramSymbols)
+genSimpleProgWithSymbols = do
+  prog <- genSimpleProgram
+  -- For generated programs, use empty symbols
+  -- (Real parsing/symbol building would be too complex for property tests)
+  return (prog, emptySymbols)
 
 genSimpleStmt :: Gen Stmt
 genSimpleStmt = do

@@ -44,6 +44,7 @@ library
                     , LiveOak.Coalesce
                     , LiveOak.DCE
                     , LiveOak.StringRuntime
+                    , LiveOak.SSATypeInfer
                     , LiveOak.Compiler
                     , LiveOak.Sam
                     , LiveOak.TailCall
@@ -83,6 +84,7 @@ test-suite liveoak-test
     build-depends:    base >= 4.17 && < 5
                     , liveoak
                     , text >= 2.0
+                    , containers >= 0.6
                     , tasty >= 1.4
                     , tasty-hunit >= 0.10
                     , tasty-quickcheck >= 0.10

@@ -72,6 +72,7 @@ compileWithWarnings path source = do
   -- Use SSA-based codegen
   let optimizedProgram = optimize symbols program
       ssaProg = SSA.toSSA symbols optimizedProgram
+      -- TEMPORARILY DISABLED: optimizedSSA = SSA.optimizeSSAProgram ssaProg
   code <- SSACodegen.generateFromSSA ssaProg symbols
 
   -- Peephole optimize SAM code
@@ -92,8 +93,7 @@ compileCollectAllErrors path source =
       in if null allErrors
          then let optimizedProgram = optimize symbols program
                   ssaProg = SSA.toSSA symbols optimizedProgram
-                  optimizedSSA = SSA.optimizeSSAProgram ssaProg
-              in case SSACodegen.generateFromSSA optimizedSSA symbols of
+              in case SSACodegen.generateFromSSA ssaProg symbols of
                    Left codegenErr -> Left [codegenErr]
                    Right code ->
                      let optimizedCode = Peephole.optimizeText code

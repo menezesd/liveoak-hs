@@ -8,10 +8,11 @@ module LiveOak.DataFlow.SSA
   ) where
 
 import LiveOak.Ast (Program)
+import LiveOak.Symbol (ProgramSymbols)
 import qualified LiveOak.SSA as SSA
 
 -- | Run the SSA optimizations exposed by the SSA module.
-optimizeSSADataFlow :: Program -> Program
+optimizeSSADataFlow :: ProgramSymbols -> Program -> Program
 optimizeSSADataFlow = SSA.optimizeSSA
 
 

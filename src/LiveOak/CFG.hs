@@ -43,6 +43,7 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.List (foldl')
+import Debug.Trace (trace)
 
 --------------------------------------------------------------------------------
 -- Types
@@ -101,7 +102,7 @@ cfgFromBlocks entry blocks =
 -- | Convert an SSA block to a CFG block
 convertBlock :: SSABlock -> CFGBlock
 convertBlock SSABlock{..} =
-  let (instrs, term) = splitTerminator blockInstrs
+  let (instrs, term) = splitTerminator blockLabel blockInstrs
   in CFGBlock
     { cfgBlockId = blockLabel
     , cfgPhis = blockPhis
@@ -110,14 +111,15 @@ convertBlock SSABlock{..} =
     }
 
 -- | Split instructions into non-terminators and terminator
-splitTerminator :: [SSAInstr] -> ([SSAInstr], Terminator)
-splitTerminator instrs =
+-- Empty blocks (like join blocks) get a void return terminator
+splitTerminator :: String -> [SSAInstr] -> ([SSAInstr], Terminator)
+splitTerminator _blockId instrs =
   case reverse instrs of
-    [] -> ([], TermReturn Nothing)  -- Empty block - implicit return
+    [] -> ([], TermReturn Nothing)  -- Empty block gets void return (can be optimized away later)
     (last':rest) ->
       case instrToTerm last' of
         Just term -> (reverse rest, term)
-        Nothing -> (instrs, TermReturn Nothing)  -- No terminator found
+        Nothing -> (instrs, TermReturn Nothing)  -- No explicit terminator, add implicit return
 
 -- | Try to convert an instruction to a terminator
 instrToTerm :: SSAInstr -> Maybe Terminator
@@ -207,7 +209,7 @@ postorder cfg = snd $ go Set.empty [] (cfgEntry cfg)
               (visited'', acc') = foldl (\(v, a) s -> go v a s)
                                         (visited', acc)
                                         (successors cfg bid)
-          in (visited'', bid : acc')
+          in (visited'', acc' ++ [bid])  -- Append bid after visiting children
 
 -- | Reverse postorder traversal (parent before children)
 -- This is the order needed for forward dataflow analysis
