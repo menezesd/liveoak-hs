@@ -17,21 +17,14 @@ module LiveOak.SSA
     -- * Conversion
   , toSSA
   , toSSAWithCFG    -- ^ Uses CFG-based phi placement
-  , fromSSA
 
     -- * SSA Optimizations
   , ssaDeadCodeElim
   , ssaCopyProp
   , simplifyPhis
-  , inline
-  , strengthReduce
-  , tailCallOptimize
-  , stackAllocate
   , ssaPeephole
-  , ssaOptPipeline
 
     -- * CFG-Based Optimization Pipeline
-  , optimizeSSA         -- ^ Full CFG-based SSA optimization (WARNING: broken for complex programs)
   , optimizeSSAProgram  -- ^ Optimize SSA program, return SSA (for use with SSACodegen)
   , ssaBasicPipeline    -- ^ Basic safe SSA optimizations
   ) where
@@ -46,17 +39,12 @@ import qualified LiveOak.GVN as GVN
 import qualified LiveOak.LICM as LICM
 import qualified LiveOak.SCCP as SCCP
 import LiveOak.Loop (findLoops)
-import qualified LiveOak.Inline as Inline
-import qualified LiveOak.StrengthReduce as SR
-import qualified LiveOak.TailCall as TCO
-import qualified LiveOak.Escape as Escape
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Control.Monad.State
 import Data.List (foldl')
-import qualified LiveOak.Coalesce as Coalesce
 
 --------------------------------------------------------------------------------
 -- Conversion to SSA
@@ -620,87 +608,6 @@ fillPhiArg predId renSt phi =
   in phi { phiArgs = args' }
 
 --------------------------------------------------------------------------------
--- Conversion from SSA
---------------------------------------------------------------------------------
-
--- | Convert SSA back to normal form (for code generation)
--- WARNING: This function is BROKEN for programs with complex control flow!
--- It flattens all basic blocks linearly, losing while loops, if/else structure.
--- The instrToStmt function converts SSAJump -> empty block and SSABranch -> empty if.
---
--- PROPER FIX: Use LiveOak.SSACodegen.generateFromSSA instead of converting back to AST.
--- That generates code directly from the CFG without needing control flow reconstruction.
---
--- ALTERNATIVE FIX: Implement proper control flow structuring algorithm to rebuild
--- loops and conditionals from the CFG (complex).
-fromSSA :: SSAProgram -> Program
-fromSSA (SSAProgram classes) = Program (map ssaClassToNormal classes)
-
--- | Convert SSA class back to normal AST
-ssaClassToNormal :: SSAClass -> ClassDecl
-ssaClassToNormal SSAClass{..} = ClassDecl
-  { className = ssaClassName
-  , classFields = ssaClassFields
-  , classMethods = map ssaMethodToNormal ssaClassMethods
-  }
-
--- | Convert SSA method back to normal AST
-ssaMethodToNormal :: SSAMethod -> MethodDecl
-ssaMethodToNormal method@SSAMethod{..} =
-  let params = [ParamDecl (ssaName v) (getVarType v) | v <- ssaMethodParams]
-      -- Build CFG and DomTree for coalescing
-      cfg = buildCFG method
-      domTree = computeDominators cfg
-      -- Apply coalescing to eliminate phi copies
-      coalesceResult = Coalesce.coalescePhiCopies cfg domTree ssaMethodBlocks
-      coalescedBlocks = Coalesce.applyCoalescing coalesceResult ssaMethodBlocks
-      -- Convert coalesced blocks back to statements
-      body = Block (concatMap blockToStmts coalescedBlocks) 0
-  in MethodDecl ssaMethodClassName ssaMethodName params ssaMethodReturnSig body
-
--- | Get the type from an SSAVar, defaulting to Int if unknown
--- (This shouldn't happen for parameters which always have types)
-getVarType :: SSAVar -> ValueType
-getVarType v = case ssaVarType v of
-  Just t -> t
-  Nothing -> error $ "SSA: Missing type for parameter " ++ ssaName v
-
--- | Convert a single block to statements
-blockToStmts :: SSABlock -> [Stmt]
-blockToStmts SSABlock{..} = map instrToStmt blockInstrs
-
-instrToStmt :: SSAInstr -> Stmt
-instrToStmt = \case
-  SSAAssign v e -> Assign (varToName v) (ssaExprToExpr e) 0
-  SSAFieldStore t f off v -> FieldAssign (ssaExprToExpr t) f off (ssaExprToExpr v) 0
-  SSAReturn e -> Return (ssaExprToExpr <$> e) 0
-  SSAJump _ -> Block [] 0  -- Jumps handled by control flow
-  SSABranch c _t _ -> If (ssaExprToExpr c) (Block [] 0) (Block [] 0) 0
-  SSAExprStmt e -> ExprStmt (ssaExprToExpr e) 0
-
--- | Convert SSA variable back to original name.
--- We use the base name, not the versioned name, since the semantic
--- analyzer only knows about the original variable names.
-varToName :: SSAVar -> String
-varToName (SSAVar name _ _) = name
-
-ssaExprToExpr :: SSAExpr -> Expr
-ssaExprToExpr = \case
-  SSAInt n -> IntLit n 0
-  SSABool b -> BoolLit b 0
-  SSAStr s -> StrLit s 0
-  SSANull -> NullLit 0
-  SSAUse v -> Var (varToName v) 0
-  SSAThis -> This 0
-  SSAUnary op e -> Unary op (ssaExprToExpr e) 0
-  SSABinary op l r -> Binary op (ssaExprToExpr l) (ssaExprToExpr r) 0
-  SSATernary c t e -> Ternary (ssaExprToExpr c) (ssaExprToExpr t) (ssaExprToExpr e) 0
-  SSACall name args -> Call name (map ssaExprToExpr args) 0
-  SSAInstanceCall t m args -> InstanceCall (ssaExprToExpr t) m (map ssaExprToExpr args) 0
-  SSANewObject cn args -> NewObject cn (map ssaExprToExpr args) 0
-  SSAFieldAccess t f -> FieldAccess (ssaExprToExpr t) f 0
-
---------------------------------------------------------------------------------
 -- SSA Optimizations
 --------------------------------------------------------------------------------
 
@@ -954,45 +861,6 @@ simplifyPhis (SSAProgram classes) =
          else (phi : phis, copies)
 
 --------------------------------------------------------------------------------
--- Inline Wrapper
---------------------------------------------------------------------------------
-
--- | Inline functions in the program
-inline :: SSAProgram -> SSAProgram
-inline prog = Inline.inlineOptProgram (Inline.inlineFunctions Inline.defaultHeuristics prog)
-
---------------------------------------------------------------------------------
--- Strength Reduction Wrapper
---------------------------------------------------------------------------------
-
--- | Apply strength reduction to the program
-strengthReduce :: SSAProgram -> SSAProgram
-strengthReduce (SSAProgram classes) = SSAProgram (map srClass classes)
-  where
-    srClass c = c { ssaClassMethods = map srMethod (ssaClassMethods c) }
-    srMethod method =
-      let cfg = buildCFG method
-          domTree = computeDominators cfg
-          loops = findLoops cfg domTree
-          srResult = SR.reduceStrength cfg domTree loops (ssaMethodBlocks method)
-      in method { ssaMethodBlocks = SR.srOptBlocks srResult }
-
---------------------------------------------------------------------------------
--- Tail Call Optimization Wrapper
---------------------------------------------------------------------------------
-
--- | Apply tail call optimization to the program
-tailCallOptimize :: SSAProgram -> SSAProgram
-tailCallOptimize (SSAProgram classes) = SSAProgram (map tcoClass classes)
-  where
-    tcoClass c = c { ssaClassMethods = map tcoMethod (ssaClassMethods c) }
-    tcoMethod method =
-      let className = ssaMethodClassName method
-          methodName = ssaMethodName method
-          tcoResult = TCO.optimizeTailCalls className methodName (ssaMethodBlocks method)
-      in method { ssaMethodBlocks = TCO.tcoOptBlocks tcoResult }
-
---------------------------------------------------------------------------------
 -- SSA Peephole Optimization
 --------------------------------------------------------------------------------
 
@@ -1037,20 +905,6 @@ peepholeExpr = \case
   other -> other
 
 --------------------------------------------------------------------------------
--- Stack Allocation Wrapper
---------------------------------------------------------------------------------
-
--- | Perform escape analysis and mark objects for stack allocation
-stackAllocate :: SSAProgram -> SSAProgram
-stackAllocate (SSAProgram classes) = SSAProgram (map saClass classes)
-  where
-    saClass c = c { ssaClassMethods = map saMethod (ssaClassMethods c) }
-    saMethod method =
-      let cfg = buildCFG method
-          escapeResult = Escape.analyzeEscape cfg (ssaMethodBlocks method)
-      in method { ssaMethodBlocks = Escape.stackAllocate escapeResult (ssaMethodBlocks method) }
-
---------------------------------------------------------------------------------
 -- CFG-Based SSA Optimization Pipeline
 --------------------------------------------------------------------------------
 
@@ -1072,32 +926,9 @@ ssaBasicPipeline =
   . sccp
   . simplifyPhis
 
--- | Full CFG-based SSA optimization.
--- Converts to SSA with proper phi placement, applies optimizations, then
--- converts back. NOTE: fromSSA loses control flow - this is broken for complex programs!
--- Use optimizeSSAProgram + SSACodegen instead.
-optimizeSSA :: ProgramSymbols -> Program -> Program
-optimizeSSA syms prog =
-  let ssaProg = toSSA syms prog
-      optimized = optimizeSSAProgram ssaProg
-  in fromSSA optimized
-
 -- | Apply optimization with explicit iteration limit.
 fixedPointWithLimit :: Eq a => Int -> (a -> a) -> a -> a
 fixedPointWithLimit 0 _ x = x  -- Max iterations reached
 fixedPointWithLimit n f x =
   let x' = f x
   in if x' == x then x else fixedPointWithLimit (n - 1) f x'
-
--- | SSA optimization pipeline (old, kept for reference)
-ssaOptPipeline :: SSAProgram -> SSAProgram
-ssaOptPipeline =
-    inline
-  . strengthReduce
-  . tailCallOptimize
-  . gvn
-  . sccp
-  . licm
-  . ssaDeadCodeElim
-  . ssaCopyProp
-  . simplifyPhis

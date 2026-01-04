@@ -1,18 +1,8 @@
 {-# LANGUAGE RecordWildCards #-}
 
 -- | SSA-level dataflow orchestration.
--- For now this simply delegates to the safer SSA passes that already
--- exist in the SSA module.
+-- Currently empty - SSA optimizations are applied in the Compiler module
+-- using SSA.optimizeSSAProgram with SSACodegen.
 module LiveOak.DataFlow.SSA
-  ( optimizeSSADataFlow
+  ( -- Currently no exports - SSA optimization is done in Compiler.hs
   ) where
-
-import LiveOak.Ast (Program)
-import LiveOak.Symbol (ProgramSymbols)
-import qualified LiveOak.SSA as SSA
-
--- | Run the SSA optimizations exposed by the SSA module.
-optimizeSSADataFlow :: ProgramSymbols -> Program -> Program
-optimizeSSADataFlow = SSA.optimizeSSA
-
-
