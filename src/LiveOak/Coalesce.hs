@@ -89,10 +89,10 @@ coalescePhiCopies cfg domTree blocks =
 
 -- | Find copy-related pairs from phi nodes
 findPhiCopies :: [SSABlock] -> [(String, String)]
-findPhiCopies blocks = concatMap blockPhiCopies blocks
+findPhiCopies = concatMap blockPhiCopies
   where
     blockPhiCopies SSABlock{..} =
-      [ (ssaName (phiVar phi), ssaName argVar)
+      [ (varNameString (ssaName (phiVar phi)), varNameString (ssaName argVar))
       | phi <- blockPhis
       , (_, argVar) <- phiArgs phi
       ]
@@ -169,5 +169,5 @@ applyToExpr coalesced = \case
 -- | Rename a variable according to coalescing
 renameVar :: Map String String -> SSAVar -> SSAVar
 renameVar coalesced var =
-  let rep = findRep coalesced (ssaName var)
-  in var { ssaName = rep }
+  let rep = findRep coalesced (varNameString (ssaName var))
+  in var { ssaName = varName rep }

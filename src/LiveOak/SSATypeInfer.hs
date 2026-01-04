@@ -21,16 +21,15 @@ import Data.List (foldl')
 
 import LiveOak.SSATypes
 import LiveOak.Types (ValueType(..), Type(..), ofPrimitive, ofObject, typeClassName)
-import LiveOak.Symbol (ProgramSymbols, lookupClass, lookupField, lookupProgramMethod, csFieldOrder, vsType, msReturnType)
+import LiveOak.Symbol (ProgramSymbols, lookupClass, lookupField, lookupProgramMethod, vsType, msReturnType)
 import LiveOak.Ast (UnaryOp(..), BinaryOp(..))
-import qualified LiveOak.Ast as Ast
 
 --------------------------------------------------------------------------------
 -- Type Environment
 --------------------------------------------------------------------------------
 
 -- | Type environment: tracks types of SSA variables
-type TypeEnv = Map (String, Int) ValueType
+type TypeEnv = Map VarKey ValueType
 
 -- | Build a type environment from SSA blocks using a small fixed-point pass.
 -- Seeds with parameter and annotated variable types, then iterates until no change.
@@ -130,18 +129,14 @@ inferSSAExprTypeWithClass classCtx syms env = \case
     et <- inferSSAExprTypeWithClass classCtx syms env e
     if tt == et then Just tt else Nothing
 
-  SSACall name _args ->
+  SSACall _name _args ->
     -- Would need to resolve function return type from symbol table
     -- For now, assume int
     Just (ofPrimitive TInt)
 
   SSAInstanceCall target method _args -> do
     targetClass <- inferSSAExprClassWithCtx classCtx syms env target
-    case lookupProgramMethod targetClass method syms of
-      Just ms -> case msReturnType ms of
-        Just retType -> Just retType
-        Nothing -> Nothing
-      Nothing -> Nothing
+    msReturnType =<< lookupProgramMethod targetClass method syms
 
   SSANewObject className _args ->
     Just (ofObject className)

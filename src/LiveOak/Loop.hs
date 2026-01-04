@@ -1,5 +1,3 @@
-{-# LANGUAGE RecordWildCards #-}
-
 -- | Natural loop detection and analysis.
 -- Uses dominance information to find back edges and compute loop bodies.
 module LiveOak.Loop
@@ -192,10 +190,7 @@ isLoopHeader loops bid = Map.member bid loops
 
 -- | Get the nesting depth of a block (0 if not in any loop)
 loopDepth :: LoopNest -> BlockId -> Int
-loopDepth loops bid =
-  case innerMostLoop loops bid of
-    Just loop -> loopNestDepth loop
-    Nothing -> 0
+loopDepth loops bid = maybe 0 loopNestDepth (innerMostLoop loops bid)
 
 -- | Get the innermost loop containing a block
 innerMostLoop :: LoopNest -> BlockId -> Maybe Loop
@@ -225,14 +220,14 @@ loopExits cfg loop =
 -- 2. Defined outside the loop
 -- 3. Themselves loop-invariant
 isLoopInvariant :: Loop -> Set String -> SSAExpr -> Bool
-isLoopInvariant _loop defsInLoop expr = go expr
+isLoopInvariant _loop defsInLoop = go
   where
     go (SSAInt _) = True
     go (SSABool _) = True
     go (SSAStr _) = True
     go SSANull = True
     go SSAThis = True  -- 'this' doesn't change
-    go (SSAUse var) = not (Set.member (ssaName var) defsInLoop)
+    go (SSAUse var) = not (Set.member (varNameString (ssaName var)) defsInLoop)
     go (SSAUnary _ e) = go e
     go (SSABinary _ l r) = go l && go r
     go (SSATernary c t e) = go c && go t && go e

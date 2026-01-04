@@ -79,7 +79,7 @@ splitEdgeSSA :: (CFG, Map BlockId SSABlock, [SSABlock]) ->
                 (CFG, Map BlockId SSABlock, [SSABlock])
 splitEdgeSSA (cfg, blockMap, newBlocks) (from, to) =
   let -- Create new block name
-      splitName = BlockId (blockIdName from ++ "_to_" ++ blockIdName to)
+      splitName = blockId (blockIdName from ++ "_to_" ++ blockIdName to)
       -- Create new block with just a jump
       newBlock = SSABlock
         { blockLabel = splitName
@@ -125,16 +125,15 @@ updatePhiPreds oldPred newPred block@SSABlock{..} =
 
 -- | Convert phi nodes to parallel copies for a specific predecessor
 phisToCopies :: BlockId -> [PhiNode] -> [ParallelCopy]
-phisToCopies fromBlock phis =
-  mapMaybe (phiToCopy fromBlock) phis
+phisToCopies fromBlock = mapMaybe (phiToCopy fromBlock)
 
 -- | Convert a single phi to a copy (if applicable for this predecessor)
 phiToCopy :: BlockId -> PhiNode -> Maybe ParallelCopy
 phiToCopy fromBlock PhiNode{..} =
   case lookup fromBlock phiArgs of
     Just srcVar -> Just $ ParallelCopy
-      { pcDest = ssaName phiVar
-      , pcSrc = ssaName srcVar
+      { pcDest = varNameString (ssaName phiVar)
+      , pcSrc = varNameString (ssaName srcVar)
       , pcFromBlock = fromBlock
       }
     Nothing -> Nothing
@@ -260,13 +259,13 @@ insertCopies copyMap (acc, count) (bid, block@SSABlock{..}) =
 copyToInstr :: SeqCopy -> SSAInstr
 copyToInstr = \case
   CopyMove dest src ->
-    SSAAssign (SSAVar dest 0 Nothing) (SSAUse (SSAVar src 0 Nothing))
+    SSAAssign (SSAVar (varName dest) 0 Nothing) (SSAUse (SSAVar (varName src) 0 Nothing))
   CopySwap dest src ->
     -- Swap is typically lowered to multiple moves with temp
     -- For now, treat as a move (would need runtime support for actual swap)
-    SSAAssign (SSAVar dest 0 Nothing) (SSAUse (SSAVar src 0 Nothing))
+    SSAAssign (SSAVar (varName dest) 0 Nothing) (SSAUse (SSAVar (varName src) 0 Nothing))
   CopyTemp dest src ->
-    SSAAssign (SSAVar dest 0 Nothing) (SSAUse (SSAVar src 0 Nothing))
+    SSAAssign (SSAVar (varName dest) 0 Nothing) (SSAUse (SSAVar (varName src) 0 Nothing))
 
 -- | Insert instructions before the terminator
 insertBeforeTerminator :: [SSAInstr] -> [SSAInstr] -> [SSAInstr]

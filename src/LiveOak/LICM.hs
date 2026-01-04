@@ -161,8 +161,8 @@ hoistPass :: CFG -> DomTree -> Loop -> BlockId -> Set String -> LICM Bool
 hoistPass _cfg domTree loop preheader defsInLoop = do
   blockMap <- gets licmBlockMap
   let bodyBlocks = [b | bid <- Set.toList (loopBody loop)
-                      , Just b <- [Map.lookup bid blockMap]
                       , bid /= loopHeader loop  -- Don't hoist from header (has phis)
+                      , Just b <- [Map.lookup bid blockMap]
                       ]
   -- Find hoistable instructions
   hoistable <- fmap concat $ forM bodyBlocks $ \block -> do

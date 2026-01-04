@@ -13,6 +13,9 @@ module LiveOak.StrengthReduce
   , InductionVar(..)
   , findInductionVars
   , classifyIV
+
+    -- * Linear Function Test Replacement
+  , replaceLFT
   ) where
 
 import LiveOak.SSATypes
@@ -86,7 +89,7 @@ findInductionVars loop blockMap =
 -- | Build a map from variable names to their defining expressions
 buildDefMap :: [SSABlock] -> Map String SSAExpr
 buildDefMap blocks = Map.fromList
-  [ (ssaName var, expr)
+  [ (varNameString (ssaName var), expr)
   | block <- blocks
   , SSAAssign var expr <- blockInstrs block
   ]
@@ -98,16 +101,16 @@ findBasicIVs loop defMap SSABlock{..} =
 
 -- | Classify a phi node as a basic IV
 classifyAsBasicIV :: Loop -> Map String SSAExpr -> BlockId -> PhiNode -> Maybe InductionVar
-classifyAsBasicIV loop defMap bid PhiNode{..} =
+classifyAsBasicIV loop defMap _bid PhiNode{..} =
   -- A basic IV has:
   -- 1. An initial value from outside the loop
   -- 2. An update of the form iv = iv + constant from inside the loop
-  let (outsideArgs, insideArgs) = partitionArgs loop phiArgs
-      phiVarName = ssaName phiVar
+  let (outsideArgs, insideArgs) = partitionArgs phiArgs
+      phiVarName = varNameString (ssaName phiVar)
   in case (outsideArgs, insideArgs) of
     ([(_, initVar)], [(_, stepVar)]) ->
       -- Look up the definition of stepVar and extract the step
-      let step = extractStep phiVarName (ssaName stepVar) defMap
+      let step = extractStep phiVarName (varNameString (ssaName stepVar)) defMap
       in Just $ BasicIV
         { ivVar = phiVarName
         , ivInit = SSAUse initVar
@@ -115,8 +118,8 @@ classifyAsBasicIV loop defMap bid PhiNode{..} =
         }
     _ -> Nothing
   where
-    partitionArgs loop' args =
-      let loopBlocks = loopBody loop'
+    partitionArgs args =
+      let loopBlocks = loopBody loop
       in ( [(p, v) | (p, v) <- args, not (Set.member p loopBlocks)]
          , [(p, v) | (p, v) <- args, Set.member p loopBlocks]
          )
@@ -127,42 +130,42 @@ extractStep :: String -> String -> Map String SSAExpr -> Int
 extractStep phiVarName stepVarName defMap =
   case Map.lookup stepVarName defMap of
     Just (SSABinary Add (SSAUse v) (SSAInt n))
-      | ssaName v == phiVarName -> n
+      | varNameString (ssaName v) == phiVarName -> n
     Just (SSABinary Add (SSAInt n) (SSAUse v))
-      | ssaName v == phiVarName -> n
+      | varNameString (ssaName v) == phiVarName -> n
     Just (SSABinary Sub (SSAUse v) (SSAInt n))
-      | ssaName v == phiVarName -> negate n
+      | varNameString (ssaName v) == phiVarName -> negate n
     _ -> 1  -- Default to 1 if we can't determine the step
 
 -- | Find derived induction variables
 findDerivedIVs :: Loop -> Set String -> SSABlock -> [InductionVar]
-findDerivedIVs loop basicIVNames SSABlock{..} =
+findDerivedIVs _loop basicIVNames SSABlock{..} =
   mapMaybe (classifyAsDerivedIV basicIVNames) blockInstrs
 
 -- | Classify an instruction as a derived IV
 classifyAsDerivedIV :: Set String -> SSAInstr -> Maybe InductionVar
 classifyAsDerivedIV basicIVNames = \case
   SSAAssign var (SSABinary Mul (SSAUse base) (SSAInt k))
-    | Set.member (ssaName base) basicIVNames ->
+    | Set.member (varNameString (ssaName base)) basicIVNames ->
         Just $ DerivedIV
-          { ivVar = ssaName var
-          , ivBaseVar = ssaName base
+          { ivVar = varNameString (ssaName var)
+          , ivBaseVar = varNameString (ssaName base)
           , ivMultiplier = k
           , ivOffset = 0
           }
   SSAAssign var (SSABinary Mul (SSAInt k) (SSAUse base))
-    | Set.member (ssaName base) basicIVNames ->
+    | Set.member (varNameString (ssaName base)) basicIVNames ->
         Just $ DerivedIV
-          { ivVar = ssaName var
-          , ivBaseVar = ssaName base
+          { ivVar = varNameString (ssaName var)
+          , ivBaseVar = varNameString (ssaName base)
           , ivMultiplier = k
           , ivOffset = 0
           }
   SSAAssign var (SSABinary Add (SSABinary Mul (SSAUse base) (SSAInt k)) (SSAInt c))
-    | Set.member (ssaName base) basicIVNames ->
+    | Set.member (varNameString (ssaName base)) basicIVNames ->
         Just $ DerivedIV
-          { ivVar = ssaName var
-          , ivBaseVar = ssaName base
+          { ivVar = varNameString (ssaName var)
+          , ivBaseVar = varNameString (ssaName base)
           , ivMultiplier = k
           , ivOffset = c
           }
@@ -172,11 +175,11 @@ classifyAsDerivedIV basicIVNames = \case
 classifyIV :: Set String -> SSAExpr -> Maybe (String, Int, Int)
 classifyIV basicIVNames = \case
   SSABinary Mul (SSAUse var) (SSAInt k)
-    | Set.member (ssaName var) basicIVNames -> Just (ssaName var, k, 0)
+    | Set.member (varNameString (ssaName var)) basicIVNames -> Just (varNameString (ssaName var), k, 0)
   SSABinary Mul (SSAInt k) (SSAUse var)
-    | Set.member (ssaName var) basicIVNames -> Just (ssaName var, k, 0)
+    | Set.member (varNameString (ssaName var)) basicIVNames -> Just (varNameString (ssaName var), k, 0)
   SSABinary Add (SSABinary Mul (SSAUse var) (SSAInt k)) (SSAInt c)
-    | Set.member (ssaName var) basicIVNames -> Just (ssaName var, k, c)
+    | Set.member (varNameString (ssaName var)) basicIVNames -> Just (varNameString (ssaName var), k, c)
   _ -> Nothing
 
 --------------------------------------------------------------------------------
@@ -235,7 +238,7 @@ mkCandidate bid basicIVNames (idx, instr) = case instr of
         Just $ SRCandidate
           { srcBlock = bid
           , srcInstr = idx
-          , srcVar = ssaName var
+          , srcVar = varNameString (ssaName var)
           , srcExpr = expr
           , srcBaseIV = baseVar
           , srcMultiplier = mult
@@ -253,7 +256,7 @@ applySR loop blockMap candidates blocks =
 applyOneReduction :: Loop -> Map BlockId SSABlock ->
                      ([SSABlock], Int, [InductionVar]) -> SRCandidate ->
                      ([SSABlock], Int, [InductionVar])
-applyOneReduction loop _blockMap (blocks, count, ivs) candidate =
+applyOneReduction _loop _blockMap (blocks, count, ivs) candidate =
   let -- Create a new induction variable for this expression
       newIVName = srcVar candidate ++ "_sr"
       step = srcMultiplier candidate  -- Step = multiplier * base_step
@@ -274,7 +277,7 @@ applyOneReduction loop _blockMap (blocks, count, ivs) candidate =
 
 -- | Transform a block for strength reduction
 transformBlock :: SRCandidate -> String -> Int -> SSABlock -> SSABlock
-transformBlock candidate newIVName step block@SSABlock{..}
+transformBlock candidate newIVName _step block@SSABlock{..}
   | blockLabel == srcBlock candidate =
       block { blockInstrs = map (transformInstr candidate newIVName) blockInstrs }
   | otherwise = block
@@ -284,9 +287,9 @@ transformInstr :: SRCandidate -> String -> SSAInstr -> SSAInstr
 transformInstr candidate newIVName instr =
   case instr of
     SSAAssign var _
-      | ssaName var == srcVar candidate ->
+      | varNameString (ssaName var) == srcVar candidate ->
           -- Replace i * stride with the new IV
-          SSAAssign var (SSAUse (SSAVar newIVName 0 Nothing))
+          SSAAssign var (SSAUse (SSAVar (varName newIVName) 0 Nothing))
     other -> other
 
 --------------------------------------------------------------------------------
@@ -297,21 +300,21 @@ transformInstr candidate newIVName instr =
 -- Replaces comparisons like (i * stride < limit) with (j < limit')
 -- where j is the strength-reduced variable
 replaceLFT :: Loop -> [InductionVar] -> [SSABlock] -> [SSABlock]
-replaceLFT loop derivedIVs = map (replaceBlockLFT loop derivedIVs)
+replaceLFT _loop derivedIVs = map (replaceBlockLFT derivedIVs)
 
 -- | Replace LFT in a block
-replaceBlockLFT :: Loop -> [InductionVar] -> SSABlock -> SSABlock
-replaceBlockLFT loop derivedIVs block@SSABlock{..} =
+replaceBlockLFT :: [InductionVar] -> SSABlock -> SSABlock
+replaceBlockLFT derivedIVs block@SSABlock{..} =
   block { blockInstrs = map (replaceInstrLFT derivedIVs) blockInstrs }
 
 -- | Replace LFT in an instruction
 replaceInstrLFT :: [InductionVar] -> SSAInstr -> SSAInstr
 replaceInstrLFT derivedIVs = \case
   SSABranch (SSABinary cmp (SSAUse var) limit) thenB elseB
-    | Just iv <- findDerivedIV (ssaName var) derivedIVs ->
+    | Just iv <- findDerivedIV (varNameString (ssaName var)) derivedIVs ->
         -- Replace comparison with derived IV comparison
         -- i * a < n  =>  i_sr < n  (where i_sr is initialized to 0 and stepped by a)
-        SSABranch (SSABinary cmp (SSAUse (SSAVar (ivVar iv) 0 Nothing)) limit) thenB elseB
+        SSABranch (SSABinary cmp (SSAUse (SSAVar (varName (ivVar iv)) 0 Nothing)) limit) thenB elseB
   other -> other
   where
     findDerivedIV name = foldr (\iv acc ->

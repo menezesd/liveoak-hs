@@ -101,7 +101,7 @@ processBlock cfg rpoIdx idom bid =
 
 -- | Find common dominator of two blocks (intersection in dominator tree)
 findCommonDom :: Map BlockId Int -> Map BlockId BlockId -> BlockId -> BlockId -> BlockId
-findCommonDom rpoIdx idom b1 b2 = go b1 b2
+findCommonDom rpoIdx idom = go
   where
     idx bid = fromMaybe maxBound $ Map.lookup bid rpoIdx
 
@@ -191,7 +191,7 @@ domChildren DomTree{..} bid = lookupList bid domChildren_
 
 -- | Get depth of block in dominator tree (entry = 0)
 domDepth :: DomTree -> BlockId -> Int
-domDepth domTree bid = go 0 bid
+domDepth domTree = go 0
   where
     go depth b = case immediateDom domTree b of
       Just parent -> go (depth + 1) parent
@@ -229,7 +229,7 @@ reverseCFG cfg exits =
       in (reversed, single)
     _ ->
       -- Multiple exits: add virtual exit node
-      let virtualExit = BlockId "__exit__"
+      let virtualExit = blockId "__exit__"
           -- Add edges from virtual exit to all real exits
           newSuccs = Map.insert virtualExit exits $
                      foldl' (\m e -> Map.insertWith (++) e [virtualExit] m)

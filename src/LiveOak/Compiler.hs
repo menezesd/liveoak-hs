@@ -1,5 +1,3 @@
-{-# LANGUAGE OverloadedStrings #-}
-
 -- | Main compiler module for LiveOak.
 -- Orchestrates the compilation pipeline: parse -> validate -> semantic check -> optimize -> codegen.
 module LiveOak.Compiler
@@ -42,8 +40,8 @@ data CompilationStage
   deriving (Eq, Show)
 
 -- | Compilation configuration.
-data CompileConfig = CompileConfig
-  { ccOptimizeSSA :: !Bool      -- ^ Apply SSA-level optimizations
+newtype CompileConfig = CompileConfig
+  { ccOptimizeSSA :: Bool      -- ^ Apply SSA-level optimizations
   }
 
 -- | Default configuration: SSA optimizations enabled.

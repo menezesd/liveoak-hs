@@ -52,7 +52,7 @@ blockMapFromList blocks = Map.fromList [(blockLabel b, b) | b <- blocks]
 -- | Get all variables used in an expression
 exprUses :: SSAExpr -> Set String
 exprUses = \case
-  SSAUse var -> Set.singleton (ssaName var)
+  SSAUse var -> Set.singleton (varNameString (ssaName var))
   SSAUnary _ e -> exprUses e
   SSABinary _ l r -> exprUses l `Set.union` exprUses r
   SSATernary c t e -> exprUses c `Set.union` exprUses t `Set.union` exprUses e
@@ -76,7 +76,7 @@ instrUses = \case
 
 -- | Get all variables used in a phi node
 phiUses :: PhiNode -> Set String
-phiUses PhiNode{..} = Set.fromList [ssaName v | (_, v) <- phiArgs]
+phiUses PhiNode{..} = Set.fromList [varNameString (ssaName v) | (_, v) <- phiArgs]
 
 -- | Get all variables used in a block (including phi nodes)
 blockUses :: SSABlock -> Set String
@@ -90,14 +90,14 @@ blockUses SSABlock{..} = Set.unions $
 -- | Get the variable defined by an instruction (if any)
 instrDefs :: SSAInstr -> Set String
 instrDefs = \case
-  SSAAssign var _ -> Set.singleton (ssaName var)
+  SSAAssign var _ -> Set.singleton (varNameString (ssaName var))
   _ -> Set.empty
 
 -- | Get all variables defined in a block (phi nodes + instructions)
 blockDefs :: SSABlock -> Set String
 blockDefs SSABlock{..} = Set.fromList $
-  [ssaName (phiVar phi) | phi <- blockPhis] ++
-  [ssaName var | SSAAssign var _ <- blockInstrs]
+  [varNameString (ssaName (phiVar phi)) | phi <- blockPhis] ++
+  [varNameString (ssaName var) | SSAAssign var _ <- blockInstrs]
 
 --------------------------------------------------------------------------------
 -- Expression Predicates

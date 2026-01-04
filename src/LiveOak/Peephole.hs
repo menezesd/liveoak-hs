@@ -370,18 +370,6 @@ peepholePass = \case
 
   -- Note: removed incorrect pattern (PUSHIMM 0 : SWAP : SUB) - that computes -x, not identity
 
-  -- Compare with self: DUP; EQUAL always true
-  (DUP : EQUAL : rest) -> ADDSP (-1) : PUSHIMM 1 : peepholePass rest
-
-  -- Compare with self: DUP; LESS always false
-  (DUP : LESS : rest) -> ADDSP (-1) : PUSHIMM 0 : peepholePass rest
-
-  -- Compare with self: DUP; GREATER always false
-  (DUP : GREATER : rest) -> ADDSP (-1) : PUSHIMM 0 : peepholePass rest
-
-  -- DUP; SUB = 0
-  (DUP : SUB : rest) -> ADDSP (-1) : PUSHIMM 0 : peepholePass rest
-
   -- DUP; AND = x (x & x = x, so DUP:AND is no-op)
   (DUP : AND : rest) -> peepholePass rest
 

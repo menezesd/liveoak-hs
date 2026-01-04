@@ -1,6 +1,3 @@
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE RecordWildCards #-}
-
 -- | Symbol table structures for LiveOak.
 -- Provides immutable representations of program symbols: variables, methods, classes.
 module LiveOak.Symbol

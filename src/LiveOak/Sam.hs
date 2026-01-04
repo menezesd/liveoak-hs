@@ -1,6 +1,4 @@
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RecordWildCards #-}
 
 -- | SAM (Stack Abstract Machine) simulator.
 -- Executes SAM assembly code and returns the result.
@@ -38,8 +36,7 @@ import qualified Data.Vector as V
 --------------------------------------------------------------------------------
 
 -- | SAM values.
-data SamValue
-  = SamInt !Int
+newtype SamValue = SamInt Int
   deriving (Eq, Show)
 
 -- | SAM errors.
@@ -472,7 +469,10 @@ execInstr instr st = case instr of
   CMP -> do
     (b, st1) <- popInt st
     (a, st2) <- popInt st1
-    let cmpRes = if a < b then -1 else if a > b then 1 else 0
+    let cmpRes
+          | a < b = -1
+          | a > b = 1
+          | otherwise = 0
     Right $ push (SamInt cmpRes) st2 { samPC = samPC st + 1 }
 
   ISNIL -> do

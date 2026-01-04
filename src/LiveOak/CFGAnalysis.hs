@@ -1,5 +1,3 @@
-{-# LANGUAGE RecordWildCards #-}
-
 -- | CFG Analysis module for LiveOak.
 -- Bundles CFG construction, dominance analysis, and loop detection
 -- with a unified interface for SSA optimizations.

@@ -144,19 +144,16 @@ findDep fromIdx fromInstr (toIdx, toInstr) =
       toUses = instrUses toInstr
 
       -- RAW: from writes, to reads
-      raw = if not (Set.null (Set.intersection fromDefs toUses))
-            then [DepEdge fromIdx toIdx TrueDep (instrLatency fromInstr)]
-            else []
+      raw = [DepEdge fromIdx toIdx TrueDep (instrLatency fromInstr) |
+              not (Set.null (Set.intersection fromDefs toUses))]
 
       -- WAR: from reads, to writes
-      war = if not (Set.null (Set.intersection fromUses toDefs))
-            then [DepEdge fromIdx toIdx AntiDep 0]
-            else []
+      war = [DepEdge fromIdx toIdx AntiDep 0 |
+              not (Set.null (Set.intersection fromUses toDefs))]
 
       -- WAW: both write same variable
-      waw = if not (Set.null (Set.intersection fromDefs toDefs))
-            then [DepEdge fromIdx toIdx OutputDep 0]
-            else []
+      waw = [DepEdge fromIdx toIdx OutputDep 0 |
+              not (Set.null (Set.intersection fromDefs toDefs))]
 
   in raw ++ war ++ waw
 
@@ -206,18 +203,18 @@ listSchedule :: DepGraph -> [Int]
 listSchedule graph =
   let cp = criticalPath graph
       -- Priority: critical path length (higher = schedule first)
-      priority n = IntMap.findWithDefault 0 n cp
       allPredsScheduled n scheduled =
         all (\e -> Set.member (depFrom e) scheduled) (IntMap.findWithDefault [] n (dgPreds graph))
       go remaining scheduled acc
         | Set.null remaining = reverse acc
         | otherwise =
             let ready = [n | n <- Set.toList remaining, allPredsScheduled n scheduled]
+                readyWithPriority = [(n, IntMap.findWithDefault 0 n cp) | n <- ready]
                 -- Sort by priority (descending)
-                sorted = sortBy (comparing (Down . priority)) ready
+                sorted = sortBy (comparing (Down . snd)) readyWithPriority
             in case sorted of
               [] -> reverse acc ++ Set.toList remaining  -- Cycle or deadlock
-              (n:_) -> go (Set.delete n remaining) (Set.insert n scheduled) (n : acc)
+              ((n, _):_) -> go (Set.delete n remaining) (Set.insert n scheduled) (n : acc)
   in go (Set.fromList $ dgNodes graph) Set.empty []
 
 --------------------------------------------------------------------------------
@@ -254,7 +251,7 @@ findTraces cfg _blocks =
 scheduleTrace :: [SSABlock] -> [BlockId] -> SSABlock
 scheduleTrace blocks trace =
   case [b | b <- blocks, blockLabel b `elem` trace] of
-    [] -> SSABlock (BlockId "__empty__") [] []
+    [] -> SSABlock (blockId "__empty__") [] []
     (b:_) -> b  -- Simplified: return first block
 
 --------------------------------------------------------------------------------

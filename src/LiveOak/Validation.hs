@@ -48,12 +48,12 @@ validateEntrypointErrors syms =
         Nothing -> [ResolveError (entryClass ++ "." ++ entryMethod ++ " method not found") 0 0]
         Just mainMethod ->
           let userArgs = expectedUserArgs mainMethod
-              argErr = if userArgs /= 0
-                       then [SyntaxError (entryClass ++ "." ++ entryMethod ++ " must not have parameters") 0 0]
-                       else []
-              instanceErr = if numParams mainMethod <= 0
-                            then [SyntaxError (entryClass ++ "." ++ entryMethod ++ " must be an instance method") 0 0]
-                            else []
+              argErr =
+                [SyntaxError (entryClass ++ "." ++ entryMethod ++ " must not have parameters") 0 0 |
+                  userArgs /= 0]
+              instanceErr =
+                [SyntaxError (entryClass ++ "." ++ entryMethod ++ " must be an instance method") 0 0 |
+                  numParams mainMethod <= 0]
           in argErr ++ instanceErr
 
 -- | Validate that the entry point exists.

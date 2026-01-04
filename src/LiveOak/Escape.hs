@@ -2,31 +2,40 @@
 {-# LANGUAGE RecordWildCards #-}
 
 -- | Escape Analysis.
--- Determines whether objects "escape" their allocation site, enabling
--- stack allocation for non-escaping objects.
+-- Determines whether objects "escape" their allocation site. An object escapes if:
+-- - It is returned from a method
+-- - It is stored in a field (global state)
+-- - It is passed to another method (argument escape)
 --
--- __Status: EXPERIMENTAL__ - This module is not yet integrated into the
--- optimization pipeline. Stack allocation transformation is incomplete.
+-- Non-escaping objects are candidates for:
+-- - Stack allocation (requires codegen support)
+-- - Scalar replacement (replace object with its fields)
+-- - More aggressive inlining
+--
+-- This module provides analysis only. Transformations based on escape info
+-- should be implemented in the respective optimization passes.
 module LiveOak.Escape
   ( -- * Escape Analysis
     analyzeEscape
+  , analyzeMethodEscape
   , EscapeResult(..)
   , EscapeState(..)
 
     -- * Queries
   , doesEscape
-  , canStackAllocate
-  , stackAllocate
+  , isNonEscaping
+  , getStackCandidates
+
+    -- * Inter-procedural Analysis
+  , MethodEscapeSummary(..)
+  , computeMethodSummary
   ) where
 
-import LiveOak.SSATypes
+import LiveOak.SSATypes hiding (varName)
 import LiveOak.CFG
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Set (Set)
-import qualified Data.Set as Set
-import Data.List (foldl')
 
 --------------------------------------------------------------------------------
 -- Types
@@ -58,21 +67,24 @@ data EscapeResult = EscapeResult
 -- Escape Analysis
 --------------------------------------------------------------------------------
 
--- | Analyze escape for a method
+-- | Analyze escape for a method using CFG
 analyzeEscape :: CFG -> [SSABlock] -> EscapeResult
 analyzeEscape cfg blocks =
-  let -- Find all allocation sites
-      allocations = findAllocations blocks
-      -- Analyze escape for each allocation
+  let allocations = findAllocations blocks
       analyzed = Map.map (analyzeAllocation cfg blocks) allocations
-      -- Filter non-escaping
       noEscape = [asVar a | a <- Map.elems analyzed, asEscape a == NoEscape]
-      stackCandidates = [asVar a | a <- Map.elems analyzed, canStackAllocate a]
+      stackCandidates = [asVar a | a <- Map.elems analyzed, asEscape a == NoEscape]
   in EscapeResult
     { escapeAllocations = analyzed
     , escapeNoEscape = noEscape
     , escapeStackCandidates = stackCandidates
     }
+
+-- | Analyze escape for a method (simpler interface without CFG)
+analyzeMethodEscape :: SSAMethod -> EscapeResult
+analyzeMethodEscape method@SSAMethod{..} =
+  let cfg = buildCFG method
+  in analyzeEscape cfg ssaMethodBlocks
 
 -- | Find all allocation sites
 findAllocations :: [SSABlock] -> Map String AllocationSite
@@ -80,7 +92,7 @@ findAllocations blocks =
   Map.fromList $ concatMap findBlockAllocations blocks
   where
     findBlockAllocations SSABlock{..} =
-      [(ssaName var, AllocationSite blockLabel (ssaName var) cn NoEscape)
+      [(varNameString (ssaName var), AllocationSite blockLabel (varNameString (ssaName var)) cn NoEscape)
       | SSAAssign var (SSANewObject cn _) <- blockInstrs]
 
 -- | Analyze escape state of an allocation
@@ -123,13 +135,11 @@ findInstrUses bid varName (idx, instr) = case instr of
   SSAAssign _ expr -> findExprUses bid idx varName expr
 
   SSAReturn (Just expr) ->
-    if exprUsesVar varName expr
-    then [UseReturn bid]
-    else []
+    [UseReturn bid | exprUsesVar varName expr]
 
   SSAFieldStore target field _ value ->
-    let targetUses = if exprUsesVar varName target then [UseStore bid field idx] else []
-        valueUses = if exprUsesVar varName value then [UseStore bid field idx] else []
+    let targetUses = [UseStore bid field idx | exprUsesVar varName target]
+        valueUses = [UseStore bid field idx | exprUsesVar varName value]
     in targetUses ++ valueUses
 
   SSAExprStmt expr -> findExprUses bid idx varName expr
@@ -139,7 +149,7 @@ findInstrUses bid varName (idx, instr) = case instr of
 -- | Find uses in an expression
 findExprUses :: BlockId -> Int -> String -> SSAExpr -> [UseSite]
 findExprUses bid idx varName = \case
-  SSAUse var | ssaName var == varName -> [UseLocal bid idx]
+  SSAUse var | varNameString (ssaName var) == varName -> [UseLocal bid idx]
   SSAUnary _ e -> findExprUses bid idx varName e
   SSABinary _ l r ->
     findExprUses bid idx varName l ++ findExprUses bid idx varName r
@@ -148,23 +158,23 @@ findExprUses bid idx varName = \case
     findExprUses bid idx varName t ++
     findExprUses bid idx varName e
   SSACall _ args ->
-    [UseArg bid name | (i, arg) <- zip [0..] args
+    [UseArg bid name | (i, arg) <- zip [(0::Int)..] args
                      , exprUsesVar varName arg
                      , let name = "arg" ++ show i]
   SSAInstanceCall target method args ->
-    let targetUses = if exprUsesVar varName target then [UseArg bid method] else []
+    let targetUses = [UseArg bid method | exprUsesVar varName target]
         argUses = [UseArg bid method | arg <- args, exprUsesVar varName arg]
     in targetUses ++ argUses
   SSANewObject _ args ->
     [UseArg bid "constructor" | arg <- args, exprUsesVar varName arg]
   SSAFieldAccess target _ ->
-    if exprUsesVar varName target then [UseLocal bid idx] else []
+    [UseLocal bid idx | exprUsesVar varName target]
   _ -> []
 
 -- | Check if expression uses a variable
 exprUsesVar :: String -> SSAExpr -> Bool
 exprUsesVar varName = \case
-  SSAUse var -> ssaName var == varName
+  SSAUse var -> varNameString (ssaName var) == varName
   SSAUnary _ e -> exprUsesVar varName e
   SSABinary _ l r -> exprUsesVar varName l || exprUsesVar varName r
   SSATernary c t e -> exprUsesVar varName c || exprUsesVar varName t || exprUsesVar varName e
@@ -194,30 +204,13 @@ doesEscape result varName =
     Just site -> asEscape site /= NoEscape
     Nothing -> True  -- Unknown, assume escapes
 
--- | Check if an allocation can be stack-allocated
-canStackAllocate :: AllocationSite -> Bool
-canStackAllocate site = asEscape site == NoEscape
+-- | Check if an allocation does not escape
+isNonEscaping :: EscapeResult -> String -> Bool
+isNonEscaping result varName = not (doesEscape result varName)
 
---------------------------------------------------------------------------------
--- Stack Allocation Transformation
---------------------------------------------------------------------------------
-
--- | Transform allocations to stack allocations where possible
-stackAllocate :: EscapeResult -> [SSABlock] -> [SSABlock]
-stackAllocate result = map transformBlock
-  where
-    stackVars = Set.fromList (escapeStackCandidates result)
-
-    transformBlock block@SSABlock{..} =
-      block { blockInstrs = map transformInstr blockInstrs }
-
-    transformInstr = \case
-      SSAAssign var (SSANewObject cn args)
-        | Set.member (ssaName var) stackVars ->
-            -- Mark as stack allocation (implementation-specific)
-            -- For now, keep as heap allocation but mark for later
-            SSAAssign var (SSANewObject ("__stack__" ++ cn) args)
-      other -> other
+-- | Get list of variables that are candidates for stack allocation
+getStackCandidates :: EscapeResult -> [String]
+getStackCandidates = escapeStackCandidates
 
 --------------------------------------------------------------------------------
 -- Inter-procedural Escape Analysis
@@ -244,7 +237,7 @@ computeMethodSummary name params blocks =
 -- | Compute escape state of a parameter
 computeParamEscape :: [SSABlock] -> SSAVar -> EscapeState
 computeParamEscape blocks param =
-  let varName = ssaName param
+  let varName = varNameString (ssaName param)
       uses = findAllUses blocks varName
       escapeStates = map classifyUse uses
   in if null escapeStates then NoEscape else maximum escapeStates
@@ -257,9 +250,9 @@ blockHasEscapingReturn blocks SSABlock{..} =
     isEscapingReturn = \case
       SSAReturn (Just (SSANewObject _ _)) -> True
       SSAReturn (Just (SSAUse var)) ->
-        -- Check if variable is a non-escaping allocation
+        -- Check if variable is an allocation
         let allocSites = findAllocations blocks
-        in case Map.lookup (ssaName var) allocSites of
+        in case Map.lookup (varNameString (ssaName var)) allocSites of
           Just _ -> True  -- Returning allocated object
           Nothing -> False
       _ -> False

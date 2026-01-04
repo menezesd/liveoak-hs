@@ -13,6 +13,7 @@ import LiveOak.Ast
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Maybe (fromMaybe)
 import Data.Set (Set)
 import qualified Data.Set as Set
 
@@ -321,29 +322,29 @@ refineRanges ranges = \case
   -- x < n: then branch has x in [lo, n-1], else branch has x in [n, hi]
   Binary Lt (Var name _) (IntLit n _) _ ->
     let current = Map.findWithDefault fullRange name ranges
-        thenRange = current { rangeUpper = Just (min (maybe (n-1) id (rangeUpper current)) (n-1)) }
-        elseRange = current { rangeLower = Just (max (maybe n id (rangeLower current)) n) }
+        thenRange = current { rangeUpper = Just (min (fromMaybe (n - 1) (rangeUpper current)) (n - 1)) }
+        elseRange = current { rangeLower = Just (max (fromMaybe n (rangeLower current)) n) }
     in (Map.insert name thenRange ranges, Map.insert name elseRange ranges)
 
   -- x <= n: then has [lo, n], else has [n+1, hi]
   Binary Le (Var name _) (IntLit n _) _ ->
     let current = Map.findWithDefault fullRange name ranges
-        thenRange = current { rangeUpper = Just (min (maybe n id (rangeUpper current)) n) }
-        elseRange = current { rangeLower = Just (max (maybe (n+1) id (rangeLower current)) (n+1)) }
+        thenRange = current { rangeUpper = Just (min (fromMaybe n (rangeUpper current)) n) }
+        elseRange = current { rangeLower = Just (max (fromMaybe (n + 1) (rangeLower current)) (n + 1)) }
     in (Map.insert name thenRange ranges, Map.insert name elseRange ranges)
 
   -- x > n: then has [n+1, hi], else has [lo, n]
   Binary Gt (Var name _) (IntLit n _) _ ->
     let current = Map.findWithDefault fullRange name ranges
-        thenRange = current { rangeLower = Just (max (maybe (n+1) id (rangeLower current)) (n+1)) }
-        elseRange = current { rangeUpper = Just (min (maybe n id (rangeUpper current)) n) }
+        thenRange = current { rangeLower = Just (max (fromMaybe (n + 1) (rangeLower current)) (n + 1)) }
+        elseRange = current { rangeUpper = Just (min (fromMaybe n (rangeUpper current)) n) }
     in (Map.insert name thenRange ranges, Map.insert name elseRange ranges)
 
   -- x >= n: then has [n, hi], else has [lo, n-1]
   Binary Ge (Var name _) (IntLit n _) _ ->
     let current = Map.findWithDefault fullRange name ranges
-        thenRange = current { rangeLower = Just (max (maybe n id (rangeLower current)) n) }
-        elseRange = current { rangeUpper = Just (min (maybe (n-1) id (rangeUpper current)) (n-1)) }
+        thenRange = current { rangeLower = Just (max (fromMaybe n (rangeLower current)) n) }
+        elseRange = current { rangeUpper = Just (min (fromMaybe (n - 1) (rangeUpper current)) (n - 1)) }
     in (Map.insert name thenRange ranges, Map.insert name elseRange ranges)
 
   -- x == n: then has [n, n], else keeps current range (can't narrow much)
@@ -356,4 +357,3 @@ refineRanges ranges = \case
 
   -- For other conditions, don't refine
   _ -> (ranges, ranges)
-

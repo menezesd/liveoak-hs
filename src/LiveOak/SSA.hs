@@ -56,6 +56,16 @@ module LiveOak.SSA
     -- * CFG-Based Optimization Pipeline
   , optimizeSSAProgram  -- ^ Optimize SSA program, return SSA (for use with SSACodegen)
   , ssaBasicPipeline    -- ^ Basic safe SSA optimizations
+  , ssaTailCallOpt      -- ^ Tail call optimization
+  , strengthReduce      -- ^ Strength reduction (multiply -> add in loops)
+  , ssaInline           -- ^ Function inlining (single-block functions)
+
+    -- * Escape Analysis (re-exported from LiveOak.Escape)
+  , Escape.analyzeMethodEscape
+  , Escape.EscapeResult(..)
+  , Escape.EscapeState(..)
+  , Escape.doesEscape
+  , Escape.isNonEscaping
   ) where
 
 import LiveOak.Ast
@@ -67,15 +77,20 @@ import qualified LiveOak.GVN as GVN
 import qualified LiveOak.LICM as LICM
 import qualified LiveOak.PRE as PRE
 import qualified LiveOak.SCCP as SCCP
+import qualified LiveOak.TailCall as TCO
+import qualified LiveOak.Escape as Escape
+import qualified LiveOak.StrengthReduce as SR
+import qualified LiveOak.Inline as Inline
 import LiveOak.Loop (findLoops)
 import LiveOak.SSAUtils (blockMapFromList, fixedPointWithLimit)
-import LiveOak.MapUtils (lookupSet)
+import LiveOak.MapUtils (lookupInt, lookupSet)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Control.Monad.State
 import Data.List (foldl')
+import Data.Maybe (fromMaybe)
 
 --------------------------------------------------------------------------------
 -- Conversion to SSA
@@ -109,9 +124,9 @@ type SSAConv a = State SSAState a
 freshVar :: String -> SSAConv SSAVar
 freshVar name = do
   st <- get
-  let ver = Map.findWithDefault 0 name (nextVersion st)
+  let ver = lookupInt name (nextVersion st)
   put st { nextVersion = Map.insert name (ver + 1) (nextVersion st) }
-  return (SSAVar name ver Nothing)
+  return (SSAVar (varName name) ver Nothing)
 
 -- | Define a variable (create new version)
 defineVar :: String -> SSAConv SSAVar
@@ -128,7 +143,7 @@ useVar name = do
     Just v -> return v
     Nothing -> do
       -- First use - create version 0
-      let v = SSAVar name 0 Nothing
+      let v = SSAVar (varName name) 0 Nothing
       modify $ \st' -> st' { currentDefs = Map.insert name v (currentDefs st') }
       return v
 
@@ -138,21 +153,21 @@ freshBlock = do
   st <- get
   let n = nextBlockId st
   put st { nextBlockId = n + 1 }
-  return $ BlockId ("B" ++ show n)
+  return $ blockId ("B" ++ show n)
 
 -- | Convert a method to SSA form
 methodToSSA :: ProgramSymbols -> String -> MethodDecl -> SSAMethod
 methodToSSA syms clsName MethodDecl{..} =
   let initState = SSAState Map.empty Map.empty 0 syms clsName
       -- Initialize parameters as version 0 with their types
-      paramVars = [SSAVar (paramName p) 0 (Just (paramType p)) | p <- methodParams]
-      initDefs = Map.fromList [(paramName p, SSAVar (paramName p) 0 (Just (paramType p))) | p <- methodParams]
+      paramVars = [SSAVar (varName (paramName p)) 0 (Just (paramType p)) | p <- methodParams]
+      initDefs = Map.fromList [(paramName p, SSAVar (varName (paramName p)) 0 (Just (paramType p))) | p <- methodParams]
       st = initState { currentDefs = initDefs }
-      entryId = BlockId "entry"
+      entryId = blockId "entry"
       (rawBlocks, _) = runState (stmtToBlocks Nothing entryId methodBody) st
       -- Ensure the last block has a terminator (add implicit return if needed)
       blocks = ensureTerminator rawBlocks
-  in SSAMethod clsName methodName paramVars methodReturnSig blocks entryId
+  in SSAMethod clsName (methodNameFromString methodName) paramVars methodReturnSig blocks entryId
   where
     -- Add an implicit return to the last block if it doesn't have a terminator
     ensureTerminator [] = []
@@ -214,9 +229,7 @@ stmtToBlocks loopExit label = \case
       Just cs -> case lookupField name cs of
         Just _fv -> do
           -- It's a field - convert to field store
-          let offset = case fieldOffset name cs of
-                Just off -> off
-                Nothing -> 0
+          let offset = fromMaybe 0 (fieldOffset name cs)
           return [SSABlock label [] [SSAFieldStore SSAThis name offset ssaExpr]]
         Nothing -> do
           -- It's a local variable
@@ -297,9 +310,9 @@ hasTerminator instrs = case reverse instrs of
 -- | Add a jump instruction to the end of the last block
 -- Only adds jump if the block doesn't already end with a terminator (Return, Jump, Branch)
 addJumpToEnd :: [SSABlock] -> BlockId -> [SSABlock]
-addJumpToEnd [] target = [SSABlock (BlockId "empty") [] [SSAJump target]]
+addJumpToEnd [] target = [SSABlock (blockId "empty") [] [SSAJump target]]
 addJumpToEnd blocks target = case reverse blocks of
-  [] -> [SSABlock (BlockId "empty") [] [SSAJump target]]  -- Already handled above, but safe
+  [] -> [SSABlock (blockId "empty") [] [SSAJump target]]  -- Already handled above, but safe
   (lastBlock:initRev) ->
     let lastInstrs = blockInstrs lastBlock
         lastWithJump = if hasTerminator lastInstrs
@@ -441,9 +454,9 @@ findDefSites method = foldl' addBlockDefs Map.empty (ssaMethodBlocks method)
     addBlockDefs acc block =
       foldl' (addDef (blockLabel block)) acc (blockInstrs block)
 
-    addDef blockId acc instr = case instr of
+    addDef bid acc instr = case instr of
       SSAAssign var _ ->
-        Map.insertWith Set.union (ssaName var) (Set.singleton blockId) acc
+        Map.insertWith Set.union (varNameString (ssaName var)) (Set.singleton bid) acc
       _ -> acc
 
 -- | Insert phi nodes at dominance frontiers of definition sites
@@ -474,23 +487,23 @@ computePhiSites domFrontier _varName defBlocks = go defBlocks Set.empty
 
 -- | Insert phi nodes for a variable into the appropriate blocks
 insertPhisForVar :: CFG -> Map BlockId SSABlock -> String -> Set BlockId -> Map BlockId SSABlock
-insertPhisForVar cfg blockMap varName phiBlocks =
-  Set.foldl' insertPhi blockMap phiBlocks
+insertPhisForVar cfg blockMap vName =
+  Set.foldl' insertPhi blockMap
   where
-    insertPhi bm blockId =
-      case Map.lookup blockId bm of
+    insertPhi bm bid =
+      case Map.lookup bid bm of
         Nothing -> bm  -- Block not found
         Just block ->
           -- Create phi node with placeholder arguments
-          let preds = predecessors cfg blockId
-              phiArgs = [(p, SSAVar varName 0 Nothing) | p <- preds]
-              phi = PhiNode (SSAVar varName 0 Nothing) phiArgs
+          let preds = predecessors cfg bid
+              phiArgs = [(p, SSAVar (varName vName) 0 Nothing) | p <- preds]
+              phi = PhiNode (SSAVar (varName vName) 0 Nothing) phiArgs
               -- Add phi if not already present for this variable
               existingPhis = blockPhis block
-              hasPhiForVar = any (\p -> ssaName (phiVar p) == varName) existingPhis
+              hasPhiForVar = any (\p -> varNameString (ssaName (phiVar p)) == vName) existingPhis
           in if hasPhiForVar
              then bm
-             else Map.insert blockId (block { blockPhis = phi : existingPhis }) bm
+             else Map.insert bid (block { blockPhis = phi : existingPhis }) bm
 
 --------------------------------------------------------------------------------
 -- SSA Variable Renaming
@@ -501,35 +514,36 @@ insertPhisForVar cfg blockMap varName phiBlocks =
 renameVariables :: CFG -> DomTree -> [ParamDecl] -> [SSABlock] -> [SSABlock]
 renameVariables cfg domTree params blocks =
   let -- Initialize with parameters as version 0 (next version is 1)
-      initVersions = Map.fromList [(paramName p, 1) | p <- params]
-      initDefs = Map.fromList [(paramName p, SSAVar (paramName p) 0 (Just (paramType p))) | p <- params]
+      initVersions = Map.fromList [(varName (paramName p), 1) | p <- params]
+      initDefs = Map.fromList [(varName (paramName p), SSAVar (varName (paramName p)) 0 (Just (paramType p))) | p <- params]
       initState = RenameState initVersions initDefs
       -- Process blocks in dominator tree order
       blockMap = blockMapFromList blocks
       entry = cfgEntry cfg
-      (_, renamedMap) = if Map.member entry blockMap
+      (renSt, renamedMap) = if Map.member entry blockMap
         then renameBlock cfg domTree entry initState blockMap
         else (initState, blockMap)  -- Entry doesn't exist, skip renaming
-      -- Process any unreachable blocks that weren't renamed
-      blockIds = Map.keysSet blockMap
-      renamedBlockIds = Map.keysSet renamedMap
-      unreached = Set.toList $ Set.difference blockIds renamedBlockIds
-      finalMap = foldl' (\m bid -> case Map.lookup bid blockMap of
-                          Nothing -> m
-                          Just b -> Map.insert bid b m) renamedMap unreached
+      -- Process any unreachable blocks with fresh versions.
+      reachable = Set.fromList (domRPO domTree)
+      unreached = Set.toList $ Set.difference (Map.keysSet blockMap) reachable
+      seedUnreachable st = st { renameCurrentDef = initDefs }
+      (_, finalMap) = foldl' (\(st, bm) bid ->
+                                renameBlock cfg domTree bid (seedUnreachable st) bm)
+                              (renSt, renamedMap)
+                              unreached
   in Map.elems finalMap
 
 -- | State for variable renaming
 data RenameState = RenameState
-  { renameVersions :: !(Map String Int)      -- ^ Next version for each variable
-  , renameCurrentDef :: !(Map String SSAVar) -- ^ Current reaching definition
+  { renameVersions :: !(Map VarName Int)      -- ^ Next version for each variable
+  , renameCurrentDef :: !(Map VarName SSAVar) -- ^ Current reaching definition
   }
 
 -- | Rename variables in a block and its dominance subtree
 renameBlock :: CFG -> DomTree -> BlockId -> RenameState -> Map BlockId SSABlock
            -> (RenameState, Map BlockId SSABlock)
-renameBlock cfg domTree blockId renSt blockMap =
-  case Map.lookup blockId blockMap of
+renameBlock cfg domTree bid renSt blockMap =
+  case Map.lookup bid blockMap of
     Nothing -> (renSt, blockMap)
     Just block ->
       let -- Rename phi node definitions (create new versions)
@@ -538,14 +552,14 @@ renameBlock cfg domTree blockId renSt blockMap =
           (renSt2, renamedInstrs) = renameInstrs renSt1 (blockInstrs block)
           -- Update block
           renamedBlock = block { blockPhis = renamedPhis, blockInstrs = renamedInstrs }
-          blockMap1 = Map.insert blockId renamedBlock blockMap
+          blockMap1 = Map.insert bid renamedBlock blockMap
           -- Fill in phi arguments in successor blocks
-          blockMap2 = foldl' (fillPhiArgs blockId renSt2) blockMap1 (successors cfg blockId)
+          blockMap2 = foldl' (fillPhiArgs bid renSt2) blockMap1 (successors cfg bid)
           -- Process children in a dominator tree.
           -- Thread version counters across siblings, but keep parent defs.
           (renSt3, blockMap3) = foldl' (processChild cfg domTree renSt2)
                                         (renSt2, blockMap2)
-                                        (domChildren domTree blockId)
+                                        (domChildren domTree bid)
       in (renSt3, blockMap3)
 
 -- | Process a child in the dominator tree
@@ -564,11 +578,11 @@ renamePhistDefs renSt phis =
   in (st', reverse acc)  -- Reverse since we cons to front
   where
     renamePhi (st, acc) phi =
-      let varName = ssaName (phiVar phi)
-          version = Map.findWithDefault 0 varName (renameVersions st)
-          newVar = SSAVar varName version (ssaVarType (phiVar phi))
-          st' = st { renameVersions = Map.insert varName (version + 1) (renameVersions st)
-                   , renameCurrentDef = Map.insert varName newVar (renameCurrentDef st)
+      let vName = ssaName (phiVar phi)
+          version = lookupInt vName (renameVersions st)
+          newVar = SSAVar vName version (ssaVarType (phiVar phi))
+          st' = st { renameVersions = Map.insert vName (version + 1) (renameVersions st)
+                   , renameCurrentDef = Map.insert vName newVar (renameCurrentDef st)
                    }
           phi' = phi { phiVar = newVar }
       in (st', phi' : acc)  -- O(1) cons instead of O(n) append
@@ -582,11 +596,11 @@ renameInstrs renSt instrs =
     renameInstr (st, acc) instr = case instr of
       SSAAssign var expr ->
         let expr' = renameExpr st expr
-            varName = ssaName var
-            version = Map.findWithDefault 0 varName (renameVersions st)
-            newVar = SSAVar varName version (ssaVarType var)
-            st' = st { renameVersions = Map.insert varName (version + 1) (renameVersions st)
-                     , renameCurrentDef = Map.insert varName newVar (renameCurrentDef st)
+            vName = ssaName var
+            version = lookupInt vName (renameVersions st)
+            newVar = SSAVar vName version (ssaVarType var)
+            st' = st { renameVersions = Map.insert vName (version + 1) (renameVersions st)
+                     , renameCurrentDef = Map.insert vName newVar (renameCurrentDef st)
                      }
         in (st', SSAAssign newVar expr' : acc)
 
@@ -638,8 +652,8 @@ fillPhiArgs predId renSt blockMap succId =
 -- | Fill in phi argument from a specific predecessor
 fillPhiArg :: BlockId -> RenameState -> PhiNode -> PhiNode
 fillPhiArg predId renSt phi =
-  let varName = ssaName (phiVar phi)
-      currentDef = Map.findWithDefault (SSAVar varName 0 Nothing) varName (renameCurrentDef renSt)
+  let vName = ssaName (phiVar phi)
+      currentDef = Map.findWithDefault (SSAVar vName 0 Nothing) vName (renameCurrentDef renSt)
       args' = map updateArg (phiArgs phi)
       updateArg (p, v)
         | p == predId = (p, currentDef)
@@ -771,7 +785,7 @@ ssaCopyProp (SSAProgram classes) =
       SSAExprStmt e -> SSAExprStmt (substExpr copies e)
       i -> i
 
-    substVar copies v = go Set.empty v
+    substVar copies = go Set.empty
       where
         go seen var
           | Set.member (ssaName var, ssaVersion var) seen = var  -- Cycle detected, stop
@@ -870,6 +884,35 @@ licmMethod method =
       loops = findLoops cfg domTree
       licmResult = LICM.runLICM cfg domTree loops (ssaMethodBlocks method)
   in method { ssaMethodBlocks = LICM.licmOptBlocks licmResult }
+
+--------------------------------------------------------------------------------
+-- Strength Reduction Wrapper
+--------------------------------------------------------------------------------
+
+-- | Strength reduction on SSA program (replaces multiplications with additions in loops)
+strengthReduce :: SSAProgram -> SSAProgram
+strengthReduce (SSAProgram classes) = SSAProgram (map srClass classes)
+
+srClass :: SSAClass -> SSAClass
+srClass c = c { ssaClassMethods = map srMethod (ssaClassMethods c) }
+
+srMethod :: SSAMethod -> SSAMethod
+srMethod method =
+  let cfg = buildCFG method
+      domTree = computeDominators cfg
+      loops = findLoops cfg domTree
+      srResult = SR.reduceStrength cfg domTree loops (ssaMethodBlocks method)
+  in method { ssaMethodBlocks = SR.srOptBlocks srResult }
+
+--------------------------------------------------------------------------------
+-- Inlining Wrapper
+--------------------------------------------------------------------------------
+
+-- | Inline small functions (single-block functions like getters/setters)
+ssaInline :: SSAProgram -> SSAProgram
+ssaInline prog =
+  let result = Inline.inlineFunctions Inline.defaultHeuristics prog
+  in Inline.inlineOptProgram result
 
 --------------------------------------------------------------------------------
 -- PRE Wrapper
@@ -992,18 +1035,28 @@ peepholeExpr = \case
 -- Takes an SSA program and applies optimizations, returning optimized SSA.
 -- The caller can then decide to use SSACodegen or fromSSA.
 optimizeSSAProgram :: SSAProgram -> SSAProgram
-optimizeSSAProgram ssaProg =
-  fixedPointWithLimit 3 ssaBasicPipeline ssaProg
+optimizeSSAProgram =
+  fixedPointWithLimit 3 ssaBasicPipeline
 
 -- | Basic SSA optimization pipeline (safe, fast optimizations only)
--- Order: simplifyPhis -> SCCP -> GVN -> PRE -> LICM -> copyProp -> peephole -> DCE
+-- Order: simplifyPhis -> TCO -> Inline -> SCCP -> GVN -> PRE -> LICM -> StrengthReduce -> copyProp -> peephole -> DCE
 ssaBasicPipeline :: SSAProgram -> SSAProgram
 ssaBasicPipeline =
     ssaDeadCodeElim
   . ssaPeephole
   . ssaCopyProp
+  . strengthReduce
   . licm
   . pre
   . gvn
   . sccp
+  . ssaInline
+  . ssaTailCallOpt
   . simplifyPhis
+
+-- | Apply tail call optimization to all methods (experimental)
+-- Can be composed with ssaBasicPipeline: ssaBasicPipeline . ssaTailCallOpt
+ssaTailCallOpt :: SSAProgram -> SSAProgram
+ssaTailCallOpt (SSAProgram classes) = SSAProgram (map optimizeClass classes)
+  where
+    optimizeClass cls = cls { ssaClassMethods = map TCO.optimizeMethodTailCalls (ssaClassMethods cls) }

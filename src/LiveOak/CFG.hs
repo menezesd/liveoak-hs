@@ -9,7 +9,9 @@ module LiveOak.CFG
     CFG(..)
   , CFGBlock(..)
   , Terminator(..)
-  , BlockId(..)
+  , BlockId
+  , blockId
+  , blockIdName
 
     -- * Construction
   , buildCFG
@@ -38,7 +40,7 @@ module LiveOak.CFG
   , splitEdge
   ) where
 
-import LiveOak.SSATypes (BlockId(..), SSABlock(..), SSAInstr(..), SSAMethod(..), PhiNode(..), SSAExpr)
+import LiveOak.SSATypes (BlockId, blockId, blockIdName, SSABlock(..), SSAInstr(..), SSAMethod(..), PhiNode(..), SSAExpr)
 import LiveOak.MapUtils (lookupList)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -276,7 +278,7 @@ splitCriticalEdges cfg =
   in foldl' splitOne (cfg, []) (zip [0 :: Int ..] criticals)
   where
     splitOne (c, created) (n, (from, to)) =
-      let newBlockId = BlockId ("__split_" ++ show n ++ "__")
+      let newBlockId = blockId ("__split_" ++ show n ++ "__")
           (c', _) = splitEdge c from to newBlockId
       in (c', (from, to, newBlockId) : created)
 

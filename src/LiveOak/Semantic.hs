@@ -52,9 +52,8 @@ checkProgramCollectErrors (Program classes) syms =
     entryPointErrors = case getEntrypoint syms of
       Nothing -> [ResolveError "Missing Main.main entry point" 0 0]
       Just ms ->
-        if expectedUserArgs ms > 0
-          then [SyntaxError "Main.main must not have parameters" 0 0]
-          else []
+        [SyntaxError "Main.main must not have parameters" 0 0 |
+          expectedUserArgs ms > 0]
 
     -- Check all methods and collect errors
     methodErrors = concatMap checkClass classes

@@ -5,8 +5,8 @@
 -- Replaces function calls with the function body, eliminating call overhead
 -- and enabling further optimizations.
 --
--- __Status: EXPERIMENTAL__ - This module is not yet integrated into the
--- optimization pipeline. Return value handling is incomplete.
+-- Currently supports inlining of single-block functions (getters, setters,
+-- simple computations). Multi-block functions are not inlined.
 module LiveOak.Inline
   ( -- * Inlining
     inlineFunctions
@@ -77,15 +77,15 @@ analyzeProgram (SSAProgram classes) =
     analyzeClass cls =
       [(fullName cls m, analyzeMethod cls m) | m <- ssaClassMethods cls]
 
-    fullName cls m = ssaClassName cls ++ "_" ++ ssaMethodName m
+    fullName cls m = ssaClassName cls ++ "_" ++ methodNameString (ssaMethodName m)
 
     analyzeMethod cls m =
       let blocks = ssaMethodBlocks m
           size = sum [length (blockInstrs b) + length (blockPhis b) | b <- blocks]
           calls = countCalls blocks
-          isRec = isRecursive (ssaClassName cls) (ssaMethodName m) blocks
+          isRec = isRecursive (ssaClassName cls) (methodNameString (ssaMethodName m)) blocks
       in MethodInfo
-        { miName = ssaMethodName m
+        { miName = methodNameString (ssaMethodName m)
         , miClassName = ssaClassName cls
         , miSize = size
         , miCallCount = calls
@@ -116,8 +116,8 @@ countCalls blocks = sum [countBlockCalls b | b <- blocks]
 
 -- | Check if a method is recursive
 isRecursive :: String -> String -> [SSABlock] -> Bool
-isRecursive className methodName blocks =
-  any (blockIsRecursive className methodName) blocks
+isRecursive className methodName =
+  any (blockIsRecursive className methodName)
   where
     blockIsRecursive cn mn SSABlock{..} =
       any (instrIsRecursive cn mn) blockInstrs
@@ -241,22 +241,75 @@ findInlineableCall toInline = \case
   _ -> Nothing
 
 -- | Inline a single call
+-- For simple functions (single block or straightforward control flow),
+-- we inline by replacing the call with parameter assignments + body + return handling
 inlineCall :: MethodInfo -> Maybe SSAVar -> [SSAExpr] -> Int -> ([SSAInstr], [SSABlock])
-inlineCall info _resultVar args labelCounter =
-  let -- Create parameter assignments
-      paramAssigns = zipWith mkParamAssign (miParams info) args
-      -- Rename blocks to avoid conflicts
-      renamedBlocks = renameBlocks labelCounter (miBlocks info)
-      -- Handle return value
-      -- (simplified - would need proper return handling)
-  in (paramAssigns, renamedBlocks)
-  where
-    mkParamAssign param arg = SSAAssign param arg
+inlineCall info resultVar args _labelCounter =
+  case miBlocks info of
+    -- Simple case: single block function (getters, setters, simple computations)
+    [SSABlock{..}] ->
+      let -- Create parameter assignments (with unique names to avoid conflicts)
+          paramAssigns = zipWith (mkParamAssign _labelCounter) (miParams info) args
+          -- Create a substitution map from original params to inlined params
+          paramSubst = Map.fromList
+            [(ssaName p, inlineParamName _labelCounter p) | p <- miParams info]
+          -- Transform body instructions, substituting params and handling returns
+          bodyInstrs = concatMap (transformInstr paramSubst resultVar) blockInstrs
+      in (paramAssigns ++ bodyInstrs, [])
 
--- | Rename blocks to avoid label conflicts
-renameBlocks :: Int -> [SSABlock] -> [SSABlock]
-renameBlocks counter = map (renameBlock counter)
+    -- Multi-block functions: for now, don't inline (would need proper CFG merging)
+    _ -> ([], [])  -- Return empty to skip inlining
   where
-    renameBlock c block@SSABlock{..} =
-      let name = blockIdName blockLabel
-      in block { blockLabel = BlockId (name ++ "_inline_" ++ show c) }
+    mkParamAssign counter param arg =
+      let newName = inlineParamName counter param
+          newVar = SSAVar newName (ssaVersion param) (ssaVarType param)
+      in SSAAssign newVar arg
+
+    inlineParamName counter param =
+      varName ("__inline_" ++ show counter ++ "_" ++ varNameString (ssaName param))
+
+-- | Transform an instruction for inlining
+-- - Substitute parameter references with inlined parameter names
+-- - Convert returns to assignments (if resultVar is provided)
+transformInstr :: Map VarName VarName -> Maybe SSAVar -> SSAInstr -> [SSAInstr]
+transformInstr subst resultVar = \case
+  -- Return with value: assign to result variable
+  SSAReturn (Just expr) ->
+    case resultVar of
+      Just rv -> [SSAAssign rv (substExpr subst expr)]
+      Nothing -> []  -- Void context, discard return value
+
+  -- Return without value: nothing to do
+  SSAReturn Nothing -> []
+
+  -- Jump/Branch: skip (we're flattening into a single block)
+  SSAJump _ -> []
+  SSABranch {} -> []
+
+  -- Regular instructions: substitute parameters
+  SSAAssign var expr ->
+    [SSAAssign (substVar subst var) (substExpr subst expr)]
+  SSAFieldStore target field idx val ->
+    [SSAFieldStore (substExpr subst target) field idx (substExpr subst val)]
+  SSAExprStmt expr ->
+    [SSAExprStmt (substExpr subst expr)]
+
+-- | Substitute variable names in a variable
+substVar :: Map VarName VarName -> SSAVar -> SSAVar
+substVar subst var =
+  case Map.lookup (ssaName var) subst of
+    Just newName -> var { ssaName = newName }
+    Nothing -> var
+
+-- | Substitute variable names in an expression
+substExpr :: Map VarName VarName -> SSAExpr -> SSAExpr
+substExpr subst = \case
+  SSAUse var -> SSAUse (substVar subst var)
+  SSAUnary op e -> SSAUnary op (substExpr subst e)
+  SSABinary op l r -> SSABinary op (substExpr subst l) (substExpr subst r)
+  SSATernary c t e -> SSATernary (substExpr subst c) (substExpr subst t) (substExpr subst e)
+  SSACall n args -> SSACall n (map (substExpr subst) args)
+  SSAInstanceCall t m args -> SSAInstanceCall (substExpr subst t) m (map (substExpr subst) args)
+  SSANewObject cn args -> SSANewObject cn (map (substExpr subst) args)
+  SSAFieldAccess t f -> SSAFieldAccess (substExpr subst t) f
+  other -> other

@@ -95,7 +95,7 @@ collectExpressions blocks = Set.unions $ map collectBlockExprs blocks
       _ -> Set.empty
 
     exprToName = \case
-      SSAUse var -> Just (ssaName var)
+      SSAUse var -> Just (varNameString (ssaName var))
       SSAInt n -> Just (show n)
       SSABool b -> Just (show b)
       _ -> Nothing
@@ -120,7 +120,7 @@ blockComputes SSABlock{..} = Set.unions $ map instrComputes blockInstrs
       _ -> Set.empty
 
     exprToName = \case
-      SSAUse var -> Just (ssaName var)
+      SSAUse var -> Just (varNameString (ssaName var))
       SSAInt n -> Just (show n)
       SSABool b -> Just (show b)
       _ -> Nothing
@@ -128,8 +128,8 @@ blockComputes SSABlock{..} = Set.unions $ map instrComputes blockInstrs
 -- | Get expressions killed in a block (operand is redefined)
 blockKills :: SSABlock -> Set PREExpr -> Set PREExpr
 blockKills SSABlock{..} allPREExprs =
-  let defs = Set.fromList [ssaName (phiVar phi) | phi <- blockPhis] `Set.union`
-             Set.fromList [ssaName var | SSAAssign var _ <- blockInstrs]
+  let defs = Set.fromList [varNameString (ssaName (phiVar phi)) | phi <- blockPhis] `Set.union`
+             Set.fromList [varNameString (ssaName var) | SSAAssign var _ <- blockInstrs]
   in Set.filter (exprKilledBy defs) allPREExprs
   where
     exprKilledBy defs = \case
@@ -221,8 +221,8 @@ updateAvailBlock cfg blockMap allExprs availSets bid _ =
 earliest :: Map BlockId (Set PREExpr, Set PREExpr) ->  -- ^ Anticipatable
             Map BlockId (Set PREExpr, Set PREExpr) ->  -- ^ Available
             Map BlockId (Set PREExpr)
-earliest antSets availSets =
-  Map.intersectionWith computeEarliest antSets availSets
+earliest =
+  Map.intersectionWith computeEarliest
   where
     computeEarliest (antIn, _) (availIn, _) =
       Set.difference antIn availIn
@@ -279,8 +279,8 @@ eliminatePartialRedundancy cfg _domTree blocks =
 computeInsertions :: Map BlockId (Set PREExpr) ->
                      Map BlockId (Set PREExpr, Set PREExpr) ->
                      Map BlockId (Set PREExpr)
-computeInsertions latestSets availSets =
-  Map.intersectionWith insertHere latestSets availSets
+computeInsertions =
+  Map.intersectionWith insertHere
   where
     insertHere latest' (availIn, _) =
       Set.difference latest' availIn
@@ -289,8 +289,8 @@ computeInsertions latestSets availSets =
 computeDeletions :: Map BlockId (Set PREExpr) ->
                     Map BlockId (Set PREExpr, Set PREExpr) ->
                     Map BlockId (Set PREExpr)
-computeDeletions latestSets availSets =
-  Map.intersectionWith deleteHere latestSets availSets
+computeDeletions =
+  Map.intersectionWith deleteHere
   where
     deleteHere latest' (availIn, _) =
       Set.intersection latest' availIn
@@ -313,11 +313,11 @@ applyPRE insertions deletions = map applyToBlock
     exprToInstr = \case
       PREBinary op l r ->
         -- Create a temporary variable for the result
-        let tempVar = SSAVar ("__pre_" ++ show op ++ "_" ++ l ++ "_" ++ r) 0 Nothing
+        let tempVar = SSAVar (varName ("__pre_" ++ show op ++ "_" ++ l ++ "_" ++ r)) 0 Nothing
             expr = SSABinary op (nameToExpr l) (nameToExpr r)
         in SSAAssign tempVar expr
       PREUnary op o ->
-        let tempVar = SSAVar ("__pre_" ++ show op ++ "_" ++ o) 0 Nothing
+        let tempVar = SSAVar (varName ("__pre_" ++ show op ++ "_" ++ o)) 0 Nothing
             expr = SSAUnary op (nameToExpr o)
         in SSAAssign tempVar expr
 
@@ -333,7 +333,7 @@ applyPRE insertions deletions = map applyToBlock
       _ -> False
 
     exprToName = \case
-      SSAUse var -> Just (ssaName var)
+      SSAUse var -> Just (varNameString (ssaName var))
       SSAInt n -> Just (show n)
       SSABool b -> Just (show b)
       _ -> Nothing
@@ -342,4 +342,4 @@ applyPRE insertions deletions = map applyToBlock
       | all (`elem` ("-0123456789" :: String)) name = SSAInt (read name)
       | name == "True" = SSABool True
       | name == "False" = SSABool False
-      | otherwise = SSAUse (SSAVar name 0 Nothing)
+      | otherwise = SSAUse (SSAVar (varName name) 0 Nothing)

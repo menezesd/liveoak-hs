@@ -23,7 +23,7 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.List (foldl', sort)
-import Data.Maybe (isJust)
+import Data.Maybe (fromMaybe, isJust)
 
 import LiveOak.Ast (UnaryOp(..), BinaryOp(..))
 import LiveOak.SSATypes
@@ -118,12 +118,13 @@ generateMethodFromCFG = generateMethodSSA
 generateMethodSSA :: ProgramSymbols -> String -> SSAMethod -> Result Text
 generateMethodSSA syms clsName method@SSAMethod{..} = do
   let cfg = buildCFG method
-  methodSymbol <- case lookupClass clsName syms >>= lookupMethod ssaMethodName of
+      methodNameStr = methodNameString ssaMethodName
+  methodSymbol <- case lookupClass clsName syms >>= lookupMethod methodNameStr of
     Just ms -> return ms
-    Nothing -> D.resolveErr ("Unknown method symbol for " ++ clsName ++ "." ++ ssaMethodName) 0 0
+    Nothing -> D.resolveErr ("Unknown method symbol for " ++ clsName ++ "." ++ methodNameStr) 0 0
 
   -- Compute phi copies to insert in predecessor blocks
-  let phiCopies = computePhiCopies cfg (ssaMethodBlocks)
+  let phiCopies = computePhiCopies cfg ssaMethodBlocks
 
       -- Build type environment for this method
       typeEnv = buildTypeEnv ssaMethodBlocks syms ssaMethodClassName ssaMethodParams
@@ -151,7 +152,7 @@ generateMethodSSA syms clsName method@SSAMethod{..} = do
       ctx = SSACodegenCtx
         { scgSymbols = syms
         , scgClassName = clsName
-        , scgMethodName = ssaMethodName
+        , scgMethodName = methodNameStr
         , scgMethodSymbol = methodSymbol
         , scgCFG = cfg
         , scgPhiCopies = phiCopies
@@ -174,7 +175,7 @@ emitMethodCFG :: SSAMethod -> SSACodegen ()
 emitMethodCFG SSAMethod{..} = do
   clsName <- asks scgClassName
   -- Emit method label
-  let label = T.pack clsName <> "_" <> T.pack ssaMethodName
+  let label = methodLabelText clsName ssaMethodName
   emit $ "\n" <> label <> ":\n"
 
   -- Method prologue
@@ -195,13 +196,11 @@ emitMethodCFG SSAMethod{..} = do
 
   -- Emit blocks in reverse postorder
   let blockOrder = reversePostorder cfg
-  forM_ blockOrder $ \blockId ->
-    case getBlock cfg blockId of
-      Just block -> emitBlock block
-      Nothing -> return ()
+  forM_ blockOrder $ \bid ->
+    forM_ (getBlock cfg bid) emitBlock
 
   -- Method epilogue (return label)
-  emit $ label <> "_return:\n"
+  emit $ methodReturnLabelText clsName ssaMethodName <> ":\n"
   -- Pop local variables before unlinking (they're still on stack after ADDSP allocations)
   when (localCount > 0) $
     emit $ "ADDSP " <> tshow (-localCount) <> "\n"
@@ -215,9 +214,9 @@ collectAllVars blocks = Set.unions $ map blockVars blocks
     blockVars SSABlock{..} =
       Set.unions $ map phiVars blockPhis ++ map instrVars blockInstrs
 
-    phiVars PhiNode{..} = Set.singleton (ssaName phiVar)
+    phiVars PhiNode{..} = Set.singleton (varNameString (ssaName phiVar))
 
-    instrVars (SSAAssign var _) = Set.singleton (ssaName var)
+    instrVars (SSAAssign var _) = Set.singleton (varNameString (ssaName var))
     instrVars _ = Set.empty
 
 --------------------------------------------------------------------------------
@@ -246,7 +245,7 @@ emitInstr :: SSAInstr -> SSACodegen ()
 emitInstr = \case
   SSAAssign var expr -> do
     emitSSAExpr expr
-    slot <- getVarSlot (ssaName var)
+    slot <- getVarSlot (varNameString (ssaName var))
     emit $ "STOREOFF " <> tshow slot <> "\n"
 
   SSAFieldStore target _field off value -> do
@@ -328,7 +327,7 @@ emitTerminator currentBlock term = do
           emit $ "STOREOFF " <> tshow returnSlot <> "\n"
       clsName <- asks scgClassName
       methName <- asks scgMethodName
-      let retLabel = T.pack clsName <> "_" <> T.pack methName <> "_return"
+      let retLabel = methodReturnLabelTextFromString clsName methName
       emit $ "JUMP " <> retLabel <> "\n"
 
 -- | Find a method in all classes (used as fallback when type inference fails)
@@ -362,7 +361,7 @@ emitSSAExpr = \case
     emit "PUSHIMM 0\n"
 
   SSAUse var -> do
-    slot <- getVarSlot (ssaName var)
+    slot <- getVarSlot (varNameString (ssaName var))
     emit $ "PUSHOFF " <> tshow slot <> "\n"
 
   SSAThis -> do
@@ -501,13 +500,10 @@ emitSSAExpr = \case
     let targetClass = case target of
           SSAThis -> Just className  -- Use current class for 'this'
           _ -> inferSSAExprClassWithCtx (Just className) syms typeEnv target
-        offset = case targetClass of
-          Just cn -> case lookupClass cn syms of
-            Just cs -> case fieldOffset field cs of
-              Just off -> off
-              Nothing -> 0  -- Field not found, default to 0
-            Nothing -> 0  -- Class not found, default to 0
-          Nothing -> 0  -- Can't infer type, default to 0
+        offset = fromMaybe 0 $ do
+          cn <- targetClass
+          cs <- lookupClass cn syms
+          fieldOffset field cs
     emit $ "PUSHIMM " <> tshow offset <> "\n"
     emit "ADD\n"
     emit "PUSHIND\n"
@@ -614,7 +610,7 @@ stringBinaryEmitterSSA syms methSym currentClass tenv op lType rType l r
       SSAUse v ->
         case inferSSAExprType syms tenv (SSAUse v) of
           Just t -> t == ofPrimitive TString
-          Nothing -> lookupVarType (ssaName v)
+          Nothing -> lookupVarType (varNameString (ssaName v))
       _ -> False
 
     isStringFieldUse = \case
@@ -703,7 +699,7 @@ computePhiCopies cfg blocks =
 -- | Get phi copies for a block
 blockPhiCopies :: CFG -> SSABlock -> [(BlockId, BlockId, String, String)]
 blockPhiCopies _cfg SSABlock{..} =
-  [ (predBlock, blockLabel, ssaName (phiVar phi), ssaName srcVar)
+  [ (predBlock, blockLabel, varNameString (ssaName (phiVar phi)), varNameString (ssaName srcVar))
   | phi <- blockPhis
   , (predBlock, srcVar) <- phiArgs phi
   ]
@@ -717,8 +713,24 @@ emit :: Text -> SSACodegen ()
 emit t = modify $ \s -> s { scgCode = scgCode s <> B.fromText t }
 
 -- | Generate predictable TCO entry label.
+methodLabelTextFromString :: String -> String -> Text
+methodLabelTextFromString clsName methName = T.pack clsName <> "_" <> T.pack methName
+
+methodLabelText :: String -> MethodName -> Text
+methodLabelText clsName methName =
+  methodLabelTextFromString clsName (methodNameString methName)
+
+methodReturnLabelTextFromString :: String -> String -> Text
+methodReturnLabelTextFromString clsName methName =
+  methodLabelTextFromString clsName methName <> "_return"
+
+methodReturnLabelText :: String -> MethodName -> Text
+methodReturnLabelText clsName methName =
+  methodReturnLabelTextFromString clsName (methodNameString methName)
+
 methodTCOLabelText :: String -> String -> Text
-methodTCOLabelText clsName methName = T.pack clsName <> "_" <> T.pack methName <> "_tco"
+methodTCOLabelText clsName methName =
+  methodLabelTextFromString clsName methName <> "_tco"
 
 -- | Generate a method-specific prefix for block labels.
 methodLabelPrefixText :: SSACodegen Text

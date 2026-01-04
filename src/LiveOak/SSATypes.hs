@@ -1,5 +1,3 @@
-{-# LANGUAGE LambdaCase #-}
-
 -- | SSA type definitions for LiveOak.
 -- This module is separate to avoid circular dependencies with CFG.
 module LiveOak.SSATypes
@@ -11,8 +9,16 @@ module LiveOak.SSATypes
   , SSAInstr(..)
   , SSAExpr(..)
   , PhiNode(..)
-  , BlockId(..)
+  , BlockId
+  , blockId
+  , blockIdName
   , SSAVar(..)
+  , VarName
+  , varName
+  , varNameString
+  , MethodName
+  , methodNameFromString
+  , methodNameString
 
     -- * Variable Key
   , VarKey
@@ -28,16 +34,44 @@ import LiveOak.Types (ValueType)
 --------------------------------------------------------------------------------
 
 -- | Block identifier.
-newtype BlockId = BlockId
-  { blockIdName :: String
-  } deriving (Eq, Ord)
+newtype BlockId = BlockId String deriving (Eq, Ord)
 
 instance Show BlockId where
   show = blockIdName
 
+blockId :: String -> BlockId
+blockId = BlockId
+
+blockIdName :: BlockId -> String
+blockIdName (BlockId name) = name
+
+-- | Variable name.
+newtype VarName = VarName String deriving (Eq, Ord)
+
+instance Show VarName where
+  show = varNameString
+
+varName :: String -> VarName
+varName = VarName
+
+varNameString :: VarName -> String
+varNameString (VarName name) = name
+
+-- | Method name.
+newtype MethodName = MethodName String deriving (Eq, Ord)
+
+instance Show MethodName where
+  show = methodNameString
+
+methodNameFromString :: String -> MethodName
+methodNameFromString = MethodName
+
+methodNameString :: MethodName -> String
+methodNameString (MethodName name) = name
+
 -- | SSA variable with version number
 data SSAVar = SSAVar
-  { ssaName :: !String     -- ^ Original variable name
+  { ssaName :: !VarName    -- ^ Original variable name
   , ssaVersion :: !Int     -- ^ Version number (0 = original)
   , ssaVarType :: !(Maybe ValueType)  -- ^ Type (if known, e.g., for parameters)
   } deriving (Eq, Ord, Show)
@@ -85,7 +119,7 @@ data SSABlock = SSABlock
 -- | Method in SSA form
 data SSAMethod = SSAMethod
   { ssaMethodClassName :: !String       -- ^ Containing class name
-  , ssaMethodName :: !String
+  , ssaMethodName :: !MethodName
   , ssaMethodParams :: ![SSAVar]        -- ^ Parameters as SSA vars (version 0)
   , ssaMethodReturnSig :: !ReturnSig    -- ^ Return signature
   , ssaMethodBlocks :: ![SSABlock]      -- ^ Basic blocks
@@ -100,8 +134,8 @@ data SSAClass = SSAClass
   } deriving (Eq, Show)
 
 -- | Program in SSA form
-data SSAProgram = SSAProgram
-  { ssaClasses :: ![SSAClass]
+newtype SSAProgram = SSAProgram
+  { ssaClasses :: [SSAClass]
   } deriving (Eq, Show)
 
 --------------------------------------------------------------------------------
@@ -109,7 +143,7 @@ data SSAProgram = SSAProgram
 --------------------------------------------------------------------------------
 
 -- | A key for identifying SSA variables (name, version)
-type VarKey = (String, Int)
+type VarKey = (VarName, Int)
 
 -- | Create a VarKey from an SSAVar
 varKey :: SSAVar -> VarKey

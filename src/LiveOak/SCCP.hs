@@ -65,7 +65,7 @@ import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.List (foldl')
-import Control.Monad (forM, forM_, when, unless)
+import Control.Monad (foldM, forM, forM_, when, unless)
 import Control.Monad.State.Strict
 
 --------------------------------------------------------------------------------
@@ -135,7 +135,7 @@ initSCCPState entry params = SCCPState
   , sccpExecBlocks = Set.empty
   , sccpExecEdges = Set.empty
   , sccpSSAWorklist = []
-  , sccpCFGWorklist = [(BlockId "__entry__", entry)]  -- Virtual entry edge
+  , sccpCFGWorklist = [(blockId "__entry__", entry)]  -- Virtual entry edge
   }
 
 type SCCP a = State SCCPState a
@@ -202,15 +202,11 @@ processCFGWorklist cfg blockMap = do
         if Set.member to execBlocks
           then do
             -- Block already executed - just evaluate phis for new edge
-            case Map.lookup to blockMap of
-              Just block -> evaluatePhisForEdge from block
-              Nothing -> return ()
+            forM_ (Map.lookup to blockMap) (evaluatePhisForEdge from)
           else do
             -- First time executing this block
             modify $ \s -> s { sccpExecBlocks = Set.insert to execBlocks }
-            case Map.lookup to blockMap of
-              Just block -> evaluateBlock cfg block
-              Nothing -> return ()
+            forM_ (Map.lookup to blockMap) (evaluateBlock cfg)
       return False  -- Not done
 
 -- | Process SSA variable worklist
@@ -253,14 +249,16 @@ evaluatePhisForEdge from SSABlock{..} = do
 
 -- | Evaluate a phi node
 evaluatePhi :: BlockId -> PhiNode -> SCCP ()
-evaluatePhi blockId PhiNode{..} = do
+evaluatePhi bid PhiNode{..} = do
   execEdges <- gets sccpExecEdges
-  vals <- forM phiArgs $ \(pred, argVar) ->
-    if Set.member (pred, blockId) execEdges
-      then Just <$> getVarValue (varKey argVar)
-      else return Nothing
-  let result = foldl' meet Top [v | Just v <- vals]
+  result <- foldM (meetExecEdge execEdges) Top phiArgs
   setVarValue (varKey phiVar) result
+  where
+    meetExecEdge execEdges acc (predBlock, argVar)
+      | Set.member (predBlock, bid) execEdges = do
+          val <- getVarValue (varKey argVar)
+          return (meet acc val)
+      | otherwise = return acc
 
 -- | Evaluate an instruction
 evaluateInstr :: SSAInstr -> SCCP ()
@@ -272,22 +270,22 @@ evaluateInstr = \case
 
 -- | Evaluate the terminator to determine executable edges
 evaluateTerminator :: CFG -> BlockId -> [SSAInstr] -> SCCP ()
-evaluateTerminator _cfg blockId instrs = do
+evaluateTerminator _cfg bid instrs = do
   case findTerminator instrs of
     Just (SSAJump target) ->
-      addCFGEdge blockId target
+      addCFGEdge bid target
     Just (SSABranch cond thenB elseB) -> do
       condVal <- evaluateExpr cond
       case condVal of
-        ConstBool True -> addCFGEdge blockId thenB
-        ConstBool False -> addCFGEdge blockId elseB
+        ConstBool True -> addCFGEdge bid thenB
+        ConstBool False -> addCFGEdge bid elseB
         ConstInt n -> if n /= 0
-                      then addCFGEdge blockId thenB
-                      else addCFGEdge blockId elseB
-        ConstNull -> addCFGEdge blockId elseB  -- null is falsy
+                      then addCFGEdge bid thenB
+                      else addCFGEdge bid elseB
+        ConstNull -> addCFGEdge bid elseB  -- null is falsy
         _ -> do  -- Unknown - both branches possible
-          addCFGEdge blockId thenB
-          addCFGEdge blockId elseB
+          addCFGEdge bid thenB
+          addCFGEdge bid elseB
     Just (SSAReturn _) -> return ()  -- No successors
     Just _ -> return ()  -- Other instructions (not terminators)
     Nothing -> return ()
@@ -393,7 +391,7 @@ evaluateUses cfg blockMap useMap var = do
 --------------------------------------------------------------------------------
 
 buildUseMap :: [SSABlock] -> Map VarKey (Set BlockId)
-buildUseMap blocks = foldl' addBlock Map.empty blocks
+buildUseMap = foldl' addBlock Map.empty
   where
     addBlock acc SSABlock{..} =
       let bid = blockLabel

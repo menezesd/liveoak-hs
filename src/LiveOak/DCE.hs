@@ -59,9 +59,9 @@ buildDefUseChains blocks =
 collectDefs :: Map String DefSite -> SSABlock -> Map String DefSite
 collectDefs acc SSABlock{..} =
   let -- Phi definitions
-      phiDefs = [(ssaName (phiVar phi), DefSite blockLabel (-1)) | phi <- blockPhis]
+      phiDefs = [(varNameString (ssaName (phiVar phi)), DefSite blockLabel (-1)) | phi <- blockPhis]
       -- Instruction definitions
-      instrDefs = [(ssaName var, DefSite blockLabel i)
+      instrDefs = [(varNameString (ssaName var), DefSite blockLabel i)
                   | (i, SSAAssign var _) <- zip [0..] blockInstrs]
   in foldl' (\m (k, v) -> Map.insert k v m) acc (phiDefs ++ instrDefs)
 
@@ -69,7 +69,7 @@ collectDefs acc SSABlock{..} =
 collectUses :: Map String (Set UseSite) -> SSABlock -> Map String (Set UseSite)
 collectUses acc SSABlock{..} =
   let -- Phi uses
-      phiUses = [(ssaName argVar, UseSite blockLabel (-1))
+      phiUses = [(varNameString (ssaName argVar), UseSite blockLabel (-1))
                 | phi <- blockPhis
                 , (_, argVar) <- phiArgs phi]
       -- Instruction uses
@@ -100,7 +100,7 @@ exprVarUses = \case
   SSAStr _ -> []
   SSANull -> []
   SSAThis -> []
-  SSAUse var -> [ssaName var]
+  SSAUse var -> [varNameString (ssaName var)]
   SSAUnary _ e -> exprVarUses e
   SSABinary _ l r -> exprVarUses l ++ exprVarUses r
   SSATernary c t e -> exprVarUses c ++ exprVarUses t ++ exprVarUses e
@@ -215,7 +215,7 @@ filterPhis live phis =
       liveCount = length livePhis
   in (livePhis, totalCount - liveCount)
   where
-    isLivePhi liveSet phi = Set.member (ssaName (phiVar phi)) liveSet
+    isLivePhi liveSet phi = Set.member (varNameString (ssaName (phiVar phi))) liveSet
 
 -- | Filter instructions, keeping only live ones or those with side effects
 filterInstrs :: Set String -> [SSAInstr] -> ([SSAInstr], Int)
@@ -227,7 +227,7 @@ filterInstrs live instrs =
   where
     isLiveInstr liveSet = \case
       SSAAssign var expr ->
-        Set.member (ssaName var) liveSet || hasSideEffects expr
+        Set.member (varNameString (ssaName var)) liveSet || hasSideEffects expr
       -- Always keep terminators and side-effecting instructions
       SSAReturn _ -> True
       SSAJump _ -> True

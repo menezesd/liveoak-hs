@@ -1,4 +1,3 @@
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE RecordWildCards #-}
 
 -- | Register Allocation using Graph Coloring.
@@ -141,7 +140,7 @@ blockInstrLiveness bid SSABlock{..} out =
     go (live, acc) (idx, instr) =
       let acc' = Map.insert (bid, idx) live acc
           def = case instr of
-            SSAAssign var _ -> Set.singleton (ssaName var)
+            SSAAssign var _ -> Set.singleton (varNameString (ssaName var))
             _ -> Set.empty
           use = instrUses instr
           live' = Set.union use (Set.difference live def)
@@ -170,9 +169,9 @@ collectAllVars :: [SSABlock] -> Set String
 collectAllVars blocks = Set.unions $ map blockVars blocks
   where
     blockVars SSABlock{..} = Set.fromList $
-      [ssaName (phiVar phi) | phi <- blockPhis] ++
-      [ssaName v | (_, v) <- concatMap phiArgs blockPhis] ++
-      [ssaName var | SSAAssign var _ <- blockInstrs] ++
+      [varNameString (ssaName (phiVar phi)) | phi <- blockPhis] ++
+      [varNameString (ssaName v) | (_, v) <- concatMap phiArgs blockPhis] ++
+      [varNameString (ssaName var) | SSAAssign var _ <- blockInstrs] ++
       Set.toList (Set.unions $ map instrUses blockInstrs)
 
 -- | Build interference edges
@@ -186,13 +185,13 @@ buildEdges blocks liveness =
     addInstrEdges bid linfo acc (idx, instr) =
       let live = lookupSet (bid, idx) (liveAtPoint linfo)
           def = case instr of
-            SSAAssign var _ -> Just (ssaName var)
+            SSAAssign var _ -> Just (varNameString (ssaName var))
             _ -> Nothing
       in case def of
         Just d ->
           -- d interferes with everything live at this point (except itself)
           let others = Set.delete d live
-          in foldl' (\m v -> addEdge m d v) acc (Set.toList others)
+          in foldl' (`addEdge` d) acc (Set.toList others)
         Nothing -> acc
 
     addEdge m v1 v2 =
@@ -204,10 +203,10 @@ findMoves :: [SSABlock] -> Set (String, String)
 findMoves blocks = Set.fromList $ concatMap blockMoves blocks
   where
     blockMoves SSABlock{..} = concat
-      [ [(ssaName (phiVar phi), ssaName v) | (_, v) <- phiArgs phi]
+      [ [(varNameString (ssaName (phiVar phi)), varNameString (ssaName v)) | (_, v) <- phiArgs phi]
       | phi <- blockPhis
       ] ++
-      [ (ssaName var, ssaName src)
+      [ (varNameString (ssaName var), varNameString (ssaName src))
       | SSAAssign var (SSAUse src) <- blockInstrs
       ]
 
