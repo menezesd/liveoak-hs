@@ -137,7 +137,22 @@ stmtToBlocks :: String -> Stmt -> SSAConv [SSABlock]
 stmtToBlocks label = \case
   Block stmts _ -> do
     (instrs, blocks) <- stmtsToInstrs stmts
-    return $ SSABlock label [] instrs : blocks
+    -- Merge instructions with first block if possible
+    case (instrs, blocks) of
+      ([], []) -> return [SSABlock label [] []]
+      (_, []) -> return [SSABlock label [] instrs]
+      ([], firstBlock:rest) ->
+        -- No entry instructions, rename first block to entry and update references
+        let oldLabel = blockLabel firstBlock
+            renamedFirst = firstBlock { blockLabel = label }
+            updatedRest = map (updateBlockRefs oldLabel label) rest
+        in return (renamedFirst : updatedRest)
+      (_, firstBlock:rest) ->
+        -- Merge entry instructions into first block and update references
+        let oldLabel = blockLabel firstBlock
+            mergedFirst = SSABlock label (blockPhis firstBlock) (instrs ++ blockInstrs firstBlock)
+            updatedRest = map (updateBlockRefs oldLabel label) rest
+        in return (mergedFirst : updatedRest)
 
   VarDecl name _ initOpt _ -> do
     case initOpt of
@@ -236,6 +251,19 @@ addJumpToEnd blocks target =
       lastWithJump = last' { blockInstrs = blockInstrs last' ++ [SSAJump target] }
   in init' ++ [lastWithJump]
 
+-- | Update all references to a block label within a block's instructions
+updateBlockRefs :: String -> String -> SSABlock -> SSABlock
+updateBlockRefs oldLabel newLabel block =
+  block { blockInstrs = map updateInstr (blockInstrs block) }
+  where
+    updateInstr instr = case instr of
+      SSAJump target | target == oldLabel -> SSAJump newLabel
+      SSABranch cond t f ->
+        let t' = if t == oldLabel then newLabel else t
+            f' = if f == oldLabel then newLabel else f
+        in SSABranch cond t' f'
+      _ -> instr
+
 -- | Convert statements to instructions
 -- When we hit a control-flow statement (if/while), we need to ensure remaining
 -- statements are placed correctly after the control flow, not mixed into the entry block.
@@ -244,7 +272,8 @@ stmtsToInstrs stmts = go stmts []
   where
     go [] instrs = return (reverse instrs, [])
     go (stmt:rest) instrs = do
-      blocks <- stmtToBlocks "temp" stmt
+      tempLabel <- freshBlock
+      blocks <- stmtToBlocks tempLabel stmt
       case blocks of
         [SSABlock _ [] newInstrs] ->
           -- Simple statement - accumulate instructions
@@ -398,14 +427,24 @@ insertPhisForVar cfg blockMap varName phiBlocks =
 -- Uses dominator tree traversal to maintain reaching definitions
 renameVariables :: CFG -> DomTree -> [ParamDecl] -> [SSABlock] -> [SSABlock]
 renameVariables cfg domTree params blocks =
-  let -- Initialize with parameters as version 0
-      initVersions = Map.fromList [(paramName p, 0) | p <- params]
+  let -- Initialize with parameters as version 0 (next version is 1)
+      initVersions = Map.fromList [(paramName p, 1) | p <- params]
       initDefs = Map.fromList [(paramName p, SSAVar (paramName p) 0 (Just (paramType p))) | p <- params]
       initState = RenameState initVersions initDefs
       -- Process blocks in dominator tree order
       blockMap = Map.fromList [(blockLabel b, b) | b <- blocks]
-      (_, renamedMap) = renameBlock cfg domTree (cfgEntry cfg) initState blockMap
-  in map snd $ Map.toList renamedMap
+      entry = cfgEntry cfg
+      (finalState, renamedMap) = if Map.member entry blockMap
+        then renameBlock cfg domTree entry initState blockMap
+        else (initState, blockMap)  -- Entry doesn't exist, skip renaming
+      -- Process any unreachable blocks that weren't renamed
+      allBlockIds = Map.keysSet blockMap
+      renamedBlockIds = Map.keysSet renamedMap
+      unreached = Set.toList $ Set.difference allBlockIds renamedBlockIds
+      finalMap = foldl' (\m bid -> case Map.lookup bid blockMap of
+                          Nothing -> m
+                          Just b -> Map.insert bid b m) renamedMap unreached
+  in map snd $ Map.toList finalMap
 
 -- | State for variable renaming
 data RenameState = RenameState

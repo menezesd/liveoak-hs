@@ -69,9 +69,10 @@ compileWithWarnings path source = do
   -- Collect warnings
   let warnings = collectWarnings program symbols
 
-  -- Use traditional codegen (SSA codegen fully debugged but needs CFG-based SSA with proper phi nodes)
+  -- Use SSA-based codegen
   let optimizedProgram = optimize symbols program
-  code <- generateCode optimizedProgram symbols
+      ssaProg = SSA.toSSA symbols optimizedProgram
+  code <- SSACodegen.generateFromSSA ssaProg symbols
 
   -- Peephole optimize SAM code
   let optimizedCode = Peephole.optimizeText code

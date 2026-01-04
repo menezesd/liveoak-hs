@@ -120,7 +120,7 @@ generateMethodSSA syms clsName method@SSAMethod{..} = do
       phiCopies = computePhiCopies cfg (ssaMethodBlocks)
 
       -- Build type environment for this method
-      typeEnv = buildTypeEnv ssaMethodBlocks syms
+      typeEnv = buildTypeEnv ssaMethodBlocks syms ssaMethodClassName
 
       -- totalParams includes 'this' (like traditional codegen)
       totalParams = 1 + length ssaMethodParams
@@ -378,9 +378,12 @@ emitSSAExpr = \case
     -- Infer target class type and use qualified method name
     syms <- asks scgSymbols
     typeEnv <- asks scgTypeEnv
-    let methodLabel = case inferSSAExprClass syms typeEnv target of
-          Just className -> T.pack className <> "_" <> T.pack method
-          Nothing -> T.pack method  -- Fallback to bare name
+    className <- asks scgClassName
+    let methodLabel = case target of
+          SSAThis -> T.pack className <> "_" <> T.pack method  -- 'this' is current class
+          _ -> case inferSSAExprClass syms typeEnv target of
+                 Just cn -> T.pack cn <> "_" <> T.pack method
+                 Nothing -> T.pack method  -- Fallback to bare name
     emit $ "JSR " <> methodLabel <> "\n"
     emit "UNLINK\n"
     emit $ "ADDSP " <> tshow (negate $ length args + 1) <> "\n"  -- +1 for 'this', return slot stays
