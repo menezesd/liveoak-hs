@@ -18,6 +18,7 @@ module LiveOak.Parser
   ) where
 
 import Control.Monad (when)
+import Data.List (foldl')
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
@@ -70,7 +71,7 @@ buildSymbols classes = do
     findDuplicates :: [String] -> [String]
     findDuplicates names = [n | (n, cnt) <- Map.toList (countNames names), cnt > 1]
     countNames :: [String] -> Map String Int
-    countNames = foldr (\n m -> Map.insertWith (+) n 1 m) Map.empty
+    countNames = foldl' (\m n -> Map.insertWith (+) n 1 m) Map.empty
     checkClassDuplicates :: ClassDecl -> Parser ()
     checkClassDuplicates ClassDecl{..} = do
       let fieldNames = map fst classFields

@@ -82,18 +82,26 @@ computeLiveness cfg blocks =
     , liveAtPoint = perInstr
     }
 
--- | Iterate liveness until fixed point
+-- | Maximum iterations for liveness analysis fixed-point computation.
+-- Most CFGs converge within 10 iterations; 100 provides safety margin.
+maxLivenessIterations :: Int
+maxLivenessIterations = 100
+
+-- | Iterate liveness until fixed point or max iterations reached
 iterateLiveness :: CFG -> Map BlockId SSABlock ->
                    Map BlockId (Set String) -> Map BlockId (Set String) ->
                    (Map BlockId (Set String), Map BlockId (Set String))
-iterateLiveness cfg blockMap liveIn liveOut =
-  let -- Compute new liveOut: union of liveIn of all successors
-      newOut = Map.mapWithKey (computeOut cfg liveIn) liveOut
-      -- Compute new liveIn: (liveOut - defs) ∪ uses
-      newIn = Map.mapWithKey (computeIn blockMap newOut) liveIn
-  in if newIn == liveIn && newOut == liveOut
-     then (newIn, newOut)
-     else iterateLiveness cfg blockMap newIn newOut
+iterateLiveness cfg blockMap = go maxLivenessIterations
+  where
+    go 0 liveIn liveOut = (liveIn, liveOut)  -- Max iterations reached
+    go n liveIn liveOut =
+      let -- Compute new liveOut: union of liveIn of all successors
+          newOut = Map.mapWithKey (computeOut cfg liveIn) liveOut
+          -- Compute new liveIn: (liveOut - defs) ∪ uses
+          newIn = Map.mapWithKey (computeIn blockMap newOut) liveIn
+      in if newIn == liveIn && newOut == liveOut
+         then (newIn, newOut)
+         else go (n - 1) newIn newOut
 
 -- | Compute live-out for a block
 computeOut :: CFG -> Map BlockId (Set String) -> BlockId -> Set String -> Set String

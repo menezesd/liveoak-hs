@@ -67,7 +67,7 @@ import qualified LiveOak.GVN as GVN
 import qualified LiveOak.LICM as LICM
 import qualified LiveOak.SCCP as SCCP
 import LiveOak.Loop (findLoops)
-import LiveOak.SSAUtils (blockMapFromList)
+import LiveOak.SSAUtils (blockMapFromList, fixedPointWithLimit)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
@@ -153,20 +153,21 @@ methodToSSA syms clsName MethodDecl{..} =
   where
     -- Add an implicit return to the last block if it doesn't have a terminator
     ensureTerminator [] = []
-    ensureTerminator bs =
-      let (initBs, lastB) = (init bs, last bs)
-          lastInstrs = blockInstrs lastB
-          blockHasTerminator = case lastInstrs of
-            [] -> False
-            instrs -> case last instrs of
-              SSAReturn _ -> True
-              SSAJump _ -> True
-              SSABranch _ _ _ -> True
-              _ -> False
-          fixedLast = if blockHasTerminator
-                      then lastB
-                      else lastB { blockInstrs = lastInstrs ++ [SSAReturn Nothing] }
-      in initBs ++ [fixedLast]
+    ensureTerminator bs = case reverse bs of
+      [] -> []  -- Already handled by pattern above, but safe
+      (lastB:initBsRev) ->
+        let lastInstrs = blockInstrs lastB
+            blockHasTerminator = case reverse lastInstrs of
+              [] -> False
+              (lastInstr:_) -> case lastInstr of
+                SSAReturn _ -> True
+                SSAJump _ -> True
+                SSABranch _ _ _ -> True
+                _ -> False
+            fixedLast = if blockHasTerminator
+                        then lastB
+                        else lastB { blockInstrs = lastInstrs ++ [SSAReturn Nothing] }
+        in reverse (fixedLast : initBsRev)
 
 -- | Convert a statement to SSA blocks
 stmtToBlocks :: Maybe String -> String -> Stmt -> SSAConv [SSABlock]
@@ -917,6 +918,7 @@ peepholeExpr = \case
   -- double negation
   SSAUnary Neg (SSAUnary Neg e) -> peepholeExpr e
   SSAUnary Not (SSAUnary Not e) -> peepholeExpr e
+
   -- arithmetic identities
   SSABinary Add e (SSAInt 0) -> peepholeExpr e
   SSABinary Add (SSAInt 0) e -> peepholeExpr e
@@ -924,9 +926,33 @@ peepholeExpr = \case
   SSABinary Mul e (SSAInt 1) -> peepholeExpr e
   SSABinary Mul (SSAInt 1) e -> peepholeExpr e
   SSABinary Div e (SSAInt 1) -> peepholeExpr e
+
   -- arithmetic with zero
   SSABinary Mul _ (SSAInt 0) -> SSAInt 0
   SSABinary Mul (SSAInt 0) _ -> SSAInt 0
+
+  -- Cancellation patterns: (a - b) + b = a, (a + b) - b = a
+  SSABinary Add (SSABinary Sub a (SSAUse v1)) (SSAUse v2)
+    | varKey v1 == varKey v2 -> peepholeExpr a
+  SSABinary Sub (SSABinary Add a (SSAUse v1)) (SSAUse v2)
+    | varKey v1 == varKey v2 -> peepholeExpr a
+
+  -- Boolean absorption: a || (a && b) = a, a && (a || b) = a
+  SSABinary Or a@(SSAUse v1) (SSABinary And (SSAUse v2) _)
+    | varKey v1 == varKey v2 -> peepholeExpr a
+  SSABinary Or a@(SSAUse v1) (SSABinary And _ (SSAUse v2))
+    | varKey v1 == varKey v2 -> peepholeExpr a
+  SSABinary And a@(SSAUse v1) (SSABinary Or (SSAUse v2) _)
+    | varKey v1 == varKey v2 -> peepholeExpr a
+  SSABinary And a@(SSAUse v1) (SSABinary Or _ (SSAUse v2))
+    | varKey v1 == varKey v2 -> peepholeExpr a
+
+  -- Boolean idempotence: a && a = a, a || a = a
+  SSABinary And a@(SSAUse v1) (SSAUse v2)
+    | varKey v1 == varKey v2 -> peepholeExpr a
+  SSABinary Or a@(SSAUse v1) (SSAUse v2)
+    | varKey v1 == varKey v2 -> peepholeExpr a
+
   -- recursively apply
   SSAUnary op e -> SSAUnary op (peepholeExpr e)
   SSABinary op l r -> SSABinary op (peepholeExpr l) (peepholeExpr r)
@@ -954,10 +980,3 @@ ssaBasicPipeline =
   . gvn
   . sccp
   . simplifyPhis
-
--- | Apply optimization with explicit iteration limit.
-fixedPointWithLimit :: Eq a => Int -> (a -> a) -> a -> a
-fixedPointWithLimit 0 _ x = x  -- Max iterations reached
-fixedPointWithLimit n f x =
-  let x' = f x
-  in if x' == x then x else fixedPointWithLimit (n - 1) f x'

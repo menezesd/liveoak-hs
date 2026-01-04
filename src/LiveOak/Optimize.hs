@@ -20,6 +20,7 @@ module LiveOak.Optimize
 
 import LiveOak.Ast
 import LiveOak.Symbol (ProgramSymbols)
+import LiveOak.SSAUtils (fixedPointWithLimit)
 import qualified LiveOak.DataFlow as DF
 
 -- | Apply all optimizations to a program.
@@ -341,10 +342,3 @@ terminates = \case
   Block stmts _ -> any terminates stmts
   If _ th el _ -> terminates th && terminates el  -- Both branches terminate
   _ -> False
-
--- | Apply optimization until a fixed point or iteration limit.
-fixedPointWithLimit :: Eq a => Int -> (a -> a) -> a -> a
-fixedPointWithLimit 0 _ x = x
-fixedPointWithLimit n f x =
-  let x' = f x
-  in if x' == x then x else fixedPointWithLimit (n - 1) f x'

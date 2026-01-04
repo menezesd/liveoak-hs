@@ -21,6 +21,9 @@ module LiveOak.SSAUtils
     -- * Block Utilities
   , blockMapFromList
   , BlockMap
+
+    -- * Fixed-Point Iteration
+  , fixedPointWithLimit
   ) where
 
 import LiveOak.SSATypes
@@ -139,4 +142,22 @@ isSimple = \case
       SSAThis -> True
       SSAUse _ -> True
       _ -> False
+
+--------------------------------------------------------------------------------
+-- Fixed-Point Iteration
+--------------------------------------------------------------------------------
+
+-- | Apply a function repeatedly until a fixed point is reached or
+-- the iteration limit is exceeded. Useful for optimization passes
+-- that need to run until no more changes occur.
+--
+-- @
+-- -- Run optimization up to 3 times or until stable:
+-- optimized = fixedPointWithLimit 3 optimizePass input
+-- @
+fixedPointWithLimit :: Eq a => Int -> (a -> a) -> a -> a
+fixedPointWithLimit 0 _ x = x  -- Max iterations reached
+fixedPointWithLimit n f x =
+  let x' = f x
+  in if x' == x then x else fixedPointWithLimit (n - 1) f x'
 
