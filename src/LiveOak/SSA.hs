@@ -31,11 +31,14 @@ module LiveOak.SSA
   , ssaOptPipeline
 
     -- * CFG-Based Optimization Pipeline
-  , optimizeSSA       -- ^ Full CFG-based SSA optimization
+  , optimizeSSA         -- ^ Full CFG-based SSA optimization (WARNING: broken for complex programs)
+  , optimizeSSAProgram  -- ^ Optimize SSA program, return SSA (for use with SSACodegen)
+  , ssaBasicPipeline    -- ^ Basic safe SSA optimizations
   ) where
 
 import LiveOak.Ast
 import LiveOak.Types (ValueType)
+import LiveOak.Symbol (ProgramSymbols, lookupClass, lookupField, fieldOffset)
 import LiveOak.SSATypes
 import LiveOak.CFG
 import LiveOak.Dominance
@@ -60,16 +63,16 @@ import qualified LiveOak.Coalesce as Coalesce
 --------------------------------------------------------------------------------
 
 -- | Convert a program to SSA form
-toSSA :: Program -> SSAProgram
-toSSA (Program classes) = SSAProgram
-  [classToSSA c | c <- classes]
+toSSA :: ProgramSymbols -> Program -> SSAProgram
+toSSA syms (Program classes) = SSAProgram
+  [classToSSA syms c | c <- classes]
 
 -- | Convert a class to SSA form
-classToSSA :: ClassDecl -> SSAClass
-classToSSA ClassDecl{..} = SSAClass
+classToSSA :: ProgramSymbols -> ClassDecl -> SSAClass
+classToSSA syms ClassDecl{..} = SSAClass
   { ssaClassName = className
   , ssaClassFields = classFields
-  , ssaClassMethods = map (methodToSSA className) classMethods
+  , ssaClassMethods = map (methodToSSA syms className) classMethods
   }
 
 -- | State for SSA conversion
@@ -77,6 +80,8 @@ data SSAState = SSAState
   { nextVersion :: !(Map String Int)    -- ^ Next version for each variable
   , currentDefs :: !(Map String SSAVar) -- ^ Current definition of each variable
   , nextBlockId :: !Int                 -- ^ For generating unique block labels
+  , ssaSymbols :: !ProgramSymbols       -- ^ Symbol table for resolving fields
+  , ssaCurrentClass :: !String          -- ^ Current class name
   }
 
 type SSAConv a = State SSAState a
@@ -117,9 +122,9 @@ freshBlock = do
   return $ "B" ++ show n
 
 -- | Convert a method to SSA form
-methodToSSA :: String -> MethodDecl -> SSAMethod
-methodToSSA clsName MethodDecl{..} =
-  let initState = SSAState Map.empty Map.empty 0
+methodToSSA :: ProgramSymbols -> String -> MethodDecl -> SSAMethod
+methodToSSA syms clsName MethodDecl{..} =
+  let initState = SSAState Map.empty Map.empty 0 syms clsName
       -- Initialize parameters as version 0 with their types
       paramVars = [SSAVar (paramName p) 0 (Just (paramType p)) | p <- methodParams]
       initDefs = Map.fromList [(paramName p, SSAVar (paramName p) 0 (Just (paramType p))) | p <- methodParams]
@@ -146,8 +151,26 @@ stmtToBlocks label = \case
 
   Assign name expr _ -> do
     ssaExpr <- exprToSSA expr
-    v <- defineVar name
-    return [SSABlock label [] [SSAAssign v ssaExpr]]
+    -- Check if 'name' is a field of the current class
+    st <- get
+    let syms = ssaSymbols st
+        clsName = ssaCurrentClass st
+    case lookupClass clsName syms of
+      Just cs -> case lookupField name cs of
+        Just _fv -> do
+          -- It's a field - convert to field store
+          let offset = case fieldOffset name cs of
+                Just off -> off
+                Nothing -> 0
+          return [SSABlock label [] [SSAFieldStore SSAThis name offset ssaExpr]]
+        Nothing -> do
+          -- It's a local variable
+          v <- defineVar name
+          return [SSABlock label [] [SSAAssign v ssaExpr]]
+      Nothing -> do
+        -- Class not found - treat as local variable
+        v <- defineVar name
+        return [SSABlock label [] [SSAAssign v ssaExpr]]
 
   FieldAssign target field off value _ -> do
     t <- exprToSSA target
@@ -214,17 +237,30 @@ addJumpToEnd blocks target =
   in init' ++ [lastWithJump]
 
 -- | Convert statements to instructions
+-- When we hit a control-flow statement (if/while), we need to ensure remaining
+-- statements are placed correctly after the control flow, not mixed into the entry block.
 stmtsToInstrs :: [Stmt] -> SSAConv ([SSAInstr], [SSABlock])
-stmtsToInstrs stmts = do
-  results <- mapM stmtToInstrsHelper stmts
-  let (instrLists, blockLists) = unzip results
-  return (concat instrLists, concat blockLists)
+stmtsToInstrs stmts = go stmts []
   where
-    stmtToInstrsHelper stmt = do
+    go [] instrs = return (reverse instrs, [])
+    go (stmt:rest) instrs = do
       blocks <- stmtToBlocks "temp" stmt
       case blocks of
-        [SSABlock _ [] instrs] -> return (instrs, [])
-        _ -> return ([], blocks)
+        [SSABlock _ [] newInstrs] ->
+          -- Simple statement - accumulate instructions
+          go rest (reverse newInstrs ++ instrs)
+        _ -> do
+          -- Control flow statement - stop accumulating, create continuation blocks
+          if null rest
+            then return (reverse instrs, blocks)
+            else do
+              -- Create a new block for remaining statements
+              nextLabel <- freshBlock
+              (nextInstrs, nextBlocks) <- go rest []
+              let contBlock = SSABlock nextLabel [] nextInstrs : nextBlocks
+              -- Link last block of control flow to continuation
+              let linkedBlocks = addJumpToEnd blocks nextLabel
+              return (reverse instrs, linkedBlocks ++ contBlock)
 
 -- | Convert an expression to SSA
 exprToSSA :: Expr -> SSAConv SSAExpr
@@ -233,7 +269,22 @@ exprToSSA = \case
   BoolLit b _ -> return $ SSABool b
   StrLit s _ -> return $ SSAStr s
   NullLit _ -> return SSANull
-  Var name _ -> SSAUse <$> useVar name
+  Var name _ -> do
+    -- Check if 'name' is a field of the current class
+    st <- get
+    let syms = ssaSymbols st
+        clsName = ssaCurrentClass st
+    case lookupClass clsName syms of
+      Just cs -> case lookupField name cs of
+        Just _fv ->
+          -- It's a field - convert to field access
+          return $ SSAFieldAccess SSAThis name
+        Nothing ->
+          -- It's a local variable
+          SSAUse <$> useVar name
+      Nothing ->
+        -- Class not found - treat as local variable
+        SSAUse <$> useVar name
   This _ -> return SSAThis
   Unary op e _ -> SSAUnary op <$> exprToSSA e
   Binary op l r _ -> SSABinary op <$> exprToSSA l <*> exprToSSA r
@@ -250,23 +301,23 @@ exprToSSA = \case
 
 -- | Convert a program to SSA form using CFG and dominance analysis.
 -- This produces proper phi node placement using dominance frontiers.
-toSSAWithCFG :: Program -> SSAProgram
-toSSAWithCFG (Program classes) = SSAProgram
-  [classToSSAWithCFG c | c <- classes]
+toSSAWithCFG :: ProgramSymbols -> Program -> SSAProgram
+toSSAWithCFG syms (Program classes) = SSAProgram
+  [classToSSAWithCFG syms c | c <- classes]
 
 -- | Convert a class using CFG-based SSA
-classToSSAWithCFG :: ClassDecl -> SSAClass
-classToSSAWithCFG ClassDecl{..} = SSAClass
+classToSSAWithCFG :: ProgramSymbols -> ClassDecl -> SSAClass
+classToSSAWithCFG syms ClassDecl{..} = SSAClass
   { ssaClassName = className
   , ssaClassFields = classFields
-  , ssaClassMethods = map (methodToSSAWithCFG className) classMethods
+  , ssaClassMethods = map (methodToSSAWithCFG syms className) classMethods
   }
 
 -- | Convert a method using CFG-based SSA with proper phi placement
-methodToSSAWithCFG :: String -> MethodDecl -> SSAMethod
-methodToSSAWithCFG clsName decl@MethodDecl{..} =
+methodToSSAWithCFG :: ProgramSymbols -> String -> MethodDecl -> SSAMethod
+methodToSSAWithCFG syms clsName decl@MethodDecl{..} =
   -- Step 1: Convert to basic blocks (with simple SSA naming)
-  let basicMethod = methodToSSA clsName decl
+  let basicMethod = methodToSSA syms clsName decl
       -- Step 2: Build CFG
       cfg = buildCFG basicMethod
       -- Step 3: Compute dominance
@@ -379,16 +430,19 @@ renameBlock cfg domTree blockId renSt blockMap =
           -- Fill in phi arguments in successor blocks
           blockMap2 = foldl' (fillPhiArgs blockId renSt2) blockMap1 (successors cfg blockId)
           -- Process children in a dominator tree
-          (renSt3, blockMap3) = foldl' (processChild cfg domTree)
-                                       (renSt2, blockMap2)
-                                       (domChildren domTree blockId)
-      in (renSt3, blockMap3)
+          -- Do NOT thread renaming state across siblings; each child starts
+          -- from the current block's state to avoid leaking definitions.
+          (_, blockMap3) = foldl' (processChild cfg domTree renSt2)
+                                  (renSt2, blockMap2)
+                                  (domChildren domTree blockId)
+      in (renSt2, blockMap3)
 
 -- | Process a child in the dominator tree
-processChild :: CFG -> DomTree -> (RenameState, Map BlockId SSABlock) -> BlockId
+processChild :: CFG -> DomTree -> RenameState -> (RenameState, Map BlockId SSABlock) -> BlockId
             -> (RenameState, Map BlockId SSABlock)
-processChild cfg domTree (renSt, blockMap) childId =
-  renameBlock cfg domTree childId renSt blockMap
+processChild cfg domTree parentState (renSt, blockMap) childId =
+  let (_, blockMap') = renameBlock cfg domTree childId parentState blockMap
+  in (renSt, blockMap')
 
 -- | Rename phi node definitions
 renamePhistDefs :: RenameState -> [PhiNode] -> (RenameState, [PhiNode])
@@ -480,7 +534,15 @@ fillPhiArg predId renSt phi =
 --------------------------------------------------------------------------------
 
 -- | Convert SSA back to normal form (for code generation)
--- This inserts copy instructions for phi nodes
+-- WARNING: This function is BROKEN for programs with complex control flow!
+-- It flattens all basic blocks linearly, losing while loops, if/else structure.
+-- The instrToStmt function converts SSAJump -> empty block and SSABranch -> empty if.
+--
+-- PROPER FIX: Use LiveOak.SSACodegen.generateFromSSA instead of converting back to AST.
+-- That generates code directly from the CFG without needing control flow reconstruction.
+--
+-- ALTERNATIVE FIX: Implement proper control flow structuring algorithm to rebuild
+-- loops and conditionals from the CFG (complex).
 fromSSA :: SSAProgram -> Program
 fromSSA (SSAProgram classes) = Program (map ssaClassToNormal classes)
 
@@ -866,27 +928,42 @@ stackAllocate (SSAProgram classes) = SSAProgram (map saClass classes)
 -- CFG-Based SSA Optimization Pipeline
 --------------------------------------------------------------------------------
 
+-- | Full CFG-based SSA optimization on SSA programs.
+-- Takes an SSA program and applies optimizations, returning optimized SSA.
+-- The caller can then decide to use SSACodegen or fromSSA.
+optimizeSSAProgram :: SSAProgram -> SSAProgram
+optimizeSSAProgram ssaProg =
+  -- Run a very limited cleanup pipeline (just 2 iterations max)
+  -- Disable expensive optimizations that may cause issues
+  fixedPointWithLimit 2 ssaBasicPipeline ssaProg
+
+-- | Basic SSA optimization pipeline (safe, fast optimizations only)
+ssaBasicPipeline :: SSAProgram -> SSAProgram
+ssaBasicPipeline =
+    ssaDeadCodeElim
+  . ssaCopyProp
+  . simplifyPhis
+
 -- | Full CFG-based SSA optimization.
 -- Converts to SSA with proper phi placement, applies optimizations, then
--- converts back. This enables global optimizations across control flow.
-optimizeSSA :: Program -> Program
-optimizeSSA prog =
-  let -- Convert to SSA with proper phi placement
-      ssaProg = toSSAWithCFG prog
-      -- Run expensive, structural optimizations once
-      inlined = inline ssaProg
-      tco = tailCallOptimize inlined
-      sr = strengthReduce tco
-      -- Run the main cleanup pipeline until a fixed point is reached
-      optimized = fixedPoint ssaCleanupPipeline sr
-      -- Perform stack allocation
-      stackAllocated = stackAllocate optimized
-      -- Convert back to AST
-  in fromSSA stackAllocated
+-- converts back. NOTE: fromSSA loses control flow - this is broken for complex programs!
+-- Use optimizeSSAProgram + SSACodegen instead.
+optimizeSSA :: ProgramSymbols -> Program -> Program
+optimizeSSA syms prog =
+  let ssaProg = toSSA syms prog
+      optimized = optimizeSSAProgram ssaProg
+  in fromSSA optimized
 
--- | Apply an optimization pass until a fixed point is reached.
+-- | Apply an optimization pass until a fixed point is reached or max iterations exceeded.
 fixedPoint :: Eq a => (a -> a) -> a -> a
-fixedPoint f x = let x' = f x in if x' == x then x else fixedPoint f x'
+fixedPoint f x = fixedPointWithLimit 10 f x
+
+-- | Apply optimization with explicit iteration limit.
+fixedPointWithLimit :: Eq a => Int -> (a -> a) -> a -> a
+fixedPointWithLimit 0 _ x = x  -- Max iterations reached
+fixedPointWithLimit n f x =
+  let x' = f x
+  in if x' == x then x else fixedPointWithLimit (n - 1) f x'
 
 -- | The main pipeline of optimizations that can be run iteratively.
 ssaCleanupPipeline :: SSAProgram -> SSAProgram

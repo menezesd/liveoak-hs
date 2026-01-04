@@ -10,7 +10,7 @@ module LiveOak.SSACodegen
   , generateMethodFromCFG
   ) where
 
-import Control.Monad (forM, forM_, unless)
+import Control.Monad (forM, forM_, when)
 import Control.Monad.State.Strict
 import Control.Monad.Reader
 import Control.Monad.Except
@@ -22,14 +22,17 @@ import qualified Data.Text.Lazy as TL
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
-import Data.List (foldl')
+import Data.List (foldl', sort)
+import Data.Maybe (isJust)
 
 import LiveOak.Ast (UnaryOp(..), BinaryOp(..))
 import LiveOak.SSATypes
 import LiveOak.CFG
-import LiveOak.Symbol (ProgramSymbols)
+import LiveOak.Symbol (ProgramSymbols, lookupClass, csFieldOrder, lookupMethod, fieldOffset)
 import LiveOak.Diag (Diag, Result)
 import qualified LiveOak.Diag as D
+import LiveOak.StringRuntime (emitStringRuntime)
+import LiveOak.SSATypeInfer (TypeEnv, buildTypeEnv, inferSSAExprClass)
 
 --------------------------------------------------------------------------------
 -- Code Generation Types
@@ -40,7 +43,6 @@ data SSACodegenState = SSACodegenState
   { scgLabelCounter :: !Int
   , scgCode :: !Builder
   , scgVarSlots :: !(Map String Int)  -- ^ Stack slot for each SSA variable
-  , scgNextSlot :: !Int               -- ^ Next available stack slot
   }
 
 -- | Code generation context
@@ -51,6 +53,10 @@ data SSACodegenCtx = SSACodegenCtx
   , scgCFG :: !CFG
   , scgPhiCopies :: !(Map BlockId [(BlockId, String, String)])
     -- ^ For each block, copies to insert before jump: (target, destVar, srcVar)
+  , scgTypeEnv :: !TypeEnv
+    -- ^ Type environment for inferring expression types
+  , scgReturnSlotOffset :: !Int        -- ^ Offset of return slot relative to FBR
+  , scgLocalCount :: !Int              -- ^ Number of locals to allocate
   }
 
 type SSACodegen a = ReaderT SSACodegenCtx (StateT SSACodegenState (Either Diag)) a
@@ -62,10 +68,40 @@ type SSACodegen a = ReaderT SSACodegenCtx (StateT SSACodegenState (Either Diag))
 -- | Generate SAM code from an SSA program
 generateFromSSA :: SSAProgram -> ProgramSymbols -> Result Text
 generateFromSSA (SSAProgram classes) syms = do
+  -- Generate preamble
+  let preamble = generatePreamble syms
+
+  -- Generate all methods
   codes <- forM classes $ \cls ->
     forM (ssaClassMethods cls) $ \method ->
       generateMethodSSA syms (ssaClassName cls) method
-  return $ T.intercalate "\n" (concat codes)
+
+  -- Generate string runtime
+  let stringRuntime = generateStringRuntime
+
+  return $ T.intercalate "\n" [preamble, T.intercalate "\n" (concat codes), stringRuntime]
+
+-- | Generate program preamble (allocate Main, call Main.main, STOP)
+generatePreamble :: ProgramSymbols -> Text
+generatePreamble syms =
+  let mainFields = case lookupClass "Main" syms of
+        Just cs -> length (csFieldOrder cs)
+        Nothing -> 0
+  in T.unlines
+    [ "PUSHIMM " <> tshow mainFields
+    , "MALLOC"
+    , "PUSHIMM 0"
+    , "SWAP"
+    , "LINK"
+    , "JSR Main_main"
+    , "UNLINK"
+    , "ADDSP -1"
+    , "STOP"
+    ]
+
+-- | Generate string runtime functions
+generateStringRuntime :: Text
+generateStringRuntime = emitStringRuntime
 
 -- | Generate SAM code for a single method from its CFG
 generateMethodFromCFG :: ProgramSymbols -> String -> SSAMethod -> Result Text
@@ -83,23 +119,40 @@ generateMethodSSA syms clsName method@SSAMethod{..} = do
       -- Compute phi copies to insert in predecessor blocks
       phiCopies = computePhiCopies cfg (ssaMethodBlocks)
 
+      -- Build type environment for this method
+      typeEnv = buildTypeEnv ssaMethodBlocks syms
+
+      -- totalParams includes 'this' (like traditional codegen)
+      totalParams = 1 + length ssaMethodParams
+      returnSlotOffset = -(3 + totalParams)
+      -- Parameters: this at index 0, user params follow
+      paramSlots = Map.fromList $
+        ("this", -(2 + totalParams) + 0) :
+        zip (map ssaName ssaMethodParams) [-(2 + totalParams) + 1 + i | i <- [0..]]
+
+      allVars = collectAllVars ssaMethodBlocks
+      paramNames = Set.fromList $ "this" : map ssaName ssaMethodParams
+      localVars = sort $ Set.toList $ Set.difference allVars paramNames
+      localSlots = Map.fromList $ zip localVars [1..]
+
+      varSlots = Map.union paramSlots localSlots
+      localCount = length localVars
+
       ctx = SSACodegenCtx
         { scgSymbols = syms
         , scgClassName = clsName
         , scgMethodName = ssaMethodName
         , scgCFG = cfg
         , scgPhiCopies = phiCopies
+        , scgTypeEnv = typeEnv
+        , scgReturnSlotOffset = returnSlotOffset
+        , scgLocalCount = localCount
         }
-
-      -- Allocate slots for parameters and local variables
-      paramSlots = Map.fromList $ zip (map ssaName ssaMethodParams) [0..]
-      nextSlot = length ssaMethodParams
 
       initState = SSACodegenState
         { scgLabelCounter = 0
         , scgCode = mempty
-        , scgVarSlots = paramSlots
-        , scgNextSlot = nextSlot
+        , scgVarSlots = varSlots
         }
 
   (_, finalState) <- runStateT (runReaderT (emitMethodCFG method) ctx) initState
@@ -118,15 +171,11 @@ emitMethodCFG SSAMethod{..} = do
   emit "LINK\n"
 
   -- Allocate space for local variables
-  let allVars = collectAllVars ssaMethodBlocks
-      paramNames = Set.fromList $ map ssaName ssaMethodParams
-      localVars = Set.difference allVars paramNames
-  unless (Set.null localVars) $
-    emit $ "ADDSP " <> tshow (Set.size localVars) <> "\n"
+  localCount <- asks scgLocalCount
+  when (localCount > 0) $
+    emit $ "ADDSP " <> tshow localCount <> "\n"
 
-  -- Allocate slots for local variables
   cfg <- asks scgCFG
-  allocateVarSlots (Set.toList localVars)
 
   -- Emit blocks in reverse postorder
   let blockOrder = reversePostorder cfg
@@ -137,17 +186,11 @@ emitMethodCFG SSAMethod{..} = do
 
   -- Method epilogue (return label)
   emit $ label <> "_return:\n"
+  -- Pop local variables before unlinking (they're still on stack after ADDSP allocations)
+  when (localCount > 0) $
+    emit $ "ADDSP " <> tshow (-localCount) <> "\n"
   emit "UNLINK\n"
-  emit "JUMPIND\n"
-
--- | Allocate stack slots for local variables
-allocateVarSlots :: [String] -> SSACodegen ()
-allocateVarSlots vars = do
-  st <- get
-  let startSlot = scgNextSlot st
-      newSlots = Map.fromList $ zip vars [startSlot..]
-      allSlots = Map.union (scgVarSlots st) newSlots
-  put st { scgVarSlots = allSlots, scgNextSlot = startSlot + length vars }
+  emit "RST\n"
 
 -- | Collect all variable names from blocks
 collectAllVars :: [SSABlock] -> Set.Set String
@@ -188,6 +231,7 @@ emitInstr = \case
     emitSSAExpr expr
     slot <- getVarSlot (ssaName var)
     emit $ "STOREOFF " <> tshow slot <> "\n"
+    -- Don't pop - leave value on stack (will be cleaned up at return)
 
   SSAFieldStore target _field off value -> do
     emitSSAExpr target
@@ -197,11 +241,12 @@ emitInstr = \case
     emit "STOREIND\n"
 
   SSAReturn exprOpt -> do
+    returnSlot <- asks scgReturnSlotOffset
     case exprOpt of
       Just expr -> emitSSAExpr expr
       Nothing -> emit "PUSHIMM 0\n"
-    -- Store in return slot
-    emit "STOREOFF -2\n"
+    -- Store in return slot (value stays on stack)
+    emit $ "STOREOFF " <> tshow returnSlot <> "\n"
 
   SSAJump _ -> return ()  -- Handled by terminator
 
@@ -240,7 +285,13 @@ emitTerminator currentBlock term = do
         emit $ "STOREOFF " <> tshow destSlot <> "\n"
       emit $ "JUMP " <> T.pack thenBlock <> "\n"
 
-    TermReturn _ -> do
+    TermReturn exprOpt -> do
+      returnSlot <- asks scgReturnSlotOffset
+      case exprOpt of
+        Just expr -> emitSSAExpr expr
+        Nothing -> emit "PUSHIMM 0\n"
+      emit $ "STOREOFF " <> tshow returnSlot <> "\n"
+      -- Don't pop - value stays on stack until return label pops locals
       clsName <- asks scgClassName
       methName <- asks scgMethodName
       let retLabel = T.pack clsName <> "_" <> T.pack methName <> "_return"
@@ -270,8 +321,8 @@ emitSSAExpr = \case
     emit $ "PUSHOFF " <> tshow slot <> "\n"
 
   SSAThis -> do
-    -- 'this' is the first parameter
-    emit "PUSHOFF 0\n"
+    slot <- getVarSlot "this"
+    emit $ "PUSHOFF " <> tshow slot <> "\n"
 
   SSAUnary op e -> do
     emitSSAExpr e
@@ -303,41 +354,74 @@ emitSSAExpr = \case
   SSACall name args -> do
     -- Push return slot
     emit "PUSHIMM 0\n"
+    -- Push implicit 'this'
+    thisSlot <- getVarSlot "this"
+    emit $ "PUSHOFF " <> tshow thisSlot <> "\n"
     -- Push arguments
     forM_ args emitSSAExpr
     -- Call
     emit "LINK\n"
-    -- TODO: proper label resolution
-    emit $ "JSR " <> T.pack name <> "\n"
+    clsName <- asks scgClassName
+    syms <- asks scgSymbols
+    let methodLabel = case lookupClass clsName syms >>= lookupMethod name of
+          Just _ -> T.pack clsName <> "_" <> T.pack name
+          Nothing -> T.pack name  -- Fallback
+    emit $ "JSR " <> methodLabel <> "\n"
     emit "UNLINK\n"
-    emit $ "ADDSP " <> tshow (negate $ length args) <> "\n"
+    emit $ "ADDSP " <> tshow (negate $ length args + 1) <> "\n"  -- +1 for 'this', return slot stays
 
   SSAInstanceCall target method args -> do
     emit "PUSHIMM 0\n"  -- Return slot
     emitSSAExpr target   -- Push 'this'
     forM_ args emitSSAExpr
     emit "LINK\n"
-    -- TODO: proper label resolution based on target type
-    emit $ "JSR " <> T.pack method <> "\n"
+    -- Infer target class type and use qualified method name
+    syms <- asks scgSymbols
+    typeEnv <- asks scgTypeEnv
+    let methodLabel = case inferSSAExprClass syms typeEnv target of
+          Just className -> T.pack className <> "_" <> T.pack method
+          Nothing -> T.pack method  -- Fallback to bare name
+    emit $ "JSR " <> methodLabel <> "\n"
     emit "UNLINK\n"
-    emit $ "ADDSP " <> tshow (negate $ length args + 1) <> "\n"
+    emit $ "ADDSP " <> tshow (negate $ length args + 1) <> "\n"  -- +1 for 'this', return slot stays
 
-  SSANewObject _cn args -> do
-    -- Allocate object
-    emit $ "PUSHIMM " <> tshow (length args) <> "\n"
+  SSANewObject cn args -> do
+    syms <- asks scgSymbols
+    let nFields = case lookupClass cn syms of
+          Just cs -> length (csFieldOrder cs)
+          Nothing -> 1
+        hasCtor = maybe False (isJust . lookupMethod cn) (lookupClass cn syms)
+    -- Allocate object (heap initialized to 0)
+    emit $ "PUSHIMM " <> tshow nFields <> "\n"
     emit "MALLOC\n"
-    -- Initialize fields
-    forM_ (zip [(0::Int)..] args) $ \(i, arg) -> do
-      emit "DUP\n"
-      emit $ "PUSHIMM " <> tshow i <> "\n"
-      emit "ADD\n"
-      emitSSAExpr arg
-      emit "STOREIND\n"
+    -- Call constructor if present
+    when hasCtor $ do
+      emit "DUP\n"       -- keep object for caller
+      emit "PUSHIMM 0\n" -- return slot
+      emit "SWAP\n"      -- place obj below return slot
+      forM_ args emitSSAExpr
+      let ctorLabel = T.pack cn <> "_" <> T.pack cn
+          nArgs = length args + 1  -- +1 for 'this'
+      emit "LINK\n"
+      emit $ "JSR " <> ctorLabel <> "\n"
+      emit "UNLINK\n"
+      emit $ "ADDSP " <> tshow (negate nArgs) <> "\n"
+      emit "ADDSP -1\n"  -- pop return slot
 
-  SSAFieldAccess target _field -> do
-    -- TODO: need field offset lookup
+  SSAFieldAccess target field -> do
+    -- Emit target expression
     emitSSAExpr target
-    emit "PUSHIMM 0\n"  -- Placeholder offset
+    -- Infer target class and look up field offset
+    syms <- asks scgSymbols
+    typeEnv <- asks scgTypeEnv
+    let offset = case inferSSAExprClass syms typeEnv target of
+          Just className -> case lookupClass className syms of
+            Just cs -> case fieldOffset field cs of
+              Just off -> off
+              Nothing -> 0  -- Field not found, use 0
+            Nothing -> 0  -- Class not found, use 0
+          Nothing -> 0  -- Can't infer type, use 0
+    emit $ "PUSHIMM " <> tshow offset <> "\n"
     emit "ADD\n"
     emit "PUSHIND\n"
 
