@@ -19,7 +19,6 @@ module LiveOak.TailCall
   ) where
 
 import LiveOak.SSATypes
-import LiveOak.CFG (BlockId)
 
 --------------------------------------------------------------------------------
 -- Types
@@ -101,7 +100,7 @@ mkTailCallInfo className methodName blockId (idx, _, callee, args) =
 
 -- | Check if an instruction is a tail call
 isTailCall :: String -> String -> SSABlock -> SSAInstr -> Bool
-isTailCall className methodName block instr =
+isTailCall className methodName block _instr =
   not $ null $ findBlockTailCalls className methodName block
 
 --------------------------------------------------------------------------------
@@ -125,11 +124,11 @@ optimizeTailCalls className methodName blocks =
 
 -- | Optimize self-recursive tail calls by converting to loops
 optimizeSelfRecursive :: String -> String -> [SSABlock] -> [TailCallInfo] -> ([SSABlock], Int)
-optimizeSelfRecursive className methodName blocks tailCalls =
+optimizeSelfRecursive _className _methodName blocks tailCalls =
   let -- Create a loop header block for the method
       entryBlock = case blocks of
         (b:_) -> blockLabel b
-        [] -> "entry"
+        [] -> BlockId "entry"
       -- Replace tail calls with jumps back to entry
       optimized = map (optimizeBlockTailCalls entryBlock tailCalls) blocks
   in (optimized, length tailCalls)
@@ -165,4 +164,3 @@ optimizeInstrs entryBlock tailCalls = go 0
       -- Store to parameter slot (this is a simplified version)
       -- In practice, we'd need to track parameter variables
       SSAAssign (SSAVar ("__param_" ++ show paramIdx) 0 Nothing) expr
-

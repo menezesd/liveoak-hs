@@ -19,12 +19,9 @@ module LiveOak.Inline
   ) where
 
 import LiveOak.SSATypes
-import LiveOak.CFG
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Set (Set)
-import qualified Data.Set as Set
 import Data.List (foldl')
 
 --------------------------------------------------------------------------------
@@ -153,11 +150,11 @@ shouldInline h info
   -- Don't inline large functions
   | miSize info > maxInlineSize h = False
   -- Use cost/benefit analysis
-  | otherwise = inlineBenefit h info > 0
+  | otherwise = inlineBenefit info > 0
 
 -- | Calculate inlining benefit (positive = should inline)
-inlineBenefit :: InlineHeuristics -> MethodInfo -> Int
-inlineBenefit h info =
+inlineBenefit :: MethodInfo -> Int
+inlineBenefit info =
   let -- Benefit: eliminate call overhead (estimated at 10 instructions)
       callOverhead = 10
       benefit = miCallCount info * callOverhead
@@ -245,7 +242,7 @@ findInlineableCall toInline = \case
 
 -- | Inline a single call
 inlineCall :: MethodInfo -> Maybe SSAVar -> [SSAExpr] -> Int -> ([SSAInstr], [SSABlock])
-inlineCall info resultVar args labelCounter =
+inlineCall info _resultVar args labelCounter =
   let -- Create parameter assignments
       paramAssigns = zipWith mkParamAssign (miParams info) args
       -- Rename blocks to avoid conflicts
@@ -261,19 +258,5 @@ renameBlocks :: Int -> [SSABlock] -> [SSABlock]
 renameBlocks counter = map (renameBlock counter)
   where
     renameBlock c block@SSABlock{..} =
-      block { blockLabel = blockLabel ++ "_inline_" ++ show c }
-
---------------------------------------------------------------------------------
--- Inline Candidate Selection
---------------------------------------------------------------------------------
-
--- | Get list of functions that are good inline candidates
-getInlineCandidates :: InlineHeuristics -> SSAProgram -> [String]
-getInlineCandidates h prog =
-  let infos = analyzeProgram prog
-  in Map.keys $ Map.filter (shouldInline h) infos
-
--- | Estimate code size after inlining
-estimateSizeAfterInlining :: Map String MethodInfo -> Int
-estimateSizeAfterInlining infos =
-  sum [miSize info * max 1 (miCallCount info) | info <- Map.elems infos]
+      let name = blockIdName blockLabel
+      in block { blockLabel = BlockId (name ++ "_inline_" ++ show c) }

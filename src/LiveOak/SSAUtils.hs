@@ -27,7 +27,6 @@ module LiveOak.SSAUtils
   ) where
 
 import LiveOak.SSATypes
-import LiveOak.CFG (BlockId)
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -160,4 +159,3 @@ fixedPointWithLimit 0 _ x = x  -- Max iterations reached
 fixedPointWithLimit n f x =
   let x' = f x
   in if x' == x then x else fixedPointWithLimit (n - 1) f x'
-

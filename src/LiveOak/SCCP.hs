@@ -135,7 +135,7 @@ initSCCPState entry params = SCCPState
   , sccpExecBlocks = Set.empty
   , sccpExecEdges = Set.empty
   , sccpSSAWorklist = []
-  , sccpCFGWorklist = [("__entry__", entry)]  -- Virtual entry edge
+  , sccpCFGWorklist = [(BlockId "__entry__", entry)]  -- Virtual entry edge
   }
 
 type SCCP a = State SCCPState a

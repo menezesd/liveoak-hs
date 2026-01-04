@@ -8,11 +8,16 @@ module LiveOak.Sam
   ( -- * Types
     SamValue(..)
   , SamError(..)
+  , SamConfig(..)
+  , defaultSamConfig
 
     -- * Execution
   , runSam
+  , runSamWith
   , runSamText
+  , runSamTextWith
   , runSamDebug
+  , runSamDebugWith
   ) where
 
 import Control.Monad (when)
@@ -253,66 +258,102 @@ unescapeString (c:rest) = c : unescapeString rest
 -- Execution
 --------------------------------------------------------------------------------
 
+-- | Reserved heap address for null.
+nullAddress :: Int
+nullAddress = 0
+
+-- | First usable heap address.
+heapBase :: Int
+heapBase = nullAddress + 1
+
 -- | Initial stack size.
 stackSize :: Int
 stackSize = 65536
 
+data SamConfig = SamConfig
+  { samStackSize :: !Int
+  , samMaxSteps :: !Int
+  , samDebugMaxSteps :: !Int
+  } deriving (Eq, Show)
+
+defaultSamConfig :: SamConfig
+defaultSamConfig = SamConfig
+  { samStackSize = stackSize
+  , samMaxSteps = maxSteps
+  , samDebugMaxSteps = debugMaxSteps
+  }
+
 -- | Initialize VM state.
-initState :: Vector SamInstr -> Map String Int -> SamState
-initState code labels = SamState
-  { samStack   = V.replicate stackSize (SamInt 0)
+initState :: SamConfig -> Vector SamInstr -> Map String Int -> SamState
+initState cfg code labels = SamState
+  { samStack   = V.replicate (samStackSize cfg) (SamInt 0)
   , samHeap    = IM.empty
   , samPC      = 0
   , samSP      = 0
   , samFBR     = 0
   , samLabels  = labels
   , samCode    = code
-  , samHeapPtr = 1  -- Start at 1 to reserve 0 as null
+  , samHeapPtr = heapBase
   }
 
 -- | Run SAM assembly and return result.
 runSam :: String -> Either SamError SamValue
 runSam = runSamText . T.pack
 
+runSamWith :: SamConfig -> String -> Either SamError SamValue
+runSamWith cfg = runSamTextWith cfg . T.pack
+
 -- | Run SAM assembly from Text.
 runSamText :: Text -> Either SamError SamValue
-runSamText code = do
+runSamText = runSamTextWith defaultSamConfig
+
+runSamTextWith :: SamConfig -> Text -> Either SamError SamValue
+runSamTextWith cfg code = do
   (instrs, labels) <- parseSam code
-  let st0 = initState instrs labels
-  execLoopLimited 0 st0
+  let st0 = initState cfg instrs labels
+  execLoopLimited cfg 0 st0
 
 -- | Maximum number of execution steps (prevents infinite loops).
 maxSteps :: Int
 maxSteps = 1000000
 
+-- | Maximum number of debug steps to avoid unbounded logging.
+debugMaxSteps :: Int
+debugMaxSteps = 100000
+
 -- | Execution loop with step limit.
-execLoopLimited :: Int -> SamState -> Either SamError SamValue
-execLoopLimited steps st
-  | steps > maxSteps = Left $ RuntimeError $ "Exceeded " ++ show maxSteps ++ " steps (infinite loop?)"
+execLoopLimited :: SamConfig -> Int -> SamState -> Either SamError SamValue
+execLoopLimited cfg steps st
+  | steps > samMaxSteps cfg =
+      Left $ RuntimeError $ "Exceeded " ++ show (samMaxSteps cfg) ++ " steps (infinite loop?)"
   | otherwise = case samCode st !? samPC st of
       Nothing -> Left $ PCOutOfBounds (samPC st)
       Just STOP -> stackTop st
-      Just NOP  -> execLoopLimited (steps + 1) st { samPC = samPC st + 1 }
+      Just NOP  -> execLoopLimited cfg (steps + 1) st { samPC = samPC st + 1 }
       Just instr -> do
         st' <- execInstr instr st
-        execLoopLimited (steps + 1) st'
+        execLoopLimited cfg (steps + 1) st'
 
 -- | Run SAM with debug trace output.
 runSamDebug :: Text -> IO (Either SamError SamValue)
-runSamDebug code = case parseSam code of
+runSamDebug = runSamDebugWith defaultSamConfig
+
+runSamDebugWith :: SamConfig -> Text -> IO (Either SamError SamValue)
+runSamDebugWith cfg code = case parseSam code of
   Left err -> return $ Left err
   Right (instrs, labels) -> do
-    let st0 = initState instrs labels
-    execLoopDebug 0 st0
+    let st0 = initState cfg instrs labels
+    execLoopDebug cfg 0 st0
 
 -- | Debug execution loop with tracing.
-execLoopDebug :: Int -> SamState -> IO (Either SamError SamValue)
-execLoopDebug steps st
-  | steps > 100000 = return $ Left $ RuntimeError "Exceeded 100000 steps"
+execLoopDebug :: SamConfig -> Int -> SamState -> IO (Either SamError SamValue)
+execLoopDebug cfg steps st
+  | steps > samDebugMaxSteps cfg =
+      return $ Left $ RuntimeError $ "Exceeded " ++ show (samDebugMaxSteps cfg) ++ " steps"
   | otherwise = case samCode st !? samPC st of
       Nothing -> return $ Left $ PCOutOfBounds (samPC st)
       Just STOP -> return $ stackTop st
-      Just NOP  -> execLoopDebug (steps + 1) st { samPC = samPC st + 1 }
+      Just NOP  -> execLoopDebug cfg (steps + 1) st { samPC = samPC st + 1 }
       Just instr -> do
         -- Print trace every step (can filter to specific instructions)
         putStrLn $ show (samPC st) ++ ": " ++ show instr
@@ -322,17 +363,7 @@ execLoopDebug steps st
                 ++ show [samStack st !? i | i <- [max 0 (samSP st - 5) .. samSP st - 1]]
         case execInstr instr st of
           Left err -> return $ Left err
-          Right st' -> execLoopDebug (steps + 1) st'
-
--- | Main execution loop.
-execLoop :: SamState -> Either SamError SamValue
-execLoop st = case samCode st !? samPC st of
-  Nothing -> Left $ PCOutOfBounds (samPC st)
-  Just STOP -> stackTop st
-  Just NOP  -> execLoop st { samPC = samPC st + 1 }
-  Just instr -> do
-    st' <- execInstr instr st
-    execLoop st'
+          Right st' -> execLoopDebug cfg (steps + 1) st'
 
 -- | Get top of stack.
 stackTop :: SamState -> Either SamError SamValue
@@ -543,7 +574,7 @@ execInstr instr st = case instr of
     (pc, st') <- popInt st
     Right st' { samPC = pc }
 
-  STOP -> Right st  -- Handled in execLoop
+  STOP -> Right st  -- Handled in execLoopLimited/execLoopDebug
   NOP -> Right st { samPC = samPC st + 1 }
 
 -- | Binary integer operation helper.

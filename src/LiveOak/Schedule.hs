@@ -22,13 +22,9 @@ module LiveOak.Schedule
 import LiveOak.SSATypes
 import LiveOak.CFG
 import LiveOak.Ast (BinaryOp(..))
-import LiveOak.SSAUtils (exprUses, instrUses, instrDefs)
+import LiveOak.SSAUtils (instrUses, instrDefs)
 
-import Data.Map.Strict (Map)
-import qualified Data.Map.Strict as Map
-import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IntMap
-import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.List (foldl', sortBy, partition)
 import Data.Ord (comparing, Down(..))
@@ -56,10 +52,10 @@ data DepEdge = DepEdge
 
 -- | Dependency graph
 data DepGraph = DepGraph
-  { dgNodes :: ![Int]                       -- ^ Instruction indices
-  , dgSuccs :: !(Map Int [DepEdge])         -- ^ Successors of each node
-  , dgPreds :: !(Map Int [DepEdge])         -- ^ Predecessors of each node
-  , dgLatency :: !(Map Int Int)             -- ^ Latency of each instruction
+  { dgNodes :: ![Int]                          -- ^ Instruction indices
+  , dgSuccs :: !(IntMap.IntMap [DepEdge])      -- ^ Successors of each node
+  , dgPreds :: !(IntMap.IntMap [DepEdge])      -- ^ Predecessors of each node
+  , dgLatency :: !(IntMap.IntMap Int)          -- ^ Latency of each instruction
   } deriving (Show)
 
 -- | Scheduling result
@@ -121,9 +117,9 @@ buildDepGraph instrs =
       -- Build edges for each pair
       edges = concatMap (findDeps indexed) indexed
       -- Group by source and target
-      succs = foldl' addSucc Map.empty edges
-      preds = foldl' addPred Map.empty edges
-      lats = Map.fromList [(i, instrLatency instr) | (i, instr) <- indexed]
+      succs = foldl' addSucc IntMap.empty edges
+      preds = foldl' addPred IntMap.empty edges
+      lats = IntMap.fromList [(i, instrLatency instr) | (i, instr) <- indexed]
   in DepGraph
     { dgNodes = nodes
     , dgSuccs = succs
@@ -131,8 +127,8 @@ buildDepGraph instrs =
     , dgLatency = lats
     }
   where
-    addSucc m e = Map.insertWith (++) (depFrom e) [e] m
-    addPred m e = Map.insertWith (++) (depTo e) [e] m
+    addSucc m e = IntMap.insertWith (++) (depFrom e) [e] m
+    addPred m e = IntMap.insertWith (++) (depTo e) [e] m
 
 -- | Find dependencies from one instruction to all later ones
 findDeps :: [(Int, SSAInstr)] -> (Int, SSAInstr) -> [DepEdge]
@@ -169,25 +165,23 @@ findDep fromIdx fromInstr (toIdx, toInstr) =
 --------------------------------------------------------------------------------
 
 -- | Compute critical path length for each instruction
-criticalPath :: DepGraph -> Map Int Int
+criticalPath :: DepGraph -> IntMap.IntMap Int
 criticalPath graph =
   -- Work backwards from nodes with no successors
-  let exits = [n | n <- dgNodes graph, null (Map.findWithDefault [] n (dgSuccs graph))]
-      initial = Map.fromList [(n, Map.findWithDefault 1 n (dgLatency graph)) | n <- exits]
+  let exits = [n | n <- dgNodes graph, null (IntMap.findWithDefault [] n (dgSuccs graph))]
+      initial = IntMap.fromList [(n, IntMap.findWithDefault 1 n (dgLatency graph)) | n <- exits]
   in foldl' (propagateCP graph) initial (reverse $ topSort graph)
 
 -- | Propagate critical path length
-propagateCP :: DepGraph -> Map Int Int -> Int -> Map Int Int
+propagateCP :: DepGraph -> IntMap.IntMap Int -> Int -> IntMap.IntMap Int
 propagateCP graph cpMap node =
-  case Map.lookup node cpMap of
+  case IntMap.lookup node cpMap of
     Just _ -> cpMap  -- Already computed
     Nothing ->
-      let succs = Map.findWithDefault [] node (dgSuccs graph)
-          lat = Map.findWithDefault 1 node (dgLatency graph)
-          maxSucc = if null succs
-                    then 0
-                    else maximum [Map.findWithDefault 0 (depTo e) cpMap + depLatency e | e <- succs]
-      in Map.insert node (lat + maxSucc) cpMap
+      let succs = IntMap.findWithDefault [] node (dgSuccs graph)
+          lat = IntMap.findWithDefault 1 node (dgLatency graph)
+          maxSucc = foldl' (\acc e -> max acc (IntMap.findWithDefault 0 (depTo e) cpMap + depLatency e)) 0 succs
+      in IntMap.insert node (lat + maxSucc) cpMap
 
 -- | Topological sort of the dependency graph
 topSort :: DepGraph -> [Int]
@@ -201,7 +195,7 @@ topSort graph = go (dgNodes graph) Set.empty []
         [] -> remaining ++ acc  -- Cycle detected, just append remaining
         (n:_) -> go (filter (/= n) remaining) (Set.insert n visited) (n : acc)
 
-    predNodes n = [depFrom e | e <- Map.findWithDefault [] n (dgPreds graph)]
+    predNodes n = [depFrom e | e <- IntMap.findWithDefault [] n (dgPreds graph)]
 
 --------------------------------------------------------------------------------
 -- List Scheduling
@@ -212,23 +206,19 @@ listSchedule :: DepGraph -> [Int]
 listSchedule graph =
   let cp = criticalPath graph
       -- Priority: critical path length (higher = schedule first)
-      priority n = Map.findWithDefault 0 n cp
+      priority n = IntMap.findWithDefault 0 n cp
+      allPredsScheduled n scheduled =
+        all (\e -> Set.member (depFrom e) scheduled) (IntMap.findWithDefault [] n (dgPreds graph))
+      go remaining scheduled acc
+        | Set.null remaining = reverse acc
+        | otherwise =
+            let ready = [n | n <- Set.toList remaining, allPredsScheduled n scheduled]
+                -- Sort by priority (descending)
+                sorted = sortBy (comparing (Down . priority)) ready
+            in case sorted of
+              [] -> reverse acc ++ Set.toList remaining  -- Cycle or deadlock
+              (n:_) -> go (Set.delete n remaining) (Set.insert n scheduled) (n : acc)
   in go (Set.fromList $ dgNodes graph) Set.empty []
-  where
-    go remaining scheduled acc
-      | Set.null remaining = reverse acc
-      | otherwise =
-          let ready = [n | n <- Set.toList remaining, allPredsScheduled n scheduled]
-              -- Sort by priority (descending)
-              sorted = sortBy (comparing (Down . priority)) ready
-          in case sorted of
-            [] -> reverse acc ++ Set.toList remaining  -- Cycle or deadlock
-            (n:_) -> go (Set.delete n remaining) (Set.insert n scheduled) (n : acc)
-
-    allPredsScheduled n scheduled =
-      all (\e -> Set.member (depFrom e) scheduled) (Map.findWithDefault [] n (dgPreds graph))
-
-    priority n = Map.findWithDefault 0 n (criticalPath graph)
 
 --------------------------------------------------------------------------------
 -- Trace Scheduling
@@ -245,7 +235,7 @@ traceSchedule cfg blocks =
 
 -- | Find execution traces
 findTraces :: CFG -> [SSABlock] -> [[BlockId]]
-findTraces cfg blocks =
+findTraces cfg _blocks =
   let entry = cfgEntry cfg
       visited = Set.empty
   in buildTrace cfg entry visited []
@@ -264,7 +254,7 @@ findTraces cfg blocks =
 scheduleTrace :: [SSABlock] -> [BlockId] -> SSABlock
 scheduleTrace blocks trace =
   case [b | b <- blocks, blockLabel b `elem` trace] of
-    [] -> SSABlock "__empty__" [] []
+    [] -> SSABlock (BlockId "__empty__") [] []
     (b:_) -> b  -- Simplified: return first block
 
 --------------------------------------------------------------------------------
@@ -311,4 +301,4 @@ scheduleBlock (acc, saved) block@SSABlock{..} =
 -- | Estimate execution cycles for a schedule
 estimateCycles :: DepGraph -> [Int] -> Int
 estimateCycles graph schedule =
-  sum [Map.findWithDefault 1 i (dgLatency graph) | i <- schedule]
+  sum [IntMap.findWithDefault 1 i (dgLatency graph) | i <- schedule]

@@ -20,6 +20,7 @@ import LiveOak.CFG
 import LiveOak.SSATypes
 import LiveOak.Dominance
 import LiveOak.RegAlloc (LivenessInfo(..), computeLiveness)
+import LiveOak.MapUtils (lookupSet)
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -46,7 +47,7 @@ buildInterferenceGraph cfg _domTree blocks =
 -- | Add interference edges for a block
 addBlockInterference :: Map BlockId (Set String) -> InterferenceGraph -> SSABlock -> InterferenceGraph
 addBlockInterference liveOutMap graph block =
-  let live = Map.findWithDefault Set.empty (blockLabel block) liveOutMap
+  let live = lookupSet (blockLabel block) liveOutMap
       -- All live variables interfere with each other
       liveList = Set.toList live
   in foldl' (addEdges liveList) graph liveList

@@ -46,6 +46,7 @@ import LiveOak.CFG
 import LiveOak.Dominance
 import LiveOak.Loop
 import LiveOak.SSATypes
+import LiveOak.MapUtils (lookupSet)
 import LiveOak.SSAUtils (blockDefs, isPure, blockMapFromList)
 
 import Data.Map.Strict (Map)
@@ -129,7 +130,7 @@ processLoop cfg domTree loop = do
     Nothing -> return ()  -- Can't hoist without preheader
     Just ph -> do
       -- Get definitions in this loop
-      defs <- gets (Map.findWithDefault Set.empty (loopHeader loop) . licmDefsInLoop)
+      defs <- gets (lookupSet (loopHeader loop) . licmDefsInLoop)
       -- Find and hoist invariant instructions
       hoistInvariantCode cfg domTree loop ph defs
 

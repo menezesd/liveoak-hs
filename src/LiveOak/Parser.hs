@@ -60,28 +60,31 @@ buildSymbols :: [ClassDecl] -> Parser ProgramSymbols
 buildSymbols classes = do
   -- Check for duplicate class names
   let classNames = map className classes
-      duplicates = findDuplicates classNames
-  when (not (null duplicates)) $
-    fail $ "Duplicate class definition: " ++ head duplicates
+  checkNoDuplicates "class definition" classNames
   -- Check for duplicate fields/methods within each class
   mapM_ checkClassDuplicates classes
   let classSyms = map buildClassSymbol classes
   return $ ProgramSymbols $ Map.fromList [(csName cs, cs) | cs <- classSyms]
   where
-    findDuplicates :: [String] -> [String]
-    findDuplicates names = [n | (n, cnt) <- Map.toList (countNames names), cnt > 1]
-    countNames :: [String] -> Map String Int
-    countNames = foldl' (\m n -> Map.insertWith (+) n 1 m) Map.empty
     checkClassDuplicates :: ClassDecl -> Parser ()
     checkClassDuplicates ClassDecl{..} = do
       let fieldNames = map fst classFields
-          fieldDups = findDuplicates fieldNames
-      when (not (null fieldDups)) $
-        fail $ "Duplicate field in class " ++ className ++ ": " ++ head fieldDups
+      checkNoDuplicates ("field in class " ++ className) fieldNames
       let methodNames = map methodName classMethods
-          methodDups = findDuplicates methodNames
-      when (not (null methodDups)) $
-        fail $ "Duplicate method in class " ++ className ++ ": " ++ head methodDups
+      checkNoDuplicates ("method in class " ++ className) methodNames
+
+-- | Check for duplicates and fail with a message if any found.
+-- Uses pattern matching to safely handle the duplicate list.
+checkNoDuplicates :: String -> [String] -> Parser ()
+checkNoDuplicates context names =
+  case findDuplicates names of
+    [] -> return ()
+    (dup:_) -> fail $ "Duplicate " ++ context ++ ": " ++ dup
+  where
+    findDuplicates :: [String] -> [String]
+    findDuplicates ns = [n | (n, cnt) <- Map.toList (countNames ns), cnt > 1]
+    countNames :: [String] -> Map String Int
+    countNames = foldl' (\m n -> Map.insertWith (+) n 1 m) Map.empty
 
 -- | Build a class symbol from a class declaration.
 buildClassSymbol :: ClassDecl -> ClassSymbol
@@ -125,7 +128,10 @@ extractLocals = go 0
         [VarSymbol name vt False idx (-1) (-1)]
       VarDecl name Nothing _ _ ->
         [VarSymbol name (PrimitiveType TInt) False idx (-1) (-1)]  -- default to int
-      If _ th el _ -> go idx th ++ go (idx + length (go idx th)) el
+      If _ th el _ ->
+        let thLocals = go idx th
+            nextIdx = idx + length thLocals
+        in thLocals ++ go nextIdx el
       While _ body _ -> go idx body
       _ -> []
 

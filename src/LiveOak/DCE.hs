@@ -16,7 +16,7 @@ module LiveOak.DCE
   ) where
 
 import LiveOak.SSATypes
-import LiveOak.CFG
+import LiveOak.MapUtils (lookupSet)
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -111,7 +111,7 @@ exprVarUses = \case
 
 -- | Get uses of a variable
 getUses :: DefUseChains -> String -> Set UseSite
-getUses duc var = Map.findWithDefault Set.empty var (ducUses duc)
+getUses duc var = lookupSet var (ducUses duc)
 
 -- | Get definition site of a variable
 getDef :: DefUseChains -> String -> Maybe DefSite

@@ -22,11 +22,11 @@ module LiveOak.PhiLower
 import LiveOak.SSATypes
 import LiveOak.SSAUtils (blockMapFromList)
 import qualified LiveOak.CFG as CFG
-import LiveOak.CFG (CFG, BlockId, predecessors, successors)
+import LiveOak.CFG (CFG, predecessors)
+import LiveOak.MapUtils (lookupList)
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.List (foldl', partition)
 import Data.Maybe (mapMaybe)
@@ -79,7 +79,7 @@ splitEdgeSSA :: (CFG, Map BlockId SSABlock, [SSABlock]) ->
                 (CFG, Map BlockId SSABlock, [SSABlock])
 splitEdgeSSA (cfg, blockMap, newBlocks) (from, to) =
   let -- Create new block name
-      splitName = from ++ "_to_" ++ to
+      splitName = BlockId (blockIdName from ++ "_to_" ++ blockIdName to)
       -- Create new block with just a jump
       newBlock = SSABlock
         { blockLabel = splitName
@@ -147,11 +147,7 @@ phiToCopy fromBlock PhiNode{..} =
 -- Handles cycles using temporary variables
 sequentializeCopies :: [ParallelCopy] -> [SeqCopy]
 sequentializeCopies copies =
-  let -- Build dependency graph: dest -> src mapping
-      destToSrc = Map.fromList [(pcDest c, pcSrc c) | c <- copies]
-      srcToDests = foldl' addDep Map.empty copies
-
-      -- Find variables that are both sources and destinations (potential cycles)
+  let -- Find variables that are both sources and destinations (potential cycles)
       dests = Set.fromList (map pcDest copies)
       srcs = Set.fromList (map pcSrc copies)
       conflicts = Set.intersection dests srcs
@@ -166,7 +162,6 @@ sequentializeCopies copies =
       complexSeq = handleCycles complex
   in trivialSeq ++ complexSeq
   where
-    addDep m copy = Map.insertWith (++) (pcSrc copy) [pcDest copy] m
     isComplex conflicts copy = Set.member (pcSrc copy) conflicts
 
 -- | Handle potentially cyclic copies
@@ -188,21 +183,19 @@ handleCycles copies
              (CopyMove (pcDest c) (pcSrc c) : acc)
         [] ->
           -- Cycle detected! Use a temporary to break it
-          case remaining of
-            (c:rest) ->
-              let tempVar = "__phi_temp_" ++ pcDest c
-                  -- Save the destination to temp first
-                  saveToTemp = CopyTemp tempVar (pcDest c)
-                  -- Now we can safely overwrite dest
-                  copyToTemp = CopyMove (pcDest c) (pcSrc c)
-                  -- Fix remaining copies that used dest as source
-                  remaining' = [if pcSrc r == pcDest c
-                                then r { pcSrc = tempVar }
-                                else r
-                               | r <- rest]
-              in go remaining' (Set.insert (pcDest c) processed)
-                    (copyToTemp : saveToTemp : acc)
-            [] -> reverse acc
+          let c:rest = remaining
+              tempVar = "__phi_temp_" ++ pcDest c
+              -- Save the destination to temp first
+              saveToTemp = CopyTemp tempVar (pcDest c)
+              -- Now we can safely overwrite dest
+              copyToTemp = CopyMove (pcDest c) (pcSrc c)
+              -- Fix remaining copies that used dest as source
+              remaining' = [if pcSrc r == pcDest c
+                            then r { pcSrc = tempVar }
+                            else r
+                           | r <- rest]
+          in go remaining' (Set.insert (pcDest c) processed)
+                (copyToTemp : saveToTemp : acc)
 
 --------------------------------------------------------------------------------
 -- Phi Lowering
@@ -244,8 +237,8 @@ lowerAllPhis cfg blockMap =
 -- | Generate copies for a block's phi nodes
 generateCopies :: CFG -> (BlockId, [PhiNode]) -> [(BlockId, [SeqCopy])]
 generateCopies cfg (bid, phis) =
-  [(pred, sequentializeCopies (phisToCopies pred phis))
-  | pred <- predecessors cfg bid]
+  [(predId, sequentializeCopies (phisToCopies predId phis))
+  | predId <- predecessors cfg bid]
 
 -- | Group copies by target block
 groupCopy :: Map BlockId [[SeqCopy]] -> (BlockId, [SeqCopy]) -> Map BlockId [[SeqCopy]]
@@ -256,7 +249,7 @@ insertCopies :: Map BlockId [[SeqCopy]] ->
                 ([SSABlock], Int) -> (BlockId, SSABlock) ->
                 ([SSABlock], Int)
 insertCopies copyMap (acc, count) (bid, block@SSABlock{..}) =
-  let copies = concat $ Map.findWithDefault [] bid copyMap
+  let copies = concat $ lookupList bid copyMap
       copyInstrs = map copyToInstr copies
       -- Remove phi nodes and insert copies before terminator
       newInstrs = insertBeforeTerminator blockInstrs copyInstrs
@@ -286,86 +279,3 @@ insertBeforeTerminator instrs toInsert =
       SSABranch {} -> True
       SSAReturn _ -> True
       _ -> False
-
---------------------------------------------------------------------------------
--- Advanced: Lost Copy Problem Prevention
---------------------------------------------------------------------------------
-
--- | The "lost copy" problem occurs when a phi destination is used
--- after the phi in the same block. We need to ensure the original
--- value is preserved.
---
--- Example:
---   L1: x2 = phi(x1, x3)
---       y = x2 + 1
---       x3 = y
---       jump L1
---
--- Naive lowering might overwrite x2 before it's used.
--- Solution: Insert copies at the right point or use temporaries.
-
--- | Check for lost copy situations
-detectLostCopy :: [PhiNode] -> [SSAInstr] -> [(String, String)]
-detectLostCopy phis instrs =
-  [(ssaName (phiVar phi), usedVar)
-  | phi <- phis
-  , let phiDest = ssaName (phiVar phi)
-  , instr <- instrs
-  , usedVar <- usesInInstr instr
-  , usedVar == phiDest
-  , isPhiSource phi usedVar
-  ]
-  where
-    usesInInstr = \case
-      SSAAssign _ expr -> usesInExpr expr
-      SSAReturn (Just expr) -> usesInExpr expr
-      SSABranch cond _ _ -> usesInExpr cond
-      SSAExprStmt expr -> usesInExpr expr
-      _ -> []
-
-    usesInExpr = \case
-      SSAUse var -> [ssaName var]
-      SSAUnary _ e -> usesInExpr e
-      SSABinary _ l r -> usesInExpr l ++ usesInExpr r
-      SSATernary c t e -> usesInExpr c ++ usesInExpr t ++ usesInExpr e
-      SSACall _ args -> concatMap usesInExpr args
-      SSAInstanceCall target _ args ->
-        usesInExpr target ++ concatMap usesInExpr args
-      SSANewObject _ args -> concatMap usesInExpr args
-      SSAFieldAccess target _ -> usesInExpr target
-      _ -> []
-
-    isPhiSource phi var = any (\(_, v) -> ssaName v == var) (phiArgs phi)
-
---------------------------------------------------------------------------------
--- Advanced: Swap Problem Prevention
---------------------------------------------------------------------------------
-
--- | The "swap problem" occurs with phi cycles:
---   x2 = phi(y1, x1)
---   y2 = phi(x1, y1)
---
--- This is a swap that can't be sequentialized without a temp.
--- Our sequentializeCopies handles this, but we can optimize
--- by detecting and using architecture swap instructions if available.
-
--- | Detect swap patterns in phi nodes
-detectSwaps :: [PhiNode] -> [(String, String)]
-detectSwaps phis =
-  [(ssaName (phiVar p1), ssaName (phiVar p2))
-  | p1 <- phis
-  , p2 <- phis
-  , ssaName (phiVar p1) < ssaName (phiVar p2)  -- avoid duplicates
-  , isSwapPair p1 p2
-  ]
-  where
-    isSwapPair p1 p2 =
-      -- Check if p1's sources are p2's dests and vice versa for some pred
-      any (isSwapForPred p1 p2) (map fst $ phiArgs p1)
-
-    isSwapForPred p1 p2 pred =
-      case (lookup pred (phiArgs p1), lookup pred (phiArgs p2)) of
-        (Just s1, Just s2) ->
-          ssaName s1 == ssaName (phiVar p2) &&
-          ssaName s2 == ssaName (phiVar p1)
-        _ -> False

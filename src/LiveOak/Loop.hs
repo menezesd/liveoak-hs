@@ -24,6 +24,7 @@ module LiveOak.Loop
 import LiveOak.CFG
 import LiveOak.Dominance
 import LiveOak.SSATypes
+import LiveOak.MapUtils (lookupList)
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -31,6 +32,7 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.List (foldl')
 import qualified Data.List as List
+import qualified Data.List.NonEmpty as NE
 import Data.Ord (comparing)
 
 --------------------------------------------------------------------------------
@@ -148,9 +150,9 @@ findParent loops headers myHeader loop =
         , Set.member myHeader (loopBody l)
         ]
       -- Find the smallest (innermost) containing loop
-      parent = case candidates of
-        [] -> Nothing
-        cs -> Just $ fst $ List.minimumBy (comparing (Set.size . loopBody . snd)) cs
+      parent = case NE.nonEmpty candidates of
+        Nothing -> Nothing
+        Just cs -> Just $ fst $ List.minimumBy (comparing (Set.size . loopBody . snd)) (NE.toList cs)
   in loop { loopParent = parent }
 
 -- | Update children based on parent relationships
@@ -159,7 +161,7 @@ updateChildren loops =
   let -- Build child map
       childMap = foldl' addChild Map.empty (Map.toList loops)
       -- Update each loop with its children
-  in Map.mapWithKey (\h l -> l { loopChildren = Map.findWithDefault [] h childMap }) loops
+  in Map.mapWithKey (\h l -> l { loopChildren = lookupList h childMap }) loops
   where
     addChild m (childHeader, loop) =
       case loopParent loop of
@@ -199,9 +201,9 @@ loopDepth loops bid =
 innerMostLoop :: LoopNest -> BlockId -> Maybe Loop
 innerMostLoop loops bid =
   let containing = [l | l <- Map.elems loops, Set.member bid (loopBody l)]
-  in case containing of
-    [] -> Nothing
-    ls -> Just $ List.maximumBy (comparing loopNestDepth) ls
+  in case NE.nonEmpty containing of
+    Nothing -> Nothing
+    Just ls -> Just $ List.maximumBy (comparing loopNestDepth) (NE.toList ls)
 
 -- | Get all blocks in a loop (including nested loops)
 loopBlocks :: Loop -> [BlockId]

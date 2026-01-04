@@ -9,7 +9,7 @@ module LiveOak.CFG
     CFG(..)
   , CFGBlock(..)
   , Terminator(..)
-  , BlockId
+  , BlockId(..)
 
     -- * Construction
   , buildCFG
@@ -38,18 +38,12 @@ module LiveOak.CFG
   , splitEdge
   ) where
 
-import LiveOak.SSATypes (SSABlock(..), SSAInstr(..), SSAMethod(..), PhiNode(..), SSAExpr)
+import LiveOak.SSATypes (BlockId(..), SSABlock(..), SSAInstr(..), SSAMethod(..), PhiNode(..), SSAExpr)
+import LiveOak.MapUtils (lookupList)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.List (foldl')
-
---------------------------------------------------------------------------------
--- Types
---------------------------------------------------------------------------------
-
--- | Block identifier (label)
-type BlockId = String
 
 -- | Block terminator - determines control flow to successors
 data Terminator
@@ -111,7 +105,7 @@ convertBlock SSABlock{..} =
 
 -- | Split instructions into non-terminators and terminator
 -- Empty blocks (like join blocks) get a void return terminator
-splitTerminator :: String -> [SSAInstr] -> ([SSAInstr], Terminator)
+splitTerminator :: BlockId -> [SSAInstr] -> ([SSAInstr], Terminator)
 splitTerminator _blockId instrs =
   case reverse instrs of
     [] -> ([], TermReturn Nothing)  -- Empty block gets void return (can be optimized away later)
@@ -154,11 +148,11 @@ computePredecessors succMap =
 
 -- | Get predecessors of a block
 predecessors :: CFG -> BlockId -> [BlockId]
-predecessors cfg bid = Map.findWithDefault [] bid (cfgPreds cfg)
+predecessors cfg bid = lookupList bid (cfgPreds cfg)
 
 -- | Get successors of a block
 successors :: CFG -> BlockId -> [BlockId]
-successors cfg bid = Map.findWithDefault [] bid (cfgSuccs cfg)
+successors cfg bid = lookupList bid (cfgSuccs cfg)
 
 -- | Get all block IDs
 allBlockIds :: CFG -> [BlockId]
@@ -229,10 +223,10 @@ validateCFG cfg = concat
   where
     validateEntry
       | Map.member (cfgEntry cfg) (cfgBlocks cfg) = []
-      | otherwise = ["Entry block '" ++ cfgEntry cfg ++ "' not found"]
+      | otherwise = ["Entry block '" ++ blockIdName (cfgEntry cfg) ++ "' not found"]
 
     validateBlocks =
-      [ "Block '" ++ bid ++ "' referenced but not defined"
+      [ "Block '" ++ blockIdName bid ++ "' referenced but not defined"
       | bid <- referencedBlocks
       , not $ Map.member bid (cfgBlocks cfg)
       ]
@@ -245,7 +239,7 @@ validateCFG cfg = concat
 
     validateEdges =
       -- Check that successor/predecessor maps are consistent
-      [ "Inconsistent edge: " ++ from ++ " -> " ++ to
+      [ "Inconsistent edge: " ++ blockIdName from ++ " -> " ++ blockIdName to
       | (from, tos) <- Map.toList (cfgSuccs cfg)
       , to <- tos
       , from `notElem` predecessors cfg to
@@ -279,10 +273,10 @@ findCriticalEdges cfg =
 splitCriticalEdges :: CFG -> (CFG, [(BlockId, BlockId, BlockId)])
 splitCriticalEdges cfg =
   let criticals = findCriticalEdges cfg
-  in foldl' splitOne (cfg, []) (zip [0..] criticals)
+  in foldl' splitOne (cfg, []) (zip [0 :: Int ..] criticals)
   where
     splitOne (c, created) (n, (from, to)) =
-      let newBlockId = "__split_" ++ show n ++ "__"
+      let newBlockId = BlockId ("__split_" ++ show n ++ "__")
           (c', _) = splitEdge c from to newBlockId
       in (c', (from, to, newBlockId) : created)
 

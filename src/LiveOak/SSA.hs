@@ -69,6 +69,7 @@ import qualified LiveOak.PRE as PRE
 import qualified LiveOak.SCCP as SCCP
 import LiveOak.Loop (findLoops)
 import LiveOak.SSAUtils (blockMapFromList, fixedPointWithLimit)
+import LiveOak.MapUtils (lookupSet)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
@@ -132,12 +133,12 @@ useVar name = do
       return v
 
 -- | Get fresh block label
-freshBlock :: SSAConv String
+freshBlock :: SSAConv BlockId
 freshBlock = do
   st <- get
   let n = nextBlockId st
   put st { nextBlockId = n + 1 }
-  return $ "B" ++ show n
+  return $ BlockId ("B" ++ show n)
 
 -- | Convert a method to SSA form
 methodToSSA :: ProgramSymbols -> String -> MethodDecl -> SSAMethod
@@ -147,10 +148,11 @@ methodToSSA syms clsName MethodDecl{..} =
       paramVars = [SSAVar (paramName p) 0 (Just (paramType p)) | p <- methodParams]
       initDefs = Map.fromList [(paramName p, SSAVar (paramName p) 0 (Just (paramType p))) | p <- methodParams]
       st = initState { currentDefs = initDefs }
-      (rawBlocks, _) = runState (stmtToBlocks Nothing "entry" methodBody) st
+      entryId = BlockId "entry"
+      (rawBlocks, _) = runState (stmtToBlocks Nothing entryId methodBody) st
       -- Ensure the last block has a terminator (add implicit return if needed)
       blocks = ensureTerminator rawBlocks
-  in SSAMethod clsName methodName paramVars methodReturnSig blocks "entry"
+  in SSAMethod clsName methodName paramVars methodReturnSig blocks entryId
   where
     -- Add an implicit return to the last block if it doesn't have a terminator
     ensureTerminator [] = []
@@ -171,7 +173,7 @@ methodToSSA syms clsName MethodDecl{..} =
         in reverse (fixedLast : initBsRev)
 
 -- | Convert a statement to SSA blocks
-stmtToBlocks :: Maybe String -> String -> Stmt -> SSAConv [SSABlock]
+stmtToBlocks :: Maybe BlockId -> BlockId -> Stmt -> SSAConv [SSABlock]
 stmtToBlocks loopExit label = \case
   Block stmts _ -> do
     (instrs, blocks) <- stmtsToInstrs loopExit stmts
@@ -294,10 +296,10 @@ hasTerminator instrs = case reverse instrs of
 
 -- | Add a jump instruction to the end of the last block
 -- Only adds jump if the block doesn't already end with a terminator (Return, Jump, Branch)
-addJumpToEnd :: [SSABlock] -> String -> [SSABlock]
-addJumpToEnd [] target = [SSABlock "empty" [] [SSAJump target]]
+addJumpToEnd :: [SSABlock] -> BlockId -> [SSABlock]
+addJumpToEnd [] target = [SSABlock (BlockId "empty") [] [SSAJump target]]
 addJumpToEnd blocks target = case reverse blocks of
-  [] -> [SSABlock "empty" [] [SSAJump target]]  -- Already handled above, but safe
+  [] -> [SSABlock (BlockId "empty") [] [SSAJump target]]  -- Already handled above, but safe
   (lastBlock:initRev) ->
     let lastInstrs = blockInstrs lastBlock
         lastWithJump = if hasTerminator lastInstrs
@@ -306,7 +308,7 @@ addJumpToEnd blocks target = case reverse blocks of
     in reverse (lastWithJump : initRev)
 
 -- | Update all references to a block label within a block's instructions
-updateBlockRefs :: String -> String -> SSABlock -> SSABlock
+updateBlockRefs :: BlockId -> BlockId -> SSABlock -> SSABlock
 updateBlockRefs oldLabel newLabel block =
   block { blockInstrs = map updateInstr (blockInstrs block) }
   where
@@ -321,7 +323,7 @@ updateBlockRefs oldLabel newLabel block =
 -- | Convert statements to instructions
 -- When we hit a control-flow statement (if/while), we need to ensure remaining
 -- statements are placed correctly after the control flow, not mixed into the entry block.
-stmtsToInstrs :: Maybe String -> [Stmt] -> SSAConv ([SSAInstr], [SSABlock])
+stmtsToInstrs :: Maybe BlockId -> [Stmt] -> SSAConv ([SSAInstr], [SSABlock])
 stmtsToInstrs loopExit stmts = go stmts []
   where
     go [] instrs = return (reverse instrs, [])
@@ -463,7 +465,7 @@ computePhiSites domFrontier _varName defBlocks = go defBlocks Set.empty
       | otherwise =
           let (block, rest) = Set.deleteFindMin worklist
               -- Get dominance frontier of this block
-              frontier = Map.findWithDefault Set.empty block domFrontier
+              frontier = lookupSet block domFrontier
               -- Add phi nodes at frontier blocks that don't have one yet
               newPhiBlocks = Set.difference frontier phiBlocks
               -- Phi nodes are also definitions, so add to worklist

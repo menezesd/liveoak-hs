@@ -74,7 +74,6 @@ data GVNState = GVNState
   { gvnNextNum :: !ValueNum                   -- ^ Next available value number
   , gvnExprToNum :: !(Map ExprKey ValueNum)   -- ^ Expression -> value number
   , gvnVarToNum :: !(Map VarKey ValueNum)     -- ^ Variable -> its value number
-  , gvnNumToExpr :: !(Map ValueNum SSAExpr)   -- ^ Value number -> canonical expression
   , gvnNumToVar :: !(Map ValueNum VarKey)     -- ^ Value number -> canonical variable
   , gvnReplacements :: !(Map VarKey VarKey)   -- ^ Variable -> replacement variable
   , gvnAllReplacements :: !(Map VarKey VarKey) -- ^ All replacements (global)
@@ -89,7 +88,6 @@ initGVNState = GVNState
   { gvnNextNum = 0
   , gvnExprToNum = Map.empty
   , gvnVarToNum = Map.empty
-  , gvnNumToExpr = Map.empty
   , gvnNumToVar = Map.empty
   , gvnReplacements = Map.empty
   , gvnAllReplacements = Map.empty
@@ -482,10 +480,9 @@ getOrCreateExprNum key expr = do
 
 -- | Record an expression with its value number
 recordExpr :: ExprKey -> ValueNum -> SSAExpr -> GVN ()
-recordExpr key num expr = do
+recordExpr key num _expr = do
   modify $ \s -> s
     { gvnExprToNum = Map.insert key num (gvnExprToNum s)
-    , gvnNumToExpr = Map.insert num expr (gvnNumToExpr s)
     }
 
 -- | Record a variable replacement

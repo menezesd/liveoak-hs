@@ -21,6 +21,7 @@ import LiveOak.CFG
 import LiveOak.Dominance
 import LiveOak.SSAUtils (blockMapFromList)
 import LiveOak.Ast (BinaryOp(..), UnaryOp(..))
+import LiveOak.MapUtils (lookupSet)
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -39,8 +40,8 @@ intersectAll (x:xs) = foldl' Set.intersection x xs
 
 -- | Expression for PRE (normalized form)
 data PREExpr
-  = PREBinary !String !String !String  -- ^ op, left operand, right operand
-  | PREUnary !String !String           -- ^ op, operand
+  = PREBinary !BinaryOp !String !String  -- ^ op, left operand, right operand
+  | PREUnary !UnaryOp !String            -- ^ op, operand
   deriving (Eq, Ord, Show)
 
 -- | PRE dataflow sets for a block
@@ -85,11 +86,11 @@ collectExpressions blocks = Set.unions $ map collectBlockExprs blocks
         let left = exprToName l
             right = exprToName r
         in case (left, right) of
-          (Just ln, Just rn) -> Set.singleton $ PREBinary (show op) ln rn
+          (Just ln, Just rn) -> Set.singleton $ PREBinary op ln rn
           _ -> Set.empty
       SSAUnary op e ->
         case exprToName e of
-          Just n -> Set.singleton $ PREUnary (show op) n
+          Just n -> Set.singleton $ PREUnary op n
           Nothing -> Set.empty
       _ -> Set.empty
 
@@ -110,11 +111,11 @@ blockComputes SSABlock{..} = Set.unions $ map instrComputes blockInstrs
     exprComputes = \case
       SSABinary op l r ->
         case (exprToName l, exprToName r) of
-          (Just ln, Just rn) -> Set.singleton $ PREBinary (show op) ln rn
+          (Just ln, Just rn) -> Set.singleton $ PREBinary op ln rn
           _ -> Set.empty
       SSAUnary op e ->
         case exprToName e of
-          Just n -> Set.singleton $ PREUnary (show op) n
+          Just n -> Set.singleton $ PREUnary op n
           Nothing -> Set.empty
       _ -> Set.empty
 
@@ -125,8 +126,8 @@ blockComputes SSABlock{..} = Set.unions $ map instrComputes blockInstrs
       _ -> Nothing
 
 -- | Get expressions killed in a block (operand is redefined)
-blockKills :: SSABlock -> Set String -> Set PREExpr -> Set PREExpr
-blockKills SSABlock{..} allExprs allPREExprs =
+blockKills :: SSABlock -> Set PREExpr -> Set PREExpr
+blockKills SSABlock{..} allPREExprs =
   let defs = Set.fromList [ssaName (phiVar phi) | phi <- blockPhis] `Set.union`
              Set.fromList [ssaName var | SSAAssign var _ <- blockInstrs]
   in Set.filter (exprKilledBy defs) allPREExprs
@@ -169,7 +170,7 @@ updateAntBlock cfg blockMap allExprs antSets bid _ =
           antOut = intersectAll [fst $ Map.findWithDefault (Set.empty, Set.empty) s antSets | s <- succs]
           -- AntIn = (AntOut - Kill) ∪ Comp
           comp = blockComputes block
-          kill = blockKills block Set.empty allExprs
+          kill = blockKills block allExprs
           antIn = Set.union comp (Set.difference antOut kill)
       in (antIn, antOut)
 
@@ -207,7 +208,7 @@ updateAvailBlock cfg blockMap allExprs availSets bid _ =
           availIn = intersectAll [snd $ Map.findWithDefault (Set.empty, Set.empty) p availSets | p <- preds]
           -- AvailOut = (AvailIn - Kill) ∪ Comp
           comp = blockComputes block
-          kill = blockKills block Set.empty allExprs
+          kill = blockKills block allExprs
           availOut = Set.union comp (Set.difference availIn kill)
       in (availIn, availOut)
 
@@ -239,9 +240,9 @@ computeLatest cfg earliestSets antSets bid earliestHere =
   let succs = successors cfg bid
       -- Can delay if all successors either have the expression earliest or anticipate it
       canDelay expr = all (canDelayTo expr) succs
-      canDelayTo expr succ =
-        let succEarliest = Map.findWithDefault Set.empty succ earliestSets
-            (succAntIn, _) = Map.findWithDefault (Set.empty, Set.empty) succ antSets
+      canDelayTo expr succId =
+        let succEarliest = lookupSet succId earliestSets
+            (succAntIn, _) = Map.findWithDefault (Set.empty, Set.empty) succId antSets
         in Set.member expr succEarliest || Set.member expr succAntIn
   in Set.filter (not . canDelay) earliestHere
 
@@ -301,8 +302,8 @@ applyPRE :: Map BlockId (Set PREExpr) ->
 applyPRE insertions deletions = map applyToBlock
   where
     applyToBlock block@SSABlock{..} =
-      let toInsert = Map.findWithDefault Set.empty blockLabel insertions
-          toDelete = Map.findWithDefault Set.empty blockLabel deletions
+      let toInsert = lookupSet blockLabel insertions
+          toDelete = lookupSet blockLabel deletions
           -- Insert expressions at beginning (after phis)
           insertedInstrs = map exprToInstr (Set.toList toInsert)
           -- Delete redundant computations
@@ -312,22 +313,22 @@ applyPRE insertions deletions = map applyToBlock
     exprToInstr = \case
       PREBinary op l r ->
         -- Create a temporary variable for the result
-        let tempVar = SSAVar ("__pre_" ++ op ++ "_" ++ l ++ "_" ++ r) 0 Nothing
-            expr = SSABinary (readOp op) (nameToExpr l) (nameToExpr r)
+        let tempVar = SSAVar ("__pre_" ++ show op ++ "_" ++ l ++ "_" ++ r) 0 Nothing
+            expr = SSABinary op (nameToExpr l) (nameToExpr r)
         in SSAAssign tempVar expr
       PREUnary op o ->
-        let tempVar = SSAVar ("__pre_" ++ op ++ "_" ++ o) 0 Nothing
-            expr = SSAUnary (readUnaryOp op) (nameToExpr o)
+        let tempVar = SSAVar ("__pre_" ++ show op ++ "_" ++ o) 0 Nothing
+            expr = SSAUnary op (nameToExpr o)
         in SSAAssign tempVar expr
 
     shouldDelete toDelete = \case
       SSAAssign _ (SSABinary op l r) ->
         case (exprToName l, exprToName r) of
-          (Just ln, Just rn) -> Set.member (PREBinary (show op) ln rn) toDelete
+          (Just ln, Just rn) -> Set.member (PREBinary op ln rn) toDelete
           _ -> False
       SSAAssign _ (SSAUnary op e) ->
         case exprToName e of
-          Just n -> Set.member (PREUnary (show op) n) toDelete
+          Just n -> Set.member (PREUnary op n) toDelete
           Nothing -> False
       _ -> False
 
@@ -342,26 +343,3 @@ applyPRE insertions deletions = map applyToBlock
       | name == "True" = SSABool True
       | name == "False" = SSABool False
       | otherwise = SSAUse (SSAVar name 0 Nothing)
-
-    -- Parse operator strings back to operators
-    readOp s = case s of
-      "Add" -> Add
-      "Sub" -> Sub
-      "Mul" -> Mul
-      "Div" -> Div
-      "Mod" -> Mod
-      "And" -> And
-      "Or"  -> Or
-      "Eq"  -> Eq
-      "Ne"  -> Ne
-      "Lt"  -> Lt
-      "Le"  -> Le
-      "Gt"  -> Gt
-      "Ge"  -> Ge
-      "Concat" -> Concat
-      _ -> Add  -- Fallback (should not happen)
-
-    readUnaryOp s = case s of
-      "Neg" -> Neg
-      "Not" -> Not
-      _ -> Neg  -- Fallback (should not happen)

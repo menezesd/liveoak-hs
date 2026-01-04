@@ -11,6 +11,7 @@ module LiveOak.SSATypes
   , SSAInstr(..)
   , SSAExpr(..)
   , PhiNode(..)
+  , BlockId(..)
   , SSAVar(..)
 
     -- * Variable Key
@@ -26,6 +27,14 @@ import LiveOak.Types (ValueType)
 -- SSA Types
 --------------------------------------------------------------------------------
 
+-- | Block identifier.
+newtype BlockId = BlockId
+  { blockIdName :: String
+  } deriving (Eq, Ord)
+
+instance Show BlockId where
+  show = blockIdName
+
 -- | SSA variable with version number
 data SSAVar = SSAVar
   { ssaName :: !String     -- ^ Original variable name
@@ -36,7 +45,7 @@ data SSAVar = SSAVar
 -- | Phi node: selects value based on predecessor block
 data PhiNode = PhiNode
   { phiVar :: !SSAVar                    -- ^ Variable being defined
-  , phiArgs :: ![(String, SSAVar)]       -- ^ (predecessor label, value)
+  , phiArgs :: ![(BlockId, SSAVar)]      -- ^ (predecessor label, value)
   } deriving (Eq, Show)
 
 -- | SSA expression
@@ -61,14 +70,14 @@ data SSAInstr
   = SSAAssign !SSAVar !SSAExpr          -- ^ x_n = expr
   | SSAFieldStore !SSAExpr !String !Int !SSAExpr  -- ^ target.field = value
   | SSAReturn !(Maybe SSAExpr)
-  | SSAJump !String                     -- ^ Unconditional jump
-  | SSABranch !SSAExpr !String !String  -- ^ Conditional branch (cond, true, false)
+  | SSAJump !BlockId                    -- ^ Unconditional jump
+  | SSABranch !SSAExpr !BlockId !BlockId  -- ^ Conditional branch (cond, true, false)
   | SSAExprStmt !SSAExpr                -- ^ Expression for side effects
   deriving (Eq, Show)
 
 -- | Basic block in SSA form
 data SSABlock = SSABlock
-  { blockLabel :: !String
+  { blockLabel :: !BlockId
   , blockPhis :: ![PhiNode]             -- ^ Phi functions at block start
   , blockInstrs :: ![SSAInstr]          -- ^ Instructions (non-phi)
   } deriving (Eq, Show)
@@ -80,7 +89,7 @@ data SSAMethod = SSAMethod
   , ssaMethodParams :: ![SSAVar]        -- ^ Parameters as SSA vars (version 0)
   , ssaMethodReturnSig :: !ReturnSig    -- ^ Return signature
   , ssaMethodBlocks :: ![SSABlock]      -- ^ Basic blocks
-  , ssaEntryBlock :: !String            -- ^ Entry block label
+  , ssaEntryBlock :: !BlockId           -- ^ Entry block label
   } deriving (Eq, Show)
 
 -- | Class in SSA form

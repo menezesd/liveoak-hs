@@ -21,13 +21,15 @@ module LiveOak.RegAlloc
 
 import LiveOak.SSATypes
 import LiveOak.CFG
-import LiveOak.SSAUtils (exprUses, instrUses, blockDefs, blockUses, blockMapFromList)
+import LiveOak.SSAUtils (instrUses, blockDefs, blockUses, blockMapFromList)
+import LiveOak.MapUtils (lookupSet)
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.List (foldl', sortBy)
+import Data.Maybe (mapMaybe)
 import Data.Ord (comparing, Down(..))
 
 --------------------------------------------------------------------------------
@@ -107,7 +109,7 @@ iterateLiveness cfg blockMap = go maxLivenessIterations
 computeOut :: CFG -> Map BlockId (Set String) -> BlockId -> Set String -> Set String
 computeOut cfg liveIn bid _ =
   let succs = successors cfg bid
-  in Set.unions [Map.findWithDefault Set.empty s liveIn | s <- succs]
+  in Set.unions [lookupSet s liveIn | s <- succs]
 
 -- | Compute live-in for a block
 computeIn :: Map BlockId SSABlock -> Map BlockId (Set String) ->
@@ -116,7 +118,7 @@ computeIn blockMap liveOut bid _ =
   case Map.lookup bid blockMap of
     Nothing -> Set.empty
     Just block ->
-      let out = Map.findWithDefault Set.empty bid liveOut
+      let out = lookupSet bid liveOut
           defs = blockDefs block
           uses = blockUses block
       in Set.union uses (Set.difference out defs)
@@ -125,8 +127,8 @@ computeIn blockMap liveOut bid _ =
 computePerInstrLiveness :: Map BlockId SSABlock -> Map BlockId (Set String) ->
                            Map (BlockId, Int) (Set String)
 computePerInstrLiveness blockMap liveOut =
-  Map.unions [blockInstrLiveness bid block (Map.findWithDefault Set.empty bid liveOut)
-             | (bid, block) <- Map.toList blockMap]
+  Map.unions [blockInstrLiveness bid block (lookupSet bid liveOut)
+              | (bid, block) <- Map.toList blockMap]
 
 -- | Compute per-instruction liveness for a block
 blockInstrLiveness :: BlockId -> SSABlock -> Set String -> Map (BlockId, Int) (Set String)
@@ -178,11 +180,11 @@ buildEdges :: [SSABlock] -> LivenessInfo -> Map String (Set String)
 buildEdges blocks liveness =
   foldl' addBlockEdges Map.empty blocks
   where
-    addBlockEdges acc block@SSABlock{..} =
+    addBlockEdges acc SSABlock{..} =
       foldl' (addInstrEdges blockLabel liveness) acc (zip [0..] blockInstrs)
 
     addInstrEdges bid linfo acc (idx, instr) =
-      let live = Map.findWithDefault Set.empty (bid, idx) (liveAtPoint linfo)
+      let live = lookupSet (bid, idx) (liveAtPoint linfo)
           def = case instr of
             SSAAssign var _ -> Just (ssaName var)
             _ -> Nothing
@@ -228,15 +230,14 @@ colorGraph numRegs graph =
 
 -- | Get degree of a node
 nodeDegree :: InterferenceGraph -> String -> Int
-nodeDegree graph node = Set.size $ Map.findWithDefault Set.empty node (igEdges graph)
+nodeDegree graph node = Set.size $ lookupSet node (igEdges graph)
 
 -- | Try to color a node
 tryColor :: NumRegisters -> InterferenceGraph ->
             (RegAssignment, [String]) -> String -> (RegAssignment, [String])
 tryColor numRegs graph (assignment, spilled) node =
-  let neighbors = Map.findWithDefault Set.empty node (igEdges graph)
-      usedColors = Set.fromList [c | n <- Set.toList neighbors,
-                                    Just c <- [Map.lookup n assignment]]
+  let neighbors = lookupSet node (igEdges graph)
+      usedColors = Set.fromList $ mapMaybe (`Map.lookup` assignment) (Set.toList neighbors)
       availableColors = [c | c <- [0..numRegs-1], not (Set.member c usedColors)]
   in case availableColors of
     (c:_) -> (Map.insert node c assignment, spilled)
@@ -256,53 +257,3 @@ allocateRegisters numRegs cfg blocks =
       -- Color the graph
       result = colorGraph numRegs interference
   in result
-
---------------------------------------------------------------------------------
--- Spill Code Generation
---------------------------------------------------------------------------------
-
--- | Generate spill code for spilled variables
-generateSpillCode :: [String] -> [SSABlock] -> [SSABlock]
-generateSpillCode spilled = map (spillBlock spilled)
-  where
-    spilledSet = Set.fromList spilled
-
-    spillBlock vars block@SSABlock{..} =
-      block { blockInstrs = concatMap (spillInstr vars spilledSet) blockInstrs }
-
-    spillInstr vars spilledVars instr =
-      let -- Reload uses of spilled variables before the instruction
-          uses = Set.intersection spilledVars (instrUses instr)
-          reloads = [mkReload v | v <- Set.toList uses]
-          -- Store definitions of spilled variables after the instruction
-          def = case instr of
-            SSAAssign var _ | Set.member (ssaName var) spilledVars ->
-              [mkStore (ssaName var)]
-            _ -> []
-      in reloads ++ [instr] ++ def
-
-    mkReload var = SSAExprStmt (SSACall ("__reload_" ++ var) [])
-    mkStore var = SSAExprStmt (SSACall ("__store_" ++ var) [])
-
---------------------------------------------------------------------------------
--- Coalescing
---------------------------------------------------------------------------------
-
--- | Try to coalesce move-related variables
-coalesce :: InterferenceGraph -> RegAssignment -> RegAssignment
-coalesce graph assignment =
-  foldl' tryCoalesce assignment (Set.toList $ igMoveEdges graph)
-  where
-    tryCoalesce assign (v1, v2) =
-      -- Can coalesce if:
-      -- 1. Both have the same color, OR
-      -- 2. They don't interfere and one doesn't have a color yet
-      case (Map.lookup v1 assign, Map.lookup v2 assign) of
-        (Just c1, Just c2) | c1 == c2 -> assign  -- Already coalesced
-        (Just c1, Nothing) | not (interferes graph v1 v2) ->
-          Map.insert v2 c1 assign
-        (Nothing, Just c2) | not (interferes graph v1 v2) ->
-          Map.insert v1 c2 assign
-        _ -> assign  -- Can't coalesce
-
-    interferes g a b = Set.member b (Map.findWithDefault Set.empty a (igEdges g))

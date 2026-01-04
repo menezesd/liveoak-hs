@@ -33,6 +33,7 @@ library
                     , LiveOak.SSA
                     , LiveOak.SSATypes
                     , LiveOak.SSAUtils
+                    , LiveOak.MapUtils
                     , LiveOak.CFG
                     , LiveOak.Dominance
                     , LiveOak.SSACodegen

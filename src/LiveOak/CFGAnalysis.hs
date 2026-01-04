@@ -55,7 +55,7 @@ module LiveOak.CFGAnalysis
 import LiveOak.CFG
 import LiveOak.Dominance
 import LiveOak.Loop
-import LiveOak.SSATypes (SSAMethod(..), SSABlock)
+import LiveOak.SSATypes (SSAMethod(..))
 
 --------------------------------------------------------------------------------
 -- CFG Analysis
@@ -82,4 +82,3 @@ analyzeCFG method =
     , cfgaDomFrontier = domFrontier
     , cfgaLoops = loops
     }
-

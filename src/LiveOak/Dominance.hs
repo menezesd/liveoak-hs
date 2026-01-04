@@ -24,6 +24,7 @@ module LiveOak.Dominance
   ) where
 
 import LiveOak.CFG
+import LiveOak.MapUtils (lookupList)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
@@ -186,7 +187,7 @@ strictlyDominates domTree a b = a /= b && dominates domTree a b
 
 -- | Get children of a block in the dominator tree
 domChildren :: DomTree -> BlockId -> [BlockId]
-domChildren DomTree{..} bid = Map.findWithDefault [] bid domChildren_
+domChildren DomTree{..} bid = lookupList bid domChildren_
 
 -- | Get depth of block in dominator tree (entry = 0)
 domDepth :: DomTree -> BlockId -> Int
@@ -228,7 +229,7 @@ reverseCFG cfg exits =
       in (reversed, single)
     _ ->
       -- Multiple exits: add virtual exit node
-      let virtualExit = "__exit__"
+      let virtualExit = BlockId "__exit__"
           -- Add edges from virtual exit to all real exits
           newSuccs = Map.insert virtualExit exits $
                      foldl' (\m e -> Map.insertWith (++) e [virtualExit] m)

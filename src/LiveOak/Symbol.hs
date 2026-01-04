@@ -171,15 +171,3 @@ lookupProgramMethod className methodName ps = do
 -- | Get the Main.main entry point.
 getEntrypoint :: ProgramSymbols -> Maybe MethodSymbol
 getEntrypoint = lookupProgramMethod "Main" "main"
-
--- | Check if a class exists.
-classExists :: String -> ProgramSymbols -> Bool
-classExists name ps = Map.member name (psClasses ps)
-
--- | Get all classes.
-allClasses :: ProgramSymbols -> [ClassSymbol]
-allClasses = Map.elems . psClasses
-
--- | Number of fields in a class.
-numFields :: ClassSymbol -> Int
-numFields = length . csFieldOrder

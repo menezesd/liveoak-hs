@@ -10,7 +10,7 @@ module LiveOak.SSACodegen
   , generateMethodFromCFG
   ) where
 
-import Control.Monad (forM, forM_, when, unless)
+import Control.Monad (forM, forM_, when)
 import Control.Monad.State.Strict
 import Control.Monad.Reader
 import Control.Monad.Except
@@ -28,11 +28,12 @@ import Data.Maybe (isJust)
 import LiveOak.Ast (UnaryOp(..), BinaryOp(..))
 import LiveOak.SSATypes
 import LiveOak.CFG
-import LiveOak.Symbol (ProgramSymbols(..), MethodSymbol, VarSymbol, lookupClass, lookupField, csFieldOrder, lookupMethod, fieldOffset, csName, numParams, numLocals, msName, msParams, msLocals, vsName, vsType, stackAddress)
+import LiveOak.MapUtils (lookupList)
+import LiveOak.Symbol (ProgramSymbols(..), MethodSymbol, lookupClass, lookupField, csFieldOrder, lookupMethod, fieldOffset, csName, numParams, numLocals, msParams, msLocals, vsName, vsType, stackAddress)
 import LiveOak.Diag (Diag, Result)
 import qualified LiveOak.Diag as D
 import LiveOak.StringRuntime (emitStringRuntime, strConcatLabel, strReverseLabel, strRepeatLabel, strCompareLabel)
-import LiveOak.SSATypeInfer (TypeEnv, buildTypeEnv, inferSSAExprClass, inferSSAExprClassWithCtx, inferSSAExprType)
+import LiveOak.SSATypeInfer (TypeEnv, buildTypeEnv, inferSSAExprClassWithCtx, inferSSAExprType)
 import LiveOak.Types (ValueType(..), Type(..), ofPrimitive)
 
 --------------------------------------------------------------------------------
@@ -172,8 +173,6 @@ generateMethodSSA syms clsName method@SSAMethod{..} = do
 emitMethodCFG :: SSAMethod -> SSACodegen ()
 emitMethodCFG SSAMethod{..} = do
   clsName <- asks scgClassName
-  currentMs <- asks scgMethodSymbol
-
   -- Emit method label
   let label = T.pack clsName <> "_" <> T.pack ssaMethodName
   emit $ "\n" <> label <> ":\n"
@@ -278,7 +277,7 @@ emitTerminator :: BlockId -> Terminator -> SSACodegen ()
 emitTerminator currentBlock term = do
   -- Get phi copies to insert before this jump
   phiCopies <- asks scgPhiCopies
-  let copies = Map.findWithDefault [] currentBlock phiCopies
+  let copies = lookupList currentBlock phiCopies
 
   case term of
     TermJump target -> do
@@ -342,16 +341,6 @@ findMethodInClasses syms methodName =
   in case classesWithMethod of
        (cs:_) -> Just (csName cs)
        [] -> Nothing
-
--- | Clean up leftover values from expression evaluation
--- After an expression result is consumed (e.g., via STOREOFF), clean up
--- any temporary values left on the stack (like method call arguments)
--- Note: Only top-level method calls leave garbage; sub-expressions are consumed
-emitExprCleanup :: SSAExpr -> SSACodegen ()
-emitExprCleanup = \case
-  SSACall _ args -> emit $ "ADDSP " <> tshow (negate $ length args + 1) <> "\n"
-  SSAInstanceCall _ _ args -> emit $ "ADDSP " <> tshow (negate $ length args + 1) <> "\n"
-  _ -> return ()  -- Other expressions don't leave garbage on stack
 
 --------------------------------------------------------------------------------
 -- Expression Code Generation
@@ -742,7 +731,7 @@ methodLabelPrefixText = do
 blockLabelText :: BlockId -> SSACodegen Text
 blockLabelText bid = do
   prefix <- methodLabelPrefixText
-  return $ prefix <> "__" <> T.pack bid
+  return $ prefix <> "__" <> T.pack (blockIdName bid)
 
 -- | Generate a fresh label
 freshLabel :: Text -> SSACodegen Text
