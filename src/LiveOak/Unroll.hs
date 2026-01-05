@@ -58,20 +58,15 @@ data UnrollConfig = UnrollConfig
   } deriving (Show)
 
 -- | Default unrolling configuration
--- NOTE: Loop unrolling is DISABLED pending fixes for the following issues:
+-- Full unrolling is enabled for small loops with constant trip counts.
+-- Partial unrolling is DISABLED due to remaining issues:
 --
 -- 1. Partial unrolling does not adjust loop bounds - the loop condition still
 --    checks against the original limit, but with duplicated body, we iterate
 --    factor*N times instead of N times.
 --
--- 2. Induction variable chaining is incorrect - the loop condition uses the
---    original induction variable, not the chained variable from the last
---    duplicate.
---
--- 3. Remainder handling is missing - when trip count is not a multiple of
+-- 2. Remainder handling is missing - when trip count is not a multiple of
 --    the unroll factor, we need an epilogue loop for the remaining iterations.
---
--- 4. Full unrolling has untested edge cases with phi node elimination.
 --
 -- To fix partial unrolling properly, we need to:
 --   a) Transform: while (i < N) { body; i++; }
@@ -81,10 +76,10 @@ data UnrollConfig = UnrollConfig
 --
 defaultUnrollConfig :: UnrollConfig
 defaultUnrollConfig = UnrollConfig
-  { ucMaxUnrollFactor = 0     -- Disabled pending fixes
-  , ucMaxBodySize = 0         -- Disabled pending fixes
-  , ucFullUnrollLimit = 0     -- Disabled pending fixes
-  , ucPartialUnrollFactor = 0 -- Disabled pending fixes
+  { ucMaxUnrollFactor = 8     -- Maximum unroll factor for full unrolling
+  , ucMaxBodySize = 15        -- Maximum body size (instructions) for unrolling
+  , ucFullUnrollLimit = 8     -- Max trip count for full unrolling
+  , ucPartialUnrollFactor = 2 -- Partial unrolling factor (duplicate body 2x)
   }
 
 -- | Aggressive unrolling configuration (for when bugs are fixed)
@@ -245,6 +240,9 @@ fullyUnroll blockMap loop n
   | otherwise = doFullUnroll blockMap loop n
 
 -- | Internal implementation of full unrolling
+-- Key insight: The body uses variables defined by phi nodes. For each iteration:
+-- - Iteration 0: replace phi vars with their initial values (from preheader edge)
+-- - Iteration N: replace phi vars with the latch values from iteration N-1
 doFullUnroll :: Map BlockId SSABlock -> Loop -> Int -> (Map BlockId SSABlock, Int)
 doFullUnroll blockMap loop n =
   let header = loopHeader loop
@@ -253,21 +251,204 @@ doFullUnroll blockMap loop n =
       pureBody = filter (/= header) bodyBlocks
   in case latches of
        [latch] ->
-         case findLoopExit blockMap header of
-           Just exitTarget ->
-             let -- Clone body n times
-                 (newBlockMap, unrolledBlocks) =
-                   cloneBodyNTimes blockMap pureBody header latch exitTarget n
+         case (findLoopExit blockMap header, Map.lookup header blockMap) of
+           (Just exitTarget, Just headerBlock) ->
+             let -- Extract phi node mappings from header
+                 -- phiInitials: phi var -> initial value (from preheader)
+                 -- phiLatches: phi var -> latch value (from back edge)
+                 preheader = loopPreheader loop
+                 (phiInitials, phiLatches) = extractPhiMappings headerBlock latch preheader
+
+                 -- Get body definitions for variable renaming
+                 allBodyBlocks = catMaybes [Map.lookup bid blockMap | bid <- pureBody]
+                 bodyDefs = collectBodyDefinitions allBodyBlocks
+
+                 -- Build final value substitution: phi var -> final iteration's value
+                 -- After N iterations, phi vars should be replaced with the Nth iteration's output
+                 finalSubst = if n > 0
+                   then Map.map (renameVarForIterFinal (n - 1) bodyDefs) phiLatches
+                   else phiInitials  -- If n=0, use initial values
+
+                 -- Clone body n times with proper phi substitution
+                 unrolledBlocks = fullUnrollCopies blockMap pureBody header latch exitTarget n phiInitials phiLatches
+
+                 -- Create new header that just jumps to first iteration (or exit if n=0)
+                 newHeader = if n > 0
+                   then SSABlock header [] [SSAJump (renameBlockId (head pureBody) 0)]
+                   else SSABlock header [] [SSAJump exitTarget]
 
                  -- Remove original loop blocks
-                 withoutLoop = foldl' (flip Map.delete) newBlockMap bodyBlocks
+                 withoutLoop = foldl' (flip Map.delete) blockMap bodyBlocks
 
-                 -- Insert unrolled blocks
+                 -- Update blocks outside the loop to use final iteration's values for phi vars
+                 -- (This is needed because they may reference phi-defined variables)
+                 updatedOutside = Map.map (updateBlockWithFinalValues finalSubst (Set.fromList bodyBlocks)) withoutLoop
+
+                 -- Insert new header and unrolled blocks
                  finalMap = foldl' (\m b -> Map.insert (blockLabel b) b m)
-                                   withoutLoop unrolledBlocks
+                                   updatedOutside (newHeader : unrolledBlocks)
              in (finalMap, 1)
-           Nothing -> (blockMap, 0)
+           _ -> (blockMap, 0)
        _ -> (blockMap, 0)  -- Multiple latches not supported
+
+-- | Rename a variable for the final iteration (to get the output value)
+renameVarForIterFinal :: Int -> Set VarKey -> SSAVar -> SSAVar
+renameVarForIterFinal iter defs var =
+  let key = varKey var
+  in if Set.member key defs
+     then var { ssaName = varName (varNameString (ssaName var) ++ "_u" ++ show iter) }
+     else var  -- Non-loop variable, keep as is
+
+-- | Update a block outside the loop to use final iteration's values for phi vars
+updateBlockWithFinalValues :: Map VarKey SSAVar -> Set BlockId -> SSABlock -> SSABlock
+updateBlockWithFinalValues finalSubst loopBlocks block
+  | Set.member (blockLabel block) loopBlocks = block  -- Don't update loop blocks
+  | otherwise = block
+      { blockPhis = map (updatePhiWithFinal finalSubst) (blockPhis block)
+      , blockInstrs = map (updateInstrWithFinal finalSubst) (blockInstrs block)
+      }
+
+-- | Update a phi node with final values
+updatePhiWithFinal :: Map VarKey SSAVar -> PhiNode -> PhiNode
+updatePhiWithFinal finalSubst phi@PhiNode{..} =
+  phi { phiArgs = [(bid, maybe v id (Map.lookup (varKey v) finalSubst)) | (bid, v) <- phiArgs] }
+
+-- | Update an instruction with final values
+updateInstrWithFinal :: Map VarKey SSAVar -> SSAInstr -> SSAInstr
+updateInstrWithFinal finalSubst = \case
+  SSAAssign var expr -> SSAAssign var (updateExprWithFinal finalSubst expr)
+  SSAFieldStore t f o v -> SSAFieldStore (updateExprWithFinal finalSubst t) f o (updateExprWithFinal finalSubst v)
+  SSAReturn e -> SSAReturn (fmap (updateExprWithFinal finalSubst) e)
+  SSABranch cond t f -> SSABranch (updateExprWithFinal finalSubst cond) t f
+  SSAExprStmt e -> SSAExprStmt (updateExprWithFinal finalSubst e)
+  other -> other
+
+-- | Update an expression with final values
+updateExprWithFinal :: Map VarKey SSAVar -> SSAExpr -> SSAExpr
+updateExprWithFinal finalSubst = \case
+  SSAUse var -> case Map.lookup (varKey var) finalSubst of
+    Just finalVar -> SSAUse finalVar
+    Nothing -> SSAUse var
+  SSAUnary op e -> SSAUnary op (updateExprWithFinal finalSubst e)
+  SSABinary op l r -> SSABinary op (updateExprWithFinal finalSubst l) (updateExprWithFinal finalSubst r)
+  SSATernary c t e -> SSATernary (updateExprWithFinal finalSubst c) (updateExprWithFinal finalSubst t) (updateExprWithFinal finalSubst e)
+  SSACall name args -> SSACall name (map (updateExprWithFinal finalSubst) args)
+  SSAInstanceCall t m args -> SSAInstanceCall (updateExprWithFinal finalSubst t) m (map (updateExprWithFinal finalSubst) args)
+  SSANewObject cn args -> SSANewObject cn (map (updateExprWithFinal finalSubst) args)
+  SSAFieldAccess t f -> SSAFieldAccess (updateExprWithFinal finalSubst t) f
+  e -> e
+
+-- | Extract phi node mappings: initial values and latch values
+-- Returns (phiVar -> initialValue, phiVar -> latchValue)
+extractPhiMappings :: SSABlock -> BlockId -> Maybe BlockId -> (Map VarKey SSAVar, Map VarKey SSAVar)
+extractPhiMappings headerBlock latch preheader =
+  let phis = blockPhis headerBlock
+      initials = Map.fromList $ catMaybes
+        [ case preheader of
+            Just pre -> case lookup pre (phiArgs phi) of
+              Just initVar -> Just (varKey (phiVar phi), initVar)
+              Nothing -> findNonLatchArg phi latch  -- fallback to non-latch arg
+            Nothing -> findNonLatchArg phi latch
+        | phi <- phis
+        ]
+      latches = Map.fromList
+        [ (varKey (phiVar phi), latchVar)
+        | phi <- phis
+        , Just latchVar <- [lookup latch (phiArgs phi)]
+        ]
+  in (initials, latches)
+  where
+    -- Find an arg that's not from the latch (i.e., the initial value)
+    findNonLatchArg phi latchBid =
+      case [v | (bid, v) <- phiArgs phi, bid /= latchBid] of
+        (v:_) -> Just (varKey (phiVar phi), v)
+        [] -> Nothing
+
+-- | Create fully unrolled copies of the loop body
+fullUnrollCopies :: Map BlockId SSABlock -> [BlockId] -> BlockId -> BlockId
+                 -> BlockId -> Int -> Map VarKey SSAVar -> Map VarKey SSAVar -> [SSABlock]
+fullUnrollCopies blockMap bodyBids header latch exitTarget n phiInitials phiLatches =
+  let bodyBlocks = catMaybes [Map.lookup bid blockMap | bid <- bodyBids]
+      -- Collect variables defined in the body (not phi nodes)
+      bodyDefs = collectBodyDefinitions bodyBlocks
+  in concatMap (makeUnrollCopy bodyBlocks bodyDefs header latch exitTarget n phiLatches) [0..n-1]
+  where
+    -- For iteration i, create the substitution map for phi vars
+    makeUnrollCopy bodies defs hdr ltch exit total phiLatch i =
+      let isLast = i == total - 1
+          -- Where to go after this iteration
+          nextTarget = if isLast then exit else renameBlockId (head bodyBids) (i + 1)
+          -- Build substitution: phi var -> value for this iteration
+          subst = if i == 0
+            then phiInitials  -- Use initial values
+            else Map.map (renameVarForIter (i - 1) defs) phiLatch  -- Use renamed latch vars from prev iter
+      in map (transformBodyBlock subst defs i hdr nextTarget) bodies
+
+    -- Rename a variable for a specific iteration
+    renameVarForIter iter defs var =
+      let key = varKey var
+      in if Set.member key defs
+         then var { ssaName = varName (varNameString (ssaName var) ++ "_u" ++ show iter) }
+         else var  -- Non-loop variable, keep as is
+
+-- | Collect variable definitions in body blocks (not from phis)
+collectBodyDefinitions :: [SSABlock] -> Set VarKey
+collectBodyDefinitions blocks = Set.fromList $ concatMap blockDefs blocks
+  where
+    blockDefs SSABlock{..} =
+      [(ssaName v, ssaVersion v) | SSAAssign v _ <- blockInstrs]
+
+-- | Transform a body block for iteration i
+-- header: the loop header (target of back edge, used to redirect jumps)
+-- nextTarget: where to go after this iteration (next iter's body or exit)
+transformBodyBlock :: Map VarKey SSAVar -> Set VarKey -> Int -> BlockId -> BlockId -> SSABlock -> SSABlock
+transformBodyBlock phiSubst bodyDefs i header nextTarget block =
+  let newLabel = renameBlockId (blockLabel block) i
+      newInstrs = map (transformInstr phiSubst bodyDefs i header nextTarget) (blockInstrs block)
+  in SSABlock newLabel [] newInstrs
+
+-- | Transform an instruction for iteration i
+-- header: the loop header (target of back edge)
+-- nextTarget: where to go after this iteration (next iter's body or exit)
+transformInstr :: Map VarKey SSAVar -> Set VarKey -> Int -> BlockId -> BlockId -> SSAInstr -> SSAInstr
+transformInstr phiSubst bodyDefs i header nextTarget = \case
+  SSAAssign var expr ->
+    SSAAssign (renameDefVar bodyDefs i var) (transformExpr phiSubst bodyDefs i expr)
+  SSAFieldStore t f o v ->
+    SSAFieldStore (transformExpr phiSubst bodyDefs i t) f o (transformExpr phiSubst bodyDefs i v)
+  SSAReturn e -> SSAReturn (fmap (transformExpr phiSubst bodyDefs i) e)
+  SSAJump target
+    | target == header -> SSAJump nextTarget  -- Redirect back edge to next iteration/exit
+    | otherwise -> SSAJump (renameBlockId target i)
+  SSABranch cond t f ->
+    SSABranch (transformExpr phiSubst bodyDefs i cond) (renameBlockId t i) (renameBlockId f i)
+  SSAExprStmt e -> SSAExprStmt (transformExpr phiSubst bodyDefs i e)
+
+-- | Rename a defined variable for iteration i
+renameDefVar :: Set VarKey -> Int -> SSAVar -> SSAVar
+renameDefVar bodyDefs i var =
+  var { ssaName = varName (varNameString (ssaName var) ++ "_u" ++ show i) }
+
+-- | Transform an expression for iteration i, substituting phi vars
+transformExpr :: Map VarKey SSAVar -> Set VarKey -> Int -> SSAExpr -> SSAExpr
+transformExpr phiSubst bodyDefs i = \case
+  SSAUse var ->
+    let key = varKey var
+    in case Map.lookup key phiSubst of
+      Just substVar -> SSAUse substVar  -- Replace phi var with substituted value
+      Nothing ->
+        -- Check if it's a body-defined variable from a previous part of this iteration
+        if Set.member key bodyDefs
+        then SSAUse (var { ssaName = varName (varNameString (ssaName var) ++ "_u" ++ show i) })
+        else SSAUse var  -- External variable, keep as is
+  SSAUnary op e -> SSAUnary op (transformExpr phiSubst bodyDefs i e)
+  SSABinary op l r -> SSABinary op (transformExpr phiSubst bodyDefs i l) (transformExpr phiSubst bodyDefs i r)
+  SSATernary c t e -> SSATernary (transformExpr phiSubst bodyDefs i c) (transformExpr phiSubst bodyDefs i t) (transformExpr phiSubst bodyDefs i e)
+  SSACall name args -> SSACall name (map (transformExpr phiSubst bodyDefs i) args)
+  SSAInstanceCall t m args -> SSAInstanceCall (transformExpr phiSubst bodyDefs i t) m (map (transformExpr phiSubst bodyDefs i) args)
+  SSANewObject cn args -> SSANewObject cn (map (transformExpr phiSubst bodyDefs i) args)
+  SSAFieldAccess t f -> SSAFieldAccess (transformExpr phiSubst bodyDefs i t) f
+  e -> e  -- Literals
 
 -- | Check if a loop is simple enough to unroll
 -- Simple = single latch, single exit, no nested loops
@@ -461,52 +642,384 @@ renameExpr suffix iter = \case
 --------------------------------------------------------------------------------
 
 -- | Partially unroll a loop by duplicating the body within the loop
--- For a loop like: while (i < n) { body; i++; }
--- With factor 4, transform to: while (i < n-3) { body; body; body; body; i+=4; }
---                              while (i < n) { body; i++; }  // cleanup
+-- For a loop like: while (i < N) { body; i++; }
+-- With factor k, transform to:
+--   while (i < N-(k-1)) { body_0; body_1; ...; body_{k-1}; }  // main loop
+--   while (i < N) { body; }                                   // epilogue
 --
--- Key: Each duplicated body uses variables from the previous duplicate.
--- We need to properly chain the variable names across duplicates.
+-- Key requirements:
+-- 1. Adjust loop bound to ensure k iterations are available
+-- 2. Chain variable definitions across duplicates
+-- 3. Update phi back-edges to receive from last duplicate
+-- 4. Create epilogue loop for remainder iterations
 partiallyUnroll :: Map BlockId SSABlock -> Loop -> Int -> (Map BlockId SSABlock, Int)
 partiallyUnroll blockMap loop factor
   | factor <= 1 = (blockMap, 0)
   | not (isSimpleLoop loop blockMap) = (blockMap, 0)
+  | otherwise = doPartialUnroll blockMap loop factor
+
+-- | Check if a loop has already been unrolled (by detecting naming convention)
+-- Checks both header and body blocks for unroll suffixes
+-- Also skips epilogue loops (created by partial unrolling)
+isAlreadyUnrolled :: Loop -> Bool
+isAlreadyUnrolled loop =
+  let allBlockNames = blockIdName (loopHeader loop) : map blockIdName (Set.toList (loopBody loop))
+  in any hasUnrollSuffix allBlockNames || any isEpilogueBlock allBlockNames
+  where
+    hasUnrollSuffix name = "_p" `isInfixOf` name || "_u" `isInfixOf` name
+    isEpilogueBlock name = "epilogue" `isPrefixOf` name
+    isInfixOf needle haystack = needle `elem` [take (length needle) (drop i haystack) | i <- [0..length haystack - length needle]]
+    isPrefixOf prefix str = take (length prefix) str == prefix
+
+-- | Internal implementation of partial unrolling
+doPartialUnroll :: Map BlockId SSABlock -> Loop -> Int -> (Map BlockId SSABlock, Int)
+doPartialUnroll blockMap loop factor
+  | isAlreadyUnrolled loop = (blockMap, 0)  -- Skip already unrolled loops
   | otherwise =
-      let header = loopHeader loop
-          bodyBlocks = Set.toList (loopBody loop)
-          pureBody = filter (/= header) bodyBlocks
-      in case (loopLatches loop, Map.lookup header blockMap) of
-           ([latch], Just headerBlock) ->
-             case Map.lookup latch blockMap of
-               Just latchBlock ->
-                 let -- Get all body blocks and collect loop definitions
-                     allBodyBlocks = catMaybes [Map.lookup bid blockMap | bid <- pureBody]
-                     loopDefs = collectLoopDefinitions (headerBlock : allBodyBlocks)
+  let header = loopHeader loop
+      bodyBlocks = Set.toList (loopBody loop)
+      pureBody = filter (/= header) bodyBlocks
+      latches = loopLatches loop
+  in case (latches, Map.lookup header blockMap) of
+       ([latch], Just headerBlock) ->
+         case (analyzeInductionVar headerBlock latch pureBody blockMap,
+               findLoopBound (blockInstrs headerBlock),
+               findExitTarget (blockInstrs headerBlock)) of
+           (Just (inductionPhi, inductionStep), Just (boundVar, boundVal), Just (bodyTarget, exitTarget)) ->
+             let -- Get all body blocks
+                 allBodyBlocks = catMaybes [Map.lookup bid blockMap | bid <- pureBody]
 
-                     -- Get body instructions (non-terminators)
-                     bodyInstrs = concatMap getBodyInstrs allBodyBlocks
+                 -- Collect definitions in the body (for renaming)
+                 bodyDefs = collectBodyDefinitions allBodyBlocks
 
-                     -- Create duplicated instructions with proper chaining
-                     -- Each duplicate i uses vars from duplicate i-1
-                     -- Duplicate 0 (original) is already in the loop body
-                     duplicated = concatMap (\i -> duplicateInstrsChained bodyInstrs loopDefs i) [1..factor-1]
+                 -- Get all phis from header (need to update their back-edges)
+                 headerPhis = blockPhis headerBlock
 
-                     -- Insert before the latch's terminator
-                     -- Also need to update the latch's terminator to use the last duplicate's vars
-                     latchInstrs = blockInstrs latchBlock
-                     newLatchInstrs = case reverse latchInstrs of
-                       (term:rest) ->
-                         -- Update terminator to use vars from last duplicate
-                         let lastSuffix = "_dup" ++ show (factor - 1)
-                             term' = renameInstrForPartial lastSuffix loopDefs term
-                         in reverse rest ++ duplicated ++ [term']
-                       [] -> duplicated
+                 -- Build the unrolled body blocks
+                 -- Copy 0 is the original body, copies 1..factor-1 are new
+                 unrolledBodyBlocks = buildUnrolledBody allBodyBlocks bodyDefs headerPhis
+                                                        header latch factor
 
-                     newLatch = latchBlock { blockInstrs = newLatchInstrs }
-                     newMap = Map.insert latch newLatch blockMap
-                 in (newMap, 1)
-               Nothing -> (blockMap, 0)
-           _ -> (blockMap, 0)
+                 -- Build new header with adjusted bound
+                 newHeaderBlock = buildAdjustedHeader headerBlock boundVar boundVal factor
+                                                      bodyTarget exitTarget latch
+
+                 -- Build epilogue loop (original loop structure, new labels)
+                 epilogueBlocks = buildEpilogue headerBlock allBodyBlocks bodyDefs
+                                               latch exitTarget factor
+
+                 -- Remove original body blocks (keep header for now)
+                 withoutBody = foldl' (flip Map.delete) blockMap pureBody
+
+                 -- Insert new header, unrolled body, and epilogue
+                 finalMap = foldl' (\m b -> Map.insert (blockLabel b) b m)
+                                   withoutBody
+                                   (newHeaderBlock : unrolledBodyBlocks ++ epilogueBlocks)
+
+             in (finalMap, 1)
+           _ -> (blockMap, 0)  -- Can't analyze loop structure
+       _ -> (blockMap, 0)  -- Multiple latches not supported
+
+-- | Analyze induction variable: find the phi that increments by a constant
+analyzeInductionVar :: SSABlock -> BlockId -> [BlockId] -> Map BlockId SSABlock
+                    -> Maybe (PhiNode, Int)
+analyzeInductionVar headerBlock latch bodyBids blockMap =
+  let bodyBlocks = catMaybes [Map.lookup bid blockMap | bid <- bodyBids]
+  in case [(phi, step) | phi <- blockPhis headerBlock
+                       , Just step <- [findPhiStep phi latch bodyBlocks]] of
+       ((phi, step):_) -> Just (phi, step)
+       [] -> Nothing
+
+-- | Find step value for a phi node (how much it's incremented each iteration)
+findPhiStep :: PhiNode -> BlockId -> [SSABlock] -> Maybe Int
+findPhiStep phi latch bodyBlocks =
+  case lookup latch (phiArgs phi) of
+    Just latchVar ->
+      -- Find assignment to latchVar in body blocks
+      findStepForVar (varNameString (ssaName latchVar)) bodyBlocks
+    Nothing -> Nothing
+
+-- | Find step value for a variable
+findStepForVar :: String -> [SSABlock] -> Maybe Int
+findStepForVar varName blocks =
+  case [(step, src) | SSABlock{..} <- blocks
+                    , SSAAssign v (SSABinary Add (SSAUse src) (SSAInt step)) <- blockInstrs
+                    , varNameString (ssaName v) == varName] ++
+       [(step, src) | SSABlock{..} <- blocks
+                    , SSAAssign v (SSABinary Add (SSAInt step) (SSAUse src)) <- blockInstrs
+                    , varNameString (ssaName v) == varName] of
+    ((step, _):_) -> Just step
+    [] -> Nothing
+
+-- | Find loop bound from header branch
+findLoopBound :: [SSAInstr] -> Maybe (SSAVar, Int)
+findLoopBound instrs = case reverse instrs of
+  (SSABranch (SSABinary Lt (SSAUse var) (SSAInt limit)) _ _) : _ ->
+    Just (var, limit)
+  (SSABranch (SSABinary Le (SSAUse var) (SSAInt limit)) _ _) : _ ->
+    Just (var, limit + 1)  -- <= N is same as < N+1
+  _ -> Nothing
+
+-- | Find exit target from header branch (body target, exit target)
+findExitTarget :: [SSAInstr] -> Maybe (BlockId, BlockId)
+findExitTarget instrs = case reverse instrs of
+  (SSABranch _ bodyTarget exitTarget) : _ -> Just (bodyTarget, exitTarget)
+  _ -> Nothing
+
+-- | Build unrolled body blocks
+-- Creates factor copies of the body, chaining variables properly
+buildUnrolledBody :: [SSABlock] -> Set VarKey -> [PhiNode]
+                  -> BlockId -> BlockId -> Int -> [SSABlock]
+buildUnrolledBody bodyBlocks bodyDefs headerPhis header latch factor =
+  concatMap (buildUnrollCopy bodyBlocks bodyDefs headerPhis header latch factor) [0..factor-1]
+
+-- | Build one copy of the unrolled body
+-- Key insight for proper chaining:
+-- - For each phi `x_phi = phi [..., latch: x_latch]`, the phi receives its latch value
+-- - Copy 0 uses phi vars directly, produces renamed latch vars (e.g., a_3 -> a_3)
+-- - Copy N>0 uses PREVIOUS copy's latch vars (the values that would feed back to phi)
+-- - Copy N>0 produces renamed latch vars with suffix (e.g., a_3 -> a_p1_3)
+buildUnrollCopy :: [SSABlock] -> Set VarKey -> [PhiNode]
+                -> BlockId -> BlockId -> Int -> Int -> [SSABlock]
+buildUnrollCopy bodyBlocks bodyDefs headerPhis header latch totalFactor copyNum =
+  let suffix = if copyNum == 0 then "" else "_p" ++ show copyNum
+      isLast = copyNum == totalFactor - 1
+
+      -- Build phi->latch mapping: tells us which body-defined var feeds each phi
+      -- e.g., a_2 (phi var) is fed by a_3 (latch var from body)
+      phiToLatch = Map.fromList
+        [(varKey (phiVar phi), latchVar)
+        | phi <- headerPhis
+        , Just latchVar <- [lookup latch (phiArgs phi)]]
+
+      -- For copy 0: uses of phi vars stay as-is (they're defined by phi nodes)
+      -- For copy N>0: uses of phi vars become uses of the LATCH vars from copy N-1
+      -- e.g., copy 1 uses a_2 -> should become a_3 (copy 0's latch output)
+      --       copy 2 uses a_2 -> should become a_p1_3 (copy 1's latch output)
+      phiSubst = if copyNum == 0
+                 then Map.empty
+                 else Map.fromList
+                   [(phiKey, if copyNum == 1
+                             then latchVar  -- Copy 1 uses copy 0's latch var (no suffix)
+                             else latchVar { ssaName = varName (varNameString (ssaName latchVar) ++ "_p" ++ show (copyNum - 1)) })
+                   | (phiKey, latchVar) <- Map.toList phiToLatch]
+
+      -- For body-defined vars (including latch vars):
+      -- Copy N>0 uses vars from copy N-1
+      useSubst = if copyNum == 0
+                 then Map.empty
+                 else buildUseSubst bodyDefs (copyNum - 1)
+
+  in map (transformUnrollBlock suffix useSubst phiSubst bodyDefs isLast header latch totalFactor copyNum) bodyBlocks
+
+-- | Build use substitution map: body var -> renamed var from previous copy
+buildUseSubst :: Set VarKey -> Int -> Map VarKey SSAVar
+buildUseSubst bodyDefs prevCopy =
+  let prevSuffix = if prevCopy == 0 then "" else "_p" ++ show prevCopy
+  in Map.fromList [(key, SSAVar { ssaName = varName (varNameString name ++ prevSuffix)
+                                , ssaVersion = ver
+                                , ssaVarType = Nothing })
+                  | key@(name, ver) <- Set.toList bodyDefs]
+
+-- | Transform a block for unrolled copy
+transformUnrollBlock :: String -> Map VarKey SSAVar -> Map VarKey SSAVar
+                     -> Set VarKey -> Bool -> BlockId -> BlockId -> Int -> Int
+                     -> SSABlock -> SSABlock
+transformUnrollBlock suffix useSubst phiSubst bodyDefs isLast header latch totalFactor copyNum block =
+  let newLabel = if null suffix then blockLabel block
+                 else blockId (blockIdName (blockLabel block) ++ suffix)
+      -- Determine where to jump next
+      nextCopyFirstBlock = if isLast
+                           then header  -- Last copy jumps back to header
+                           else blockId (blockIdName (blockLabel block) ++ "_p" ++ show (copyNum + 1))
+      newInstrs = map (transformUnrollInstr suffix useSubst phiSubst bodyDefs
+                                            header latch nextCopyFirstBlock copyNum isLast) (blockInstrs block)
+  in SSABlock newLabel [] newInstrs
+
+-- | Transform an instruction for unrolled copy
+transformUnrollInstr :: String -> Map VarKey SSAVar -> Map VarKey SSAVar
+                     -> Set VarKey -> BlockId -> BlockId -> BlockId -> Int -> Bool
+                     -> SSAInstr -> SSAInstr
+transformUnrollInstr suffix useSubst phiSubst bodyDefs header latch nextTarget copyNum isLast = \case
+  SSAAssign var expr ->
+    let -- Definition gets current suffix
+        newVar = if null suffix then var
+                 else var { ssaName = varName (varNameString (ssaName var) ++ suffix) }
+        -- Uses get substituted
+        newExpr = transformUnrollExpr useSubst phiSubst expr
+    in SSAAssign newVar newExpr
+  SSAFieldStore t f o v ->
+    SSAFieldStore (transformUnrollExpr useSubst phiSubst t) f o
+                  (transformUnrollExpr useSubst phiSubst v)
+  SSAReturn e -> SSAReturn (fmap (transformUnrollExpr useSubst phiSubst) e)
+  SSAJump target
+    | target == header ->
+        -- Back edge: if last copy, go to header; otherwise go to next copy
+        if isLast then SSAJump header else SSAJump nextTarget
+    | otherwise ->
+        -- Internal jump within body
+        SSAJump (if null suffix then target else blockId (blockIdName target ++ suffix))
+  SSABranch cond t f ->
+    SSABranch (transformUnrollExpr useSubst phiSubst cond)
+              (if null suffix then t else blockId (blockIdName t ++ suffix))
+              (if null suffix then f else blockId (blockIdName f ++ suffix))
+  SSAExprStmt e -> SSAExprStmt (transformUnrollExpr useSubst phiSubst e)
+
+-- | Transform an expression for unrolled copy
+transformUnrollExpr :: Map VarKey SSAVar -> Map VarKey SSAVar -> SSAExpr -> SSAExpr
+transformUnrollExpr useSubst phiSubst = \case
+  SSAUse var ->
+    let key = varKey var
+    in case Map.lookup key phiSubst of
+         Just newVar -> SSAUse newVar
+         Nothing -> case Map.lookup key useSubst of
+           Just newVar -> SSAUse newVar
+           Nothing -> SSAUse var
+  SSAUnary op e -> SSAUnary op (transformUnrollExpr useSubst phiSubst e)
+  SSABinary op l r -> SSABinary op (transformUnrollExpr useSubst phiSubst l)
+                                   (transformUnrollExpr useSubst phiSubst r)
+  SSATernary c t e -> SSATernary (transformUnrollExpr useSubst phiSubst c)
+                                 (transformUnrollExpr useSubst phiSubst t)
+                                 (transformUnrollExpr useSubst phiSubst e)
+  SSACall name args -> SSACall name (map (transformUnrollExpr useSubst phiSubst) args)
+  SSAInstanceCall t m args ->
+    SSAInstanceCall (transformUnrollExpr useSubst phiSubst t) m
+                    (map (transformUnrollExpr useSubst phiSubst) args)
+  SSANewObject cn args -> SSANewObject cn (map (transformUnrollExpr useSubst phiSubst) args)
+  SSAFieldAccess t f -> SSAFieldAccess (transformUnrollExpr useSubst phiSubst t) f
+  e -> e
+
+-- | Build adjusted header with modified bound
+-- Changes: i < N  ->  i < N - (factor - 1)
+-- Also changes exit target to epilogue instead of original exit
+buildAdjustedHeader :: SSABlock -> SSAVar -> Int -> Int
+                    -> BlockId -> BlockId -> BlockId -> SSABlock
+buildAdjustedHeader headerBlock boundVar boundVal factor bodyTarget exitTarget latch =
+  let -- Adjusted bound: need at least `factor` iterations available
+      adjustedBound = boundVal - (factor - 1)
+      -- New exit goes to epilogue header
+      epilogueHeader = blockId "epilogue_header"
+      -- Update phi back-edges to receive from last unrolled copy
+      -- Both the block ID and variable name need to be updated
+      lastCopySuffix = "_p" ++ show (factor - 1)
+      newLatch = blockId (blockIdName latch ++ lastCopySuffix)  -- B8 -> B8_p1
+      newPhis = [phi { phiArgs = [(if bid == latch then newLatch else bid,
+                                   if bid == latch
+                                   then v { ssaName = varName (varNameString (ssaName v) ++ lastCopySuffix) }
+                                   else v)
+                                 | (bid, v) <- phiArgs phi] }
+                | phi <- blockPhis headerBlock]
+      -- Update branch instruction with new bound
+      newInstrs = map (adjustBranchBound adjustedBound epilogueHeader) (blockInstrs headerBlock)
+  in headerBlock { blockPhis = newPhis, blockInstrs = newInstrs }
+
+-- | Adjust branch bound in instruction
+adjustBranchBound :: Int -> BlockId -> SSAInstr -> SSAInstr
+adjustBranchBound newBound epilogueTarget = \case
+  SSABranch (SSABinary Lt (SSAUse var) (SSAInt _)) bodyT _exitT ->
+    SSABranch (SSABinary Lt (SSAUse var) (SSAInt newBound)) bodyT epilogueTarget
+  SSABranch (SSABinary Le (SSAUse var) (SSAInt _)) bodyT _exitT ->
+    SSABranch (SSABinary Le (SSAUse var) (SSAInt (newBound - 1))) bodyT epilogueTarget
+  other -> other
+
+-- | Build epilogue loop to handle remaining iterations
+-- This is a copy of the original loop with new labels
+buildEpilogue :: SSABlock -> [SSABlock] -> Set VarKey
+              -> BlockId -> BlockId -> Int -> [SSABlock]
+buildEpilogue headerBlock bodyBlocks bodyDefs latch exitTarget factor =
+  let epilogueHeader = blockId "epilogue_header"
+      epilogueLatch = blockId "epilogue_latch"
+
+      -- Epilogue header: receives from main loop (via adjusted header) or epilogue latch
+      mainHeader = blockLabel headerBlock
+      lastCopySuffix = "_p" ++ show (factor - 1)
+
+      -- Create epilogue phi nodes
+      -- They receive values from:
+      -- 1. Main loop header (when main loop exits) - these are the phi vars
+      -- 2. Epilogue latch (for subsequent iterations) - use the ORIGINAL latch var with suffix
+      epiloguePhis = [PhiNode
+                       { phiVar = (phiVar phi) { ssaName = varName (varNameString (ssaName (phiVar phi)) ++ "_e") }
+                       , phiArgs = [(mainHeader, phiVar phi),  -- From main loop: a_2
+                                   -- From epilogue latch: use the original latch variable with suffix
+                                   -- e.g., if phi a_2 <- [B8: a_3], then epilogue latch arg is a_e_latch_3
+                                   (epilogueLatch, case lookup latch (phiArgs phi) of
+                                     Just latchVar -> latchVar { ssaName = varName (varNameString (ssaName latchVar) ++ "_e_latch") }
+                                     Nothing -> (phiVar phi) { ssaName = varName (varNameString (ssaName (phiVar phi)) ++ "_e_latch") })]
+                       }
+                     | phi <- blockPhis headerBlock]
+
+      phiKeys = Set.fromList [varKey (phiVar phi) | phi <- blockPhis headerBlock]
+
+      -- Epilogue header instructions (same condition as original, but with epilogue phis)
+      epilogueHeaderInstrs = map (renameEpilogueInstr "_e" phiKeys epilogueLatch exitTarget) (blockInstrs headerBlock)
+
+      -- Epilogue body (copy of original body with renamed variables)
+      -- Uses epilogue phi vars, produces epilogue latch vars
+      epilogueBodyInstrs = concatMap (renameEpilogueBodyInstrs "_e" "_e_latch" phiKeys) bodyBlocks
+
+      epilogueHeaderBlock = SSABlock epilogueHeader epiloguePhis epilogueHeaderInstrs
+      epilogueLatchBlock = SSABlock epilogueLatch [] (epilogueBodyInstrs ++ [SSAJump epilogueHeader])
+
+  in [epilogueHeaderBlock, epilogueLatchBlock]
+
+-- | Rename instruction for epilogue header
+renameEpilogueInstr :: String -> Set VarKey -> BlockId -> BlockId -> SSAInstr -> SSAInstr
+renameEpilogueInstr suffix phiKeys epilogueLatch exitTarget = \case
+  SSABranch cond _bodyT _exitT ->
+    let bodyT = epilogueLatch
+    in SSABranch (renameEpilogueExpr suffix phiKeys cond) bodyT exitTarget
+  other -> other
+
+-- | Rename expression for epilogue
+-- Only renames phi-defined variables
+renameEpilogueExpr :: String -> Set VarKey -> SSAExpr -> SSAExpr
+renameEpilogueExpr suffix phiKeys = \case
+  SSAUse var ->
+    if Set.member (varKey var) phiKeys
+    then SSAUse (var { ssaName = varName (varNameString (ssaName var) ++ suffix) })
+    else SSAUse var
+  SSABinary op l r -> SSABinary op (renameEpilogueExpr suffix phiKeys l) (renameEpilogueExpr suffix phiKeys r)
+  SSAUnary op e -> SSAUnary op (renameEpilogueExpr suffix phiKeys e)
+  e -> e
+
+-- | Rename body instructions for epilogue
+renameEpilogueBodyInstrs :: String -> String -> Set VarKey -> SSABlock -> [SSAInstr]
+renameEpilogueBodyInstrs useSuffix defSuffix phiKeys SSABlock{..} =
+  [renameEpilogueBodyInstr useSuffix defSuffix phiKeys instr | instr <- blockInstrs, not (isTerminator instr)]
+
+-- | Rename a single body instruction for epilogue
+renameEpilogueBodyInstr :: String -> String -> Set VarKey -> SSAInstr -> SSAInstr
+renameEpilogueBodyInstr useSuffix defSuffix phiKeys = \case
+  SSAAssign var expr ->
+    let -- Definition gets defSuffix
+        newVar = var { ssaName = varName (varNameString (ssaName var) ++ defSuffix) }
+        -- Uses get useSuffix (for phi vars) or defSuffix (for body vars in same iteration)
+        newExpr = renameEpilogueBodyExpr useSuffix phiKeys expr
+    in SSAAssign newVar newExpr
+  other -> other
+
+-- | Rename expression for epilogue body
+-- Only renames variables that are defined within the loop (phi vars)
+-- External variables (like `rand_1`) are kept as-is
+renameEpilogueBodyExpr :: String -> Set VarKey -> SSAExpr -> SSAExpr
+renameEpilogueBodyExpr suffix phiKeys = \case
+  SSAUse var ->
+    -- Only rename if this is a phi-defined variable
+    if Set.member (varKey var) phiKeys
+    then SSAUse (var { ssaName = varName (varNameString (ssaName var) ++ suffix) })
+    else SSAUse var  -- External variable, keep as-is
+  SSABinary op l r -> SSABinary op (renameEpilogueBodyExpr suffix phiKeys l)
+                                   (renameEpilogueBodyExpr suffix phiKeys r)
+  SSAUnary op e -> SSAUnary op (renameEpilogueBodyExpr suffix phiKeys e)
+  SSATernary c t f -> SSATernary (renameEpilogueBodyExpr suffix phiKeys c)
+                                 (renameEpilogueBodyExpr suffix phiKeys t)
+                                 (renameEpilogueBodyExpr suffix phiKeys f)
+  SSACall n args -> SSACall n (map (renameEpilogueBodyExpr suffix phiKeys) args)
+  SSAInstanceCall t m args -> SSAInstanceCall (renameEpilogueBodyExpr suffix phiKeys t) m
+                                              (map (renameEpilogueBodyExpr suffix phiKeys) args)
+  SSAFieldAccess t f -> SSAFieldAccess (renameEpilogueBodyExpr suffix phiKeys t) f
+  e -> e
 
 -- | Get body instructions (non-terminators) from a block
 getBodyInstrs :: SSABlock -> [SSAInstr]

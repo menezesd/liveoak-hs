@@ -118,6 +118,7 @@ data UseSite
   | UseReturn !BlockId              -- ^ Returned from method
   | UseStore !BlockId !String !Int  -- ^ Stored to field
   | UseGlobal !BlockId              -- ^ Other global escape
+  | UseAssignValue !BlockId !String -- ^ Used as value in assignment (could escape via assigned var)
   deriving (Show)
 
 -- | Find all uses of a variable
@@ -132,7 +133,12 @@ findBlockUses varName SSABlock{..} =
 -- | Find uses in an instruction
 findInstrUses :: BlockId -> String -> (Int, SSAInstr) -> [UseSite]
 findInstrUses bid varName (idx, instr) = case instr of
-  SSAAssign _ expr -> findExprUses bid idx varName expr
+  -- For assignments, if the variable is used as a value that gets assigned to another variable,
+  -- it could escape through that variable. Check if the use is in a "value position" (not just
+  -- used to compute something, but IS the value being assigned).
+  SSAAssign assignedVar expr ->
+    let assignedName = varNameString (ssaName assignedVar)
+    in findExprUsesInAssign bid idx assignedName varName expr
 
   SSAReturn (Just expr) ->
     [UseReturn bid | exprUsesVar varName expr]
@@ -145,6 +151,21 @@ findInstrUses bid varName (idx, instr) = case instr of
   SSAExprStmt expr -> findExprUses bid idx varName expr
 
   _ -> []
+
+-- | Find uses in an assignment expression, tracking when the variable IS the value being assigned
+-- (not just used to compute it)
+findExprUsesInAssign :: BlockId -> Int -> String -> String -> SSAExpr -> [UseSite]
+findExprUsesInAssign bid idx assignedVar varName = \case
+  -- Direct use as value - could escape through assigned variable
+  SSAUse var | varNameString (ssaName var) == varName ->
+    [UseAssignValue bid assignedVar]
+  -- Ternary: either branch could be the assigned value
+  SSATernary c t e ->
+    findExprUses bid idx varName c ++  -- condition is just computed
+    findExprUsesInAssign bid idx assignedVar varName t ++  -- branches are assigned
+    findExprUsesInAssign bid idx assignedVar varName e
+  -- Other expressions: variable is used to compute, not directly assigned
+  other -> findExprUses bid idx varName other
 
 -- | Find uses in an expression
 findExprUses :: BlockId -> Int -> String -> SSAExpr -> [UseSite]
@@ -192,6 +213,7 @@ classifyUse = \case
   UseReturn _ -> GlobalEscape     -- Returning causes global escape
   UseStore _ _ _ -> GlobalEscape  -- Storing to field causes escape
   UseGlobal _ -> GlobalEscape     -- Other global uses
+  UseAssignValue _ _ -> ArgEscape -- Value assigned to another var could escape through it
 
 --------------------------------------------------------------------------------
 -- Queries
