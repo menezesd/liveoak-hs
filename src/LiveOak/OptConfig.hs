@@ -37,6 +37,15 @@ data PassFlags = PassFlags
   , pfLoopUnroll :: !Bool         -- ^ Loop unrolling
   , pfJumpThread :: !Bool         -- ^ Jump threading
   , pfSchedule :: !Bool           -- ^ Instruction scheduling
+  , pfBlockMerge :: !Bool         -- ^ Block merging
+  , pfNullCheck :: !Bool          -- ^ Null check elimination
+  , pfDeadArg :: !Bool            -- ^ Dead argument elimination
+  , pfReturnProp :: !Bool         -- ^ Return value propagation
+  , pfAlgebraic :: !Bool          -- ^ Algebraic simplifications
+  , pfReassoc :: !Bool            -- ^ Reassociation
+  , pfLoadElim :: !Bool           -- ^ Redundant load elimination
+  , pfLCSSA :: !Bool              -- ^ Loop-closed SSA form
+  , pfInstCombine :: !Bool        -- ^ Instruction combining
   } deriving (Show, Eq)
 
 -- | Full optimization configuration
@@ -70,7 +79,16 @@ allPassesEnabled = PassFlags
   , pfSROA = False   -- SROA is experimental, disabled by default
   , pfLoopUnroll = False  -- Loop unrolling is experimental
   , pfJumpThread = True
-  , pfSchedule = True  -- Instruction scheduling
+  , pfSchedule = True
+  , pfBlockMerge = True
+  , pfNullCheck = True
+  , pfDeadArg = True
+  , pfReturnProp = True
+  , pfAlgebraic = True
+  , pfReassoc = True
+  , pfLoadElim = True
+  , pfLCSSA = False  -- LCSSA is a transformation, not always needed
+  , pfInstCombine = True
   }
 
 -- | No passes enabled (for testing)
@@ -92,6 +110,15 @@ noPassesEnabled = PassFlags
   , pfLoopUnroll = False
   , pfJumpThread = False
   , pfSchedule = False
+  , pfBlockMerge = False
+  , pfNullCheck = False
+  , pfDeadArg = False
+  , pfReturnProp = False
+  , pfAlgebraic = False
+  , pfReassoc = False
+  , pfLoadElim = False
+  , pfLCSSA = False
+  , pfInstCombine = False
   }
 
 -- | Default optimization configuration
@@ -137,6 +164,15 @@ minimalOptConfig = OptConfig
       , pfLoopUnroll = False
       , pfJumpThread = False
       , pfSchedule = False
+      , pfBlockMerge = True   -- Block merging is fast and effective
+      , pfNullCheck = False
+      , pfDeadArg = False
+      , pfReturnProp = False
+      , pfAlgebraic = True    -- Algebraic simplifications are cheap
+      , pfReassoc = False
+      , pfLoadElim = False
+      , pfLCSSA = False
+      , pfInstCombine = True  -- Instruction combining is cheap
       }
   , ocIterations = 1
   , ocInlineThreshold = 20

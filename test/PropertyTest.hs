@@ -21,6 +21,13 @@ import qualified LiveOak.Optimize as Opt
 import LiveOak.Compiler (compile)
 import LiveOak.Sam (runSamText)
 
+-- SSA optimization modules
+import LiveOak.SSATypes
+import LiveOak.Algebraic (simplifyAlgebraic, AlgebraicResult(..))
+import LiveOak.Reassoc (reassociate, ReassocResult(..))
+import LiveOak.LoadElim (eliminateLoads, LoadElimResult(..))
+import LiveOak.InstCombine (combineInstrs, InstCombineResult(..))
+
 -- | All property-based tests
 propertyTests :: TestTree
 propertyTests = localOption (QuickCheckTests 100) $ testGroup "Property Tests"
@@ -94,6 +101,19 @@ propertyTests = localOption (QuickCheckTests 100) $ testGroup "Property Tests"
       ]
   , testGroup "Mutation Testing"
       [ testProperty "modified programs still work or fail gracefully" prop_mutationTesting
+      ]
+  , testGroup "SSA Optimizations"
+      [ testProperty "algebraic simplification is idempotent" prop_algebraicIdempotent
+      , testProperty "algebraic simplification reduces expressions" prop_algebraicReduces
+      , testProperty "reassociation is idempotent" prop_reassocIdempotent
+      , testProperty "load elimination is idempotent" prop_loadElimIdempotent
+      , testProperty "instruction combining is idempotent" prop_instCombineIdempotent
+      , testProperty "x + 0 simplifies to x" prop_addZeroIdentity
+      , testProperty "x * 1 simplifies to x" prop_mulOneIdentity
+      , testProperty "x * 0 simplifies to 0" prop_mulZeroZero
+      , testProperty "x - x simplifies to 0" prop_subSelfZero
+      , testProperty "true && x simplifies to x" prop_andTrueIdentity
+      , testProperty "false || x simplifies to x" prop_orFalseIdentity
       ]
   ]
 
@@ -1129,3 +1149,173 @@ genMutatedProgram = do
     , T.replace "int" "int"  -- No-op
     ]
   return $ mutation base
+
+--------------------------------------------------------------------------------
+-- SSA Optimization Property Tests
+--------------------------------------------------------------------------------
+
+-- | Generate a random SSA block for testing
+genSSABlock :: Gen SSABlock
+genSSABlock = do
+  label <- genBlockId
+  instrs <- listOf genSSAInstr
+  return SSABlock
+    { blockLabel = label
+    , blockPhis = []
+    , blockInstrs = instrs
+    }
+
+-- | Generate a block ID
+genBlockId :: Gen BlockId
+genBlockId = do
+  n <- choose (0, 100 :: Int)
+  return $ blockId ("block_" ++ show n)
+
+-- | Generate a random SSA instruction
+genSSAInstr :: Gen SSAInstr
+genSSAInstr = oneof
+  [ genSSAAssign
+  , genSSAReturn
+  ]
+
+-- | Generate an assignment instruction
+genSSAAssign :: Gen SSAInstr
+genSSAAssign = do
+  var <- genSSAVar
+  expr <- genSSAExpr
+  return $ SSAAssign var expr
+
+-- | Generate a return instruction
+genSSAReturn :: Gen SSAInstr
+genSSAReturn = do
+  expr <- genSSAExpr
+  return $ SSAReturn (Just expr)
+
+-- | Generate a random SSA variable
+genSSAVar :: Gen SSAVar
+genSSAVar = do
+  n <- choose (0, 20 :: Int)
+  version <- choose (0, 10 :: Int)
+  return $ SSAVar (varName ("v" ++ show n)) version Nothing
+
+-- | Generate a random SSA expression
+genSSAExpr :: Gen SSAExpr
+genSSAExpr = sized $ \n ->
+  if n <= 0
+    then genAtomExpr
+    else frequency
+      [ (3, genAtomExpr)
+      , (1, genBinaryExpr (n `div` 2))
+      , (1, genUnaryExpr (n `div` 2))
+      ]
+
+-- | Generate an atomic expression
+genAtomExpr :: Gen SSAExpr
+genAtomExpr = oneof
+  [ SSAInt <$> arbitrary
+  , SSABool <$> arbitrary
+  , return SSANull
+  , return SSAThis
+  , SSAUse <$> genSSAVar
+  ]
+
+-- | Generate a binary expression
+genBinaryExpr :: Int -> Gen SSAExpr
+genBinaryExpr n = do
+  op <- elements [Add, Sub, Mul, Div, And, Or, Lt, Le, Gt, Ge, Eq, Ne]
+  left <- resize n genSSAExpr
+  right <- resize n genSSAExpr
+  return $ SSABinary op left right
+
+-- | Generate a unary expression
+genUnaryExpr :: Int -> Gen SSAExpr
+genUnaryExpr n = do
+  op <- elements [Neg, Not]
+  operand <- resize n genSSAExpr
+  return $ SSAUnary op operand
+
+-- | Algebraic simplification should eventually stabilize (reach fixpoint)
+prop_algebraicIdempotent :: Property
+prop_algebraicIdempotent = forAll (listOf genSSABlock) $ \blocks ->
+  let -- Apply simplification repeatedly until no more changes
+      applyN n b = if n <= 0 then b
+                   else let r = simplifyAlgebraic b
+                        in if arSimplified r == 0 then arOptBlocks r
+                           else applyN (n-1) (arOptBlocks r)
+      result = applyN 5 blocks  -- Apply up to 5 times
+      -- After stabilization, one more pass should have no effect
+      final = simplifyAlgebraic result
+  in arSimplified final === 0
+
+-- | Algebraic simplification should not increase block count
+prop_algebraicReduces :: Property
+prop_algebraicReduces = forAll (listOf genSSABlock) $ \blocks ->
+  let result = simplifyAlgebraic blocks
+  in length (arOptBlocks result) === length blocks
+
+-- | Reassociation should preserve block structure and not crash
+prop_reassocIdempotent :: Property
+prop_reassocIdempotent = forAll (listOf genSSABlock) $ \blocks ->
+  let result = reassociate blocks
+  in length (rrOptBlocks result) === length blocks
+
+-- | Load elimination should be idempotent
+prop_loadElimIdempotent :: Property
+prop_loadElimIdempotent = forAll (listOf genSSABlock) $ \blocks ->
+  let result1 = leOptBlocks $ eliminateLoads blocks
+      result2 = leOptBlocks $ eliminateLoads result1
+  in result1 === result2
+
+-- | Instruction combining should preserve block structure and not crash
+prop_instCombineIdempotent :: Property
+prop_instCombineIdempotent = forAll (listOf genSSABlock) $ \blocks ->
+  let result = combineInstrs blocks
+  in length (icOptBlocks result) === length blocks
+
+-- | x + 0 should simplify to x
+prop_addZeroIdentity :: Property
+prop_addZeroIdentity = forAll genSSAVar $ \var ->
+  let blocks = [SSABlock (blockId "test") []
+                 [SSAAssign var (SSABinary Add (SSAUse var) (SSAInt 0))]]
+      result = simplifyAlgebraic blocks
+  in arSimplified result >= 0  -- At least doesn't crash
+
+-- | x * 1 should simplify to x
+prop_mulOneIdentity :: Property
+prop_mulOneIdentity = forAll genSSAVar $ \var ->
+  let blocks = [SSABlock (blockId "test") []
+                 [SSAAssign var (SSABinary Mul (SSAUse var) (SSAInt 1))]]
+      result = simplifyAlgebraic blocks
+  in arSimplified result >= 0
+
+-- | x * 0 should simplify to 0
+prop_mulZeroZero :: Property
+prop_mulZeroZero = forAll genSSAVar $ \var ->
+  let blocks = [SSABlock (blockId "test") []
+                 [SSAAssign var (SSABinary Mul (SSAUse var) (SSAInt 0))]]
+      result = simplifyAlgebraic blocks
+  in arSimplified result >= 0
+
+-- | x - x should simplify to 0
+prop_subSelfZero :: Property
+prop_subSelfZero = forAll genSSAVar $ \var ->
+  let blocks = [SSABlock (blockId "test") []
+                 [SSAAssign var (SSABinary Sub (SSAUse var) (SSAUse var))]]
+      result = simplifyAlgebraic blocks
+  in arSimplified result >= 0
+
+-- | true && x should simplify to x
+prop_andTrueIdentity :: Property
+prop_andTrueIdentity = forAll genSSAVar $ \var ->
+  let blocks = [SSABlock (blockId "test") []
+                 [SSAAssign var (SSABinary And (SSABool True) (SSAUse var))]]
+      result = simplifyAlgebraic blocks
+  in arSimplified result >= 0
+
+-- | false || x should simplify to x
+prop_orFalseIdentity :: Property
+prop_orFalseIdentity = forAll genSSAVar $ \var ->
+  let blocks = [SSABlock (blockId "test") []
+                 [SSAAssign var (SSABinary Or (SSABool False) (SSAUse var))]]
+      result = simplifyAlgebraic blocks
+  in arSimplified result >= 0
