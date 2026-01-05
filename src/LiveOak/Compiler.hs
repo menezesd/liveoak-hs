@@ -67,9 +67,9 @@ compileCore config path source = do
   -- AST optimization and SSA conversion
   let optimizedProgram = optimize symbols program
       ssaProg = SSA.toSSAWithCFG symbols optimizedProgram
-      -- Apply SSA optimizations if configured
+      -- Apply SSA optimizations if configured (including SROA which needs symbols)
       finalSSA = if ccOptimizeSSA config
-                 then SSA.optimizeSSAProgram ssaProg
+                 then SSA.optimizeSSAProgramWithSymbols symbols ssaProg
                  else ssaProg
 
   -- Code generation

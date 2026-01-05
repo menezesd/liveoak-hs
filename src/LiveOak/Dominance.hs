@@ -80,7 +80,10 @@ computeDominators cfg =
 -- | Iterate dominator computation until fixed point
 iterateDom :: CFG -> [BlockId] -> Map BlockId Int -> Map BlockId BlockId -> Map BlockId BlockId
 iterateDom cfg rpo rpoIdx idom =
-  let idom' = foldl' (processBlock cfg rpoIdx) idom rpo
+  let entry = cfgEntry cfg
+      -- Skip entry block - its idom is itself (root of dominator tree)
+      rpoNoEntry = filter (/= entry) rpo
+      idom' = foldl' (processBlock cfg rpoIdx) idom rpoNoEntry
   in if idom' == idom
      then idom
      else iterateDom cfg rpo rpoIdx idom'

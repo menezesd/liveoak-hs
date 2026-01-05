@@ -23,6 +23,7 @@
 module LiveOak.JumpThread
   ( -- * Jump Threading
     threadJumps
+  , threadJumpsWithEntry
   , JumpThreadResult(..)
   ) where
 
@@ -44,6 +45,13 @@ data JumpThreadResult = JumpThreadResult
   { jtOptBlocks :: ![SSABlock]    -- ^ Optimized blocks
   , jtThreaded :: !Int            -- ^ Number of jumps threaded
   , jtEliminatedBlocks :: !Int    -- ^ Number of blocks eliminated
+  , jtNewEntry :: !(Maybe BlockId) -- ^ New entry block if original was threaded
+  } deriving (Show)
+
+-- | Threading info for an empty jump-only block.
+data ThreadInfo = ThreadInfo
+  { tiFinalTarget :: !BlockId  -- ^ Final target after skipping empty blocks
+  , tiLastHop :: !BlockId      -- ^ Last empty block before the final target
   } deriving (Show)
 
 --------------------------------------------------------------------------------
@@ -52,31 +60,41 @@ data JumpThreadResult = JumpThreadResult
 
 -- | Apply jump threading to SSA blocks
 threadJumps :: [SSABlock] -> JumpThreadResult
-threadJumps blocks =
+threadJumps = threadJumpsWithEntry (blockId "entry")
+
+-- | Apply jump threading with explicit entry block
+threadJumpsWithEntry :: BlockId -> [SSABlock] -> JumpThreadResult
+threadJumpsWithEntry entryBlock blocks =
   let blockMap = blockMapFromList blocks
-      -- Build jump target map (only for blocks that are safe to thread through)
-      targetMap = buildTargetMap blockMap
+      -- Build jump threading info (only for blocks that are safe to thread through)
+      threadInfo = buildThreadInfo blockMap
+      targetMap = Map.map tiFinalTarget threadInfo
       -- Apply threading and update phi nodes
-      (threaded, count) = applyThreadingWithPhis blockMap targetMap
+      (threaded, count) = applyThreadingWithPhis blockMap threadInfo
       -- Remove empty blocks
       (cleaned, eliminated) = removeEmptyBlocks threaded
+      -- Check if entry block was threaded
+      newEntry = case Map.lookup entryBlock targetMap of
+                   Just target | not (Map.member entryBlock cleaned) -> Just target
+                   _ -> Nothing
   in JumpThreadResult
     { jtOptBlocks = Map.elems cleaned
     , jtThreaded = count
     , jtEliminatedBlocks = eliminated
+    , jtNewEntry = newEntry
     }
 
--- | Build a map of blocks that just jump to another block
--- Maps: block -> final target (skipping intermediate jumps)
-buildTargetMap :: Map BlockId SSABlock -> Map BlockId BlockId
-buildTargetMap blockMap = Map.foldlWithKey' addTarget Map.empty blockMap
+-- | Build threading info for blocks that just jump to another block.
+-- Records both the final target and the last empty block before it.
+buildThreadInfo :: Map BlockId SSABlock -> Map BlockId ThreadInfo
+buildThreadInfo blockMap = Map.foldlWithKey' addInfo Map.empty blockMap
   where
-    addTarget acc bid block =
+    addInfo acc bid block =
       case findJumpTarget block of
         Just target ->
-          -- Follow the chain to find ultimate target
-          let finalTarget = followChain blockMap (Set.singleton bid) target
-          in Map.insert bid finalTarget acc
+          case resolveThreadInfo blockMap (Set.singleton bid) bid target of
+            Just info -> Map.insert bid info acc
+            Nothing -> acc
         Nothing -> acc
 
 -- | Find the target of a block if it only contains a jump
@@ -88,23 +106,26 @@ findJumpTarget SSABlock{..}
         _ -> Nothing
   | otherwise = Nothing
 
--- | Follow a chain of jumps to find the ultimate target
-followChain :: Map BlockId SSABlock -> Set BlockId -> BlockId -> BlockId
-followChain blockMap visited target
-  | Set.member target visited = target  -- Cycle detected
+-- | Resolve the final target and last empty block in a jump chain.
+-- Returns Nothing for cycles to avoid unsafe threading.
+resolveThreadInfo :: Map BlockId SSABlock -> Set BlockId -> BlockId -> BlockId -> Maybe ThreadInfo
+resolveThreadInfo blockMap visited lastEmpty target
+  | Set.member target visited = Nothing  -- Cycle detected
   | otherwise =
       case Map.lookup target blockMap of
         Just block ->
           case findJumpTarget block of
-            Just nextTarget -> followChain blockMap (Set.insert target visited) nextTarget
-            Nothing -> target
-        Nothing -> target
+            Just nextTarget ->
+              resolveThreadInfo blockMap (Set.insert target visited) target nextTarget
+            Nothing -> Just ThreadInfo { tiFinalTarget = target, tiLastHop = lastEmpty }
+        Nothing -> Just ThreadInfo { tiFinalTarget = target, tiLastHop = lastEmpty }
 
 -- | Apply jump threading to all blocks, updating phi nodes as needed
-applyThreadingWithPhis :: Map BlockId SSABlock -> Map BlockId BlockId -> (Map BlockId SSABlock, Int)
-applyThreadingWithPhis blockMap targetMap =
-  let -- Build predecessor map BEFORE threading (who jumps to each empty block)
-      predMap = buildPredecessorMap blockMap targetMap
+applyThreadingWithPhis :: Map BlockId SSABlock -> Map BlockId ThreadInfo -> (Map BlockId SSABlock, Int)
+applyThreadingWithPhis blockMap threadInfo =
+  let targetMap = Map.map tiFinalTarget threadInfo
+      -- Build predecessor map BEFORE threading (who jumps to each threaded-through block)
+      predMap = buildPredecessorMap blockMap threadInfo
       -- Thread the jumps in all blocks
       (count, threaded) = Map.mapAccum (threadBlock targetMap) 0 blockMap
       -- Update phi nodes for the new predecessors
@@ -112,10 +133,11 @@ applyThreadingWithPhis blockMap targetMap =
   in (updated, count)
 
 -- | Build map of predecessors for each empty block that will be threaded through
--- predMap[B] = [P1, P2, ...] means P1, P2, etc. currently jump to B
+-- predMap[B] = [P1, P2, ...] means P1, P2, etc. will become new predecessors
+-- of the block that B jumps to (B is the last empty hop in a chain).
 -- Only records edges that will ACTUALLY be threaded (not self-loops)
-buildPredecessorMap :: Map BlockId SSABlock -> Map BlockId BlockId -> Map BlockId [BlockId]
-buildPredecessorMap blockMap targetMap =
+buildPredecessorMap :: Map BlockId SSABlock -> Map BlockId ThreadInfo -> Map BlockId [BlockId]
+buildPredecessorMap blockMap threadInfo =
   Map.foldlWithKey' addPreds Map.empty blockMap
   where
     addPreds acc bid SSABlock{..} =
@@ -124,17 +146,24 @@ buildPredecessorMap blockMap targetMap =
     -- Only record if threading would NOT create a self-loop
     addPred srcBid acc = \case
       SSAJump target
-        | Just finalTarget <- Map.lookup target targetMap
-        , finalTarget /= srcBid ->  -- Not a self-loop
-            Map.insertWith (++) target [srcBid] acc
+        | Just ThreadInfo{..} <- Map.lookup target threadInfo
+        , tiFinalTarget /= target
+        , tiFinalTarget /= srcBid ->  -- Not a self-loop
+            Map.insertWith (++) tiLastHop [srcBid] acc
       SSABranch _ t f ->
         let -- Only add if threading t wouldn't create self-loop
-            acc' = case Map.lookup t targetMap of
-                     Just ft | ft /= srcBid -> Map.insertWith (++) t [srcBid] acc
+            acc' = case Map.lookup t threadInfo of
+                     Just ThreadInfo{..}
+                       | tiFinalTarget /= t
+                       , tiFinalTarget /= srcBid ->
+                           Map.insertWith (++) tiLastHop [srcBid] acc
                      _ -> acc
             -- Only add if threading f wouldn't create self-loop
-        in case Map.lookup f targetMap of
-             Just ff | ff /= srcBid -> Map.insertWith (++) f [srcBid] acc'
+        in case Map.lookup f threadInfo of
+             Just ThreadInfo{..}
+               | tiFinalTarget /= f
+               , tiFinalTarget /= srcBid ->
+                   Map.insertWith (++) tiLastHop [srcBid] acc'
              _ -> acc'
       _ -> acc
 

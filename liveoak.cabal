@@ -62,6 +62,9 @@ library
                     , LiveOak.Unroll
                     , LiveOak.JumpThread
                     , LiveOak.OptConfig
+                    , LiveOak.OptContext
+                    , LiveOak.OptStats
+                    , LiveOak.SSAOptimize
     build-depends:    base >= 4.17 && < 5
                     , text >= 2.0
                     , megaparsec >= 9.0
