@@ -125,7 +125,7 @@ noPassesEnabled = PassFlags
 -- Enables safe, well-tested optimizations
 defaultOptConfig :: OptConfig
 defaultOptConfig = OptConfig
-  { ocPasses = allPassesEnabled { pfSROA = False }
+  { ocPasses = allPassesEnabled
   , ocIterations = 3
   , ocInlineThreshold = 50
   , ocUnrollFactor = 4
