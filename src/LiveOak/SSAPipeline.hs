@@ -40,6 +40,7 @@ import LiveOak.OptContext (OptContext(..), buildOptContext)
 
 import qualified LiveOak.GVN as GVN
 import qualified LiveOak.LICM as LICM
+import qualified LiveOak.LCSSA as LCSSA
 import qualified LiveOak.PRE as PRE
 import qualified LiveOak.SCCP as SCCP
 import qualified LiveOak.TailCall as TCO
@@ -145,19 +146,20 @@ runOneIteration OptConfig{..} prog =
 
       -- Phase 4: Loop optimizations
       (p14, s14) = applyPassIf (pfLICM flags) "LICM" (noStats runLICM) p13
-      (p15, s15) = applyPassIf (pfLoopUnroll flags) "LoopUnroll" runUnroll p14
-      (p16, s16) = applyPassIf (pfStrengthReduce flags) "StrengthReduce" (noStats runStrengthReduce) p15
+      (p15, s15) = applyPassIf (pfLCSSA flags) "LCSSA" runLCSSA p14
+      (p16, s16) = applyPassIf (pfLoopUnroll flags) "LoopUnroll" runUnroll p15
+      (p17, s17) = applyPassIf (pfStrengthReduce flags) "StrengthReduce" (noStats runStrengthReduce) p16
 
       -- Phase 5: Cleanup passes
-      (p17, s17) = applyPassIf (pfDSE flags) "DSE" runDSE p16
-      (p18, s18) = applyPassIf (pfCopyProp flags) "CopyProp" (noStats Opt.ssaCopyProp) p17
-      (p19, s19) = applyPassIf (pfPeephole flags) "Peephole" (noStats Opt.ssaPeephole) p18
-      (p20, s20) = applyPassIf (pfDCE flags) "DCE" (noStats Opt.ssaDeadCodeElim) p19
-      (p21, s21) = applyPassIf (pfSchedule flags) "Schedule" runSchedule p20
+      (p18, s18) = applyPassIf (pfDSE flags) "DSE" runDSE p17
+      (p19, s19) = applyPassIf (pfCopyProp flags) "CopyProp" (noStats Opt.ssaCopyProp) p18
+      (p20, s20) = applyPassIf (pfPeephole flags) "Peephole" (noStats Opt.ssaPeephole) p19
+      (p21, s21) = applyPassIf (pfDCE flags) "DCE" (noStats Opt.ssaDeadCodeElim) p20
+      (p22, s22) = applyPassIf (pfSchedule flags) "Schedule" runSchedule p21
 
       allStats = foldr combineStats emptyStats
-        [s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15, s16, s17, s18, s19, s20, s21]
-  in (p21, allStats)
+        [s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15, s16, s17, s18, s19, s20, s21, s22]
+  in (p22, allStats)
 
 -- | Apply a pass if the flag is enabled
 applyPassIf :: Bool -> String -> (SSAProgram -> (SSAProgram, PassStats)) -> SSAProgram -> (SSAProgram, OptStats)
@@ -283,6 +285,16 @@ runLICM (SSAProgram classes) = SSAProgram (map licmClass classes)
           licmResult = LICM.runLICM (octCFG ctx) (octDomTree ctx) (octLoopNest ctx) (ssaMethodBlocks method)
       in method { ssaMethodBlocks = LICM.licmOptBlocks licmResult }
 
+-- | LCSSA with stats
+runLCSSA :: SSAProgram -> (SSAProgram, PassStats)
+runLCSSA (SSAProgram classes) =
+  let results = [(cls, map LCSSA.transformLCSSAMethod (ssaClassMethods cls)) | cls <- classes]
+      totalAdded = sum [LCSSA.lcssaPhisAdded r | (_, methods) <- results, r <- methods]
+      optimized = SSAProgram [cls { ssaClassMethods = [m { ssaMethodBlocks = LCSSA.lcssaOptBlocks r }
+                                                       | (m, r) <- zip (ssaClassMethods cls) rs] }
+                             | (cls, rs) <- results]
+  in (optimized, PassStats totalAdded 1)
+
 -- | Strength Reduction
 runStrengthReduce :: SSAProgram -> SSAProgram
 runStrengthReduce (SSAProgram classes) = SSAProgram (map srClass classes)
@@ -402,3 +414,4 @@ runReturnProp :: SSAProgram -> (SSAProgram, OptStats)
 runReturnProp prog =
   let result = RP.propagateReturns prog
   in (RP.rpOptProgram result, addPassStats "ReturnProp" (PassStats (RP.rpPropagated result) 1) emptyStats)
+

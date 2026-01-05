@@ -65,6 +65,7 @@ library
                     , LiveOak.OptContext
                     , LiveOak.OptStats
                     , LiveOak.SSAOptimize
+                    , LiveOak.SSARebuild
                     , LiveOak.SSAPipeline
                     , LiveOak.Alias
                     , LiveOak.ValueRange

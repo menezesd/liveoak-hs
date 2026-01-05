@@ -76,8 +76,8 @@ allPassesEnabled = PassFlags
   , pfPeephole = True
   , pfDCE = True
   , pfDSE = True
-  , pfSROA = False   -- SROA is experimental, disabled by default
-  , pfLoopUnroll = False  -- Loop unrolling is experimental
+  , pfSROA = True    -- SROA enabled
+  , pfLoopUnroll = True   -- Loop unrolling enabled
   , pfJumpThread = True
   , pfSchedule = True
   , pfBlockMerge = True
@@ -87,7 +87,7 @@ allPassesEnabled = PassFlags
   , pfAlgebraic = True
   , pfReassoc = True
   , pfLoadElim = True
-  , pfLCSSA = False  -- LCSSA is a transformation, not always needed
+  , pfLCSSA = True   -- LCSSA ensures loop exits have phis
   , pfInstCombine = True
   }
 
@@ -125,7 +125,7 @@ noPassesEnabled = PassFlags
 -- Enables safe, well-tested optimizations
 defaultOptConfig :: OptConfig
 defaultOptConfig = OptConfig
-  { ocPasses = allPassesEnabled { pfSROA = False, pfLoopUnroll = False }
+  { ocPasses = allPassesEnabled { pfSROA = False }
   , ocIterations = 3
   , ocInlineThreshold = 50
   , ocUnrollFactor = 4
