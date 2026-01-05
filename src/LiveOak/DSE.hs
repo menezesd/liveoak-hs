@@ -27,15 +27,24 @@
 -- - At block exit: stores available after processing the block
 -- - A store is dead if overwritten in ALL successor paths before being read
 --
+-- == Alias Analysis Integration
+--
+-- When alias analysis is available, DSE can:
+-- - Prove stores to different objects don't interfere (NoAlias)
+-- - Prove a store definitely kills a previous store (MustAlias)
+-- - Be conservative when stores may alias (MayAlias)
+--
 module LiveOak.DSE
   ( -- * Dead Store Elimination
     eliminateDeadStores
+  , eliminateDeadStoresMethod
   , eliminateDeadStoresInterBlock
   , DSEResult(..)
   ) where
 
 import LiveOak.SSATypes
 import LiveOak.CFG
+import LiveOak.Alias
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -84,6 +93,129 @@ eliminateDeadStores blocks =
     , dseEliminated = sum count
     }
 
+-- | Eliminate dead stores using alias analysis for better precision
+-- This version computes points-to information and uses it to determine
+-- which stores may alias.
+eliminateDeadStoresMethod :: SSAMethod -> DSEResult
+eliminateDeadStoresMethod method =
+  let -- Compute points-to information
+      ptInfo = computePointsTo method
+      -- Process each block with alias info
+      (optimized, count) = unzip $ map (eliminateBlockWithAlias ptInfo) (ssaMethodBlocks method)
+  in DSEResult
+    { dseOptBlocks = optimized
+    , dseEliminated = sum count
+    }
+
+-- | Eliminate dead stores in a block using alias analysis
+eliminateBlockWithAlias :: PointsToInfo -> SSABlock -> (SSABlock, Int)
+eliminateBlockWithAlias ptInfo block@SSABlock{..} =
+  let indexed = zip [0..] blockInstrs
+      -- Collect stores with their info
+      storeInfos = collectStoreInfos indexed
+      -- Find dead stores using alias analysis
+      deadStores = findDeadStoresWithAlias ptInfo storeInfos indexed
+      -- Remove dead stores
+      filtered = [instr | (i, instr) <- indexed, not (Set.member i deadStores)]
+  in (block { blockInstrs = filtered }, Set.size deadStores)
+
+-- | Store information for alias-aware analysis
+data AliasStoreInfo = AliasStoreInfo
+  { asiIndex :: !Int
+  , asiTarget :: !SSAExpr
+  , asiField :: !String
+  , asiOffset :: !Int
+  , asiValue :: !SSAExpr
+  } deriving (Show)
+
+-- | Collect store information from instructions
+collectStoreInfos :: [(Int, SSAInstr)] -> [AliasStoreInfo]
+collectStoreInfos = foldr collect []
+  where
+    collect (i, SSAFieldStore target field off value) acc =
+      AliasStoreInfo i target field off value : acc
+    collect _ acc = acc
+
+-- | Find dead stores using alias analysis
+-- A store is dead if a later store must-alias it (overwrites same location)
+-- with no intervening read that may-alias it.
+findDeadStoresWithAlias :: PointsToInfo -> [AliasStoreInfo] -> [(Int, SSAInstr)] -> Set Int
+findDeadStoresWithAlias ptInfo storeInfos indexed = go Map.empty Set.empty indexed
+  where
+    -- Build map of stores by index for quick lookup
+    storeMap = Map.fromList [(asiIndex s, s) | s <- storeInfos]
+
+    -- Track pending stores and find dead ones
+    go :: Map Int AliasStoreInfo -> Set Int -> [(Int, SSAInstr)] -> Set Int
+    go _ dead [] = dead
+    go pending dead ((i, instr):rest) = case instr of
+      SSAFieldStore target field off _value ->
+        let -- Check if any pending store is killed by this store
+            (killed, surviving) = Map.partition (storeIsKilled ptInfo target field off) pending
+            dead' = Set.union dead (Set.fromList $ Map.keys killed)
+            -- Add this store as pending (if it could be killed later)
+            pending' = case Map.lookup i storeMap of
+              Just info -> Map.insert i info surviving
+              Nothing -> surviving
+        in go pending' dead' rest
+
+      SSAAssign _ expr ->
+        if exprHasCall expr
+        then go Map.empty dead rest  -- Calls invalidate all pending stores
+        else
+          let -- Remove pending stores whose fields are read by this expr
+              surviving = Map.filter (not . storeIsRead ptInfo expr) pending
+          in go surviving dead rest
+
+      SSAReturn (Just _) ->
+        -- Return escapes, invalidate all stores
+        go Map.empty dead rest
+
+      SSABranch cond _ _ ->
+        let surviving = Map.filter (not . storeIsRead ptInfo cond) pending
+        in go surviving dead rest
+
+      SSAExprStmt expr ->
+        if exprHasCall expr
+        then go Map.empty dead rest
+        else
+          let surviving = Map.filter (not . storeIsRead ptInfo expr) pending
+          in go surviving dead rest
+
+      -- Control flow terminators invalidate pending stores
+      SSAJump _ -> go Map.empty dead rest
+      SSAReturn Nothing -> go pending dead rest
+
+-- | Check if a store is killed (overwritten) by a new store
+storeIsKilled :: PointsToInfo -> SSAExpr -> String -> Int -> AliasStoreInfo -> Bool
+storeIsKilled ptInfo newTarget newField newOff AliasStoreInfo{..} =
+  case storesAlias ptInfo asiTarget asiField asiOffset newTarget newField newOff of
+    MustAlias -> True   -- New store definitely overwrites old store
+    MayAlias -> False   -- Might overwrite, but not safe to assume
+    NoAlias -> False    -- Different location, not killed
+
+-- | Check if an expression reads from a store's location
+storeIsRead :: PointsToInfo -> SSAExpr -> AliasStoreInfo -> Bool
+storeIsRead ptInfo expr AliasStoreInfo{..} = exprReadsField ptInfo asiTarget asiField expr
+
+-- | Check if an expression reads from a specific field
+exprReadsField :: PointsToInfo -> SSAExpr -> String -> SSAExpr -> Bool
+exprReadsField ptInfo storeTarget storeField = go
+  where
+    go = \case
+      SSAFieldAccess target field ->
+        (case loadStoreAlias ptInfo target field storeTarget storeField 0 of
+           NoAlias -> False
+           _ -> True)
+        || go target
+      SSAUnary _ e -> go e
+      SSABinary _ l r -> go l || go r
+      SSATernary c t e -> go c || go t || go e
+      SSACall _ args -> any go args
+      SSAInstanceCall t _ args -> go t || any go args
+      SSANewObject _ args -> any go args
+      _ -> False
+
 -- | Eliminate dead stores within a single block
 eliminateBlockDeadStores :: SSABlock -> (SSABlock, Int)
 eliminateBlockDeadStores block@SSABlock{..} =
@@ -130,30 +262,30 @@ findDeadStores safeObjs indexed = go Map.empty Set.empty indexed
                go lastStore' dead rest
 
       -- Assignments: check for calls, field reads, and variable reassignment
-      SSAAssign var expr ->
+      SSAAssign _var expr ->
         if exprHasCall expr
         then go Map.empty dead rest  -- Calls can read/write any field
         else
           let -- Remove stores for fields that are read
-              reads = getFieldReads expr
-              lastStore' = foldl' (flip Map.delete) lastStore reads
+              fieldReads = getFieldReads expr
+              lastStore' = foldl' (flip Map.delete) lastStore fieldReads
           in go lastStore' dead rest
 
-      SSAReturn (Just expr) ->
+      SSAReturn (Just _) ->
         -- Return could escape the object, invalidate all stores
         go Map.empty dead rest
 
       SSABranch cond _ _ ->
-        let reads = getFieldReads cond
-            lastStore' = foldl' (flip Map.delete) lastStore reads
+        let fieldReads = getFieldReads cond
+            lastStore' = foldl' (flip Map.delete) lastStore fieldReads
         in go lastStore' dead rest
 
       SSAExprStmt expr ->
         -- Expression statement might have side effects
         if exprHasCall expr
         then go Map.empty dead rest  -- Calls can read/write any field
-        else let reads = getFieldReads expr
-                 lastStore' = foldl' (flip Map.delete) lastStore reads
+        else let fieldReads = getFieldReads expr
+                 lastStore' = foldl' (flip Map.delete) lastStore fieldReads
              in go lastStore' dead rest
 
       -- Jump/branch terminators: stores might be read in successor blocks
@@ -305,7 +437,7 @@ checkStoreDead :: CFG -> Map BlockId SSABlock -> Set StoreObj
                -> Map BlockId (Set StoreLoc)
                -> Set (BlockId, Int) -> (BlockId, Int, StoreLoc)
                -> Set (BlockId, Int)
-checkStoreDead cfg blockMap safeObjs _killSets dead (bid, idx, loc) =
+checkStoreDead _cfg blockMap safeObjs _killSets dead (bid, idx, loc) =
   case Map.lookup bid blockMap of
     Nothing -> dead
     Just block ->
