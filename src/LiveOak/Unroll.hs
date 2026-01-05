@@ -27,6 +27,7 @@ module LiveOak.Unroll
   , UnrollResult(..)
   , UnrollConfig(..)
   , defaultUnrollConfig
+  , aggressiveUnrollConfig
   ) where
 
 import LiveOak.SSATypes
@@ -57,8 +58,20 @@ data UnrollConfig = UnrollConfig
   } deriving (Show)
 
 -- | Default unrolling configuration
+-- NOTE: Currently disabled (set to 0) due to bugs in phi node handling
+-- during variable renaming. The unrolling logic creates invalid SSA
+-- by not properly handling cross-iteration variable dependencies.
 defaultUnrollConfig :: UnrollConfig
 defaultUnrollConfig = UnrollConfig
+  { ucMaxUnrollFactor = 0    -- Disabled: set to 8 when fixed
+  , ucMaxBodySize = 0        -- Disabled: set to 20 when fixed
+  , ucFullUnrollLimit = 0    -- Disabled: set to 16 when fixed
+  , ucPartialUnrollFactor = 0 -- Disabled: set to 4 when fixed
+  }
+
+-- | Aggressive unrolling configuration (for when bugs are fixed)
+aggressiveUnrollConfig :: UnrollConfig
+aggressiveUnrollConfig = UnrollConfig
   { ucMaxUnrollFactor = 8
   , ucMaxBodySize = 20
   , ucFullUnrollLimit = 16

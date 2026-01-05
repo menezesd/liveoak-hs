@@ -36,6 +36,7 @@ data PassFlags = PassFlags
   , pfSROA :: !Bool               -- ^ Scalar replacement of aggregates
   , pfLoopUnroll :: !Bool         -- ^ Loop unrolling
   , pfJumpThread :: !Bool         -- ^ Jump threading
+  , pfSchedule :: !Bool           -- ^ Instruction scheduling
   } deriving (Show, Eq)
 
 -- | Full optimization configuration
@@ -69,6 +70,7 @@ allPassesEnabled = PassFlags
   , pfSROA = False   -- SROA is experimental, disabled by default
   , pfLoopUnroll = False  -- Loop unrolling is experimental
   , pfJumpThread = True
+  , pfSchedule = True  -- Instruction scheduling
   }
 
 -- | No passes enabled (for testing)
@@ -89,6 +91,7 @@ noPassesEnabled = PassFlags
   , pfSROA = False
   , pfLoopUnroll = False
   , pfJumpThread = False
+  , pfSchedule = False
   }
 
 -- | Default optimization configuration
@@ -133,6 +136,7 @@ minimalOptConfig = OptConfig
       , pfSROA = False
       , pfLoopUnroll = False
       , pfJumpThread = False
+      , pfSchedule = False
       }
   , ocIterations = 1
   , ocInlineThreshold = 20

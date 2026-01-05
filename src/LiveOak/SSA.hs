@@ -63,6 +63,7 @@ module LiveOak.SSA
   , ssaDSE              -- ^ Dead store elimination
   , ssaJumpThread       -- ^ Jump threading
   , ssaSROA             -- ^ Scalar replacement of aggregates
+  , ssaUnroll           -- ^ Loop unrolling
 
     -- * Statistics-Aware Optimization
   , optimizeWithStats
@@ -94,9 +95,10 @@ import qualified LiveOak.Inline as Inline
 import qualified LiveOak.DSE as DSE
 import qualified LiveOak.JumpThread as JT
 import qualified LiveOak.SROA as SROA
+import qualified LiveOak.Unroll as Unroll
 import qualified LiveOak.OptStats as OptStats
 import qualified LiveOak.SSAOptimize as Opt
-import LiveOak.Loop (findLoops)
+import LiveOak.OptContext (OptContext(..), buildOptContext)
 import LiveOak.SSAUtils (blockMapFromList, fixedPointWithLimit)
 import LiveOak.MapUtils (lookupInt, lookupSet)
 import Data.Map.Strict (Map)
@@ -687,9 +689,8 @@ gvnClass c = c { ssaClassMethods = map gvnMethod (ssaClassMethods c) }
 
 gvnMethod :: SSAMethod -> SSAMethod
 gvnMethod method =
-  let cfg = buildCFG method
-      domTree = computeDominators cfg
-      gvnResult = GVN.runGVN cfg domTree (ssaMethodBlocks method)
+  let ctx = buildOptContext method
+      gvnResult = GVN.runGVN (octCFG ctx) (octDomTree ctx) (ssaMethodBlocks method)
   in method { ssaMethodBlocks = GVN.gvnOptBlocks gvnResult }
 
 --------------------------------------------------------------------------------
@@ -702,10 +703,10 @@ sccp (SSAProgram classes) =
 
 sccpMethod :: SSAMethod -> SSAMethod
 sccpMethod method =
-  let cfg = buildCFG method
+  let ctx = buildOptContext method
       -- Method parameters should be treated as unknown (Bottom)
       paramKeys = [(ssaName p, ssaVersion p) | p <- ssaMethodParams method]
-      sccpResult = SCCP.runSCCP paramKeys cfg (ssaMethodBlocks method)
+      sccpResult = SCCP.runSCCP paramKeys (octCFG ctx) (ssaMethodBlocks method)
       constMap = Map.mapMaybe SCCP.getConstant (SCCP.sccpConstValues sccpResult)
       blocks' = map (applyConstPropagation constMap) (ssaMethodBlocks method)
       liveBlocks = filter (\b -> Set.member (blockLabel b) (SCCP.sccpReachableBlocks sccpResult)) blocks'
@@ -750,10 +751,8 @@ licmClass c = c { ssaClassMethods = map licmMethod (ssaClassMethods c) }
 
 licmMethod :: SSAMethod -> SSAMethod
 licmMethod method =
-  let cfg = buildCFG method
-      domTree = computeDominators cfg
-      loops = findLoops cfg domTree
-      licmResult = LICM.runLICM cfg domTree loops (ssaMethodBlocks method)
+  let ctx = buildOptContext method
+      licmResult = LICM.runLICM (octCFG ctx) (octDomTree ctx) (octLoopNest ctx) (ssaMethodBlocks method)
   in method { ssaMethodBlocks = LICM.licmOptBlocks licmResult }
 
 --------------------------------------------------------------------------------
@@ -769,10 +768,8 @@ srClass c = c { ssaClassMethods = map srMethod (ssaClassMethods c) }
 
 srMethod :: SSAMethod -> SSAMethod
 srMethod method =
-  let cfg = buildCFG method
-      domTree = computeDominators cfg
-      loops = findLoops cfg domTree
-      srResult = SR.reduceStrength cfg domTree loops (ssaMethodBlocks method)
+  let ctx = buildOptContext method
+      srResult = SR.reduceStrength (octCFG ctx) (octDomTree ctx) (octLoopNest ctx) (ssaMethodBlocks method)
   in method { ssaMethodBlocks = SR.srOptBlocks srResult }
 
 --------------------------------------------------------------------------------
@@ -798,9 +795,8 @@ preClass c = c { ssaClassMethods = map preMethod (ssaClassMethods c) }
 
 preMethod :: SSAMethod -> SSAMethod
 preMethod method =
-  let cfg = buildCFG method
-      domTree = computeDominators cfg
-      preResult = PRE.eliminatePartialRedundancy cfg domTree (ssaMethodBlocks method)
+  let ctx = buildOptContext method
+      preResult = PRE.eliminatePartialRedundancy (octCFG ctx) (octDomTree ctx) (ssaMethodBlocks method)
   in method { ssaMethodBlocks = PRE.preOptBlocks preResult }
 
 --------------------------------------------------------------------------------
@@ -824,7 +820,7 @@ optimizeSSAProgramWithSymbols syms prog =
 
 -- | Basic SSA optimization pipeline (safe, fast optimizations only)
 -- Order: simplifyPhis -> TCO -> Inline -> JumpThread -> SCCP -> GVN -> PRE -> LICM
---        -> StrengthReduce -> DSE -> copyProp -> peephole -> DCE
+--        -> Unroll -> StrengthReduce -> DSE -> copyProp -> peephole -> DCE
 ssaBasicPipeline :: SSAProgram -> SSAProgram
 ssaBasicPipeline =
     Opt.ssaDeadCodeElim
@@ -832,6 +828,7 @@ ssaBasicPipeline =
   . Opt.ssaCopyProp
   . ssaDSE
   . strengthReduce
+  . ssaUnroll
   . licm
   . pre
   . gvn
@@ -875,6 +872,15 @@ ssaSROA syms (SSAProgram classes) = SSAProgram (map sroaClass classes)
     sroaMethod method =
       let result = SROA.scalarReplace syms method
       in method { ssaMethodBlocks = SROA.sroaOptBlocks result }
+
+-- | Apply loop unrolling to all methods
+ssaUnroll :: SSAProgram -> SSAProgram
+ssaUnroll (SSAProgram classes) = SSAProgram (map unrollClass classes)
+  where
+    unrollClass cls = cls { ssaClassMethods = map unrollMethod (ssaClassMethods cls) }
+    unrollMethod method =
+      let result = Unroll.unrollLoops Unroll.defaultUnrollConfig method
+      in method { ssaMethodBlocks = Unroll.urOptBlocks result }
 
 --------------------------------------------------------------------------------
 -- Statistics-Aware Optimization
@@ -924,16 +930,18 @@ runOneIterationWithStats prog =
       p6 = gvn p5
       p7 = pre p6
       p8 = licm p7
-      p9 = strengthReduce p8
-      (p10, dseCount) = ssaDSEWithStats p9
-      p11 = Opt.ssaCopyProp p10
-      p12 = Opt.ssaPeephole p11
-      p13 = Opt.ssaDeadCodeElim p12
+      (p9, unrollCount) = ssaUnrollWithStats p8
+      p10 = strengthReduce p9
+      (p11, dseCount) = ssaDSEWithStats p10
+      p12 = Opt.ssaCopyProp p11
+      p13 = Opt.ssaPeephole p12
+      p14 = Opt.ssaDeadCodeElim p13
 
       stats = OptStats.emptyStats
         & addStat "JumpThread" jtCount
+        & addStat "Unroll" unrollCount
         & addStat "DSE" dseCount
-  in (p13, stats)
+  in (p14, stats)
 
   where
     addStat name count stats =
@@ -962,3 +970,13 @@ ssaJumpThreadWithStats (SSAProgram classes) =
                                                        | (m, r) <- zip (ssaClassMethods cls) rs] }
                              | (cls, rs) <- results]
   in (optimized, totalThreaded)
+
+-- | Loop unrolling with stats
+ssaUnrollWithStats :: SSAProgram -> (SSAProgram, Int)
+ssaUnrollWithStats (SSAProgram classes) =
+  let results = [(cls, map (Unroll.unrollLoops Unroll.defaultUnrollConfig) (ssaClassMethods cls)) | cls <- classes]
+      totalUnrolled = sum [Unroll.urFullyUnrolled r + Unroll.urPartiallyUnrolled r | (_, methods) <- results, r <- methods]
+      optimized = SSAProgram [cls { ssaClassMethods = [m { ssaMethodBlocks = Unroll.urOptBlocks r }
+                                                       | (m, r) <- zip (ssaClassMethods cls) rs] }
+                             | (cls, rs) <- results]
+  in (optimized, totalUnrolled)

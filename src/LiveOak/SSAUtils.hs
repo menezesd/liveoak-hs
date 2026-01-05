@@ -17,6 +17,24 @@ module LiveOak.SSAUtils
     -- * Expression Predicates
   , isPure
   , isSimple
+  , isConstant
+  , hasSideEffects
+
+    -- * Expression Traversal
+  , mapExpr
+  , foldExpr
+  , exprSize
+  , containsVar
+  , collectVarKeys
+
+    -- * Expression Substitution
+  , substVar
+  , substVars
+
+    -- * Instruction Utilities
+  , mapInstrExprs
+  , substVarsInInstr
+  , instrExprs
 
     -- * Block Utilities
   , blockMapFromList
@@ -159,3 +177,111 @@ fixedPointWithLimit 0 _ x = x  -- Max iterations reached
 fixedPointWithLimit n f x =
   let x' = f x
   in if x' == x then x else fixedPointWithLimit (n - 1) f x'
+
+--------------------------------------------------------------------------------
+-- Expression Traversal
+--------------------------------------------------------------------------------
+
+-- | Map a function over all sub-expressions in an expression
+mapExpr :: (SSAExpr -> SSAExpr) -> SSAExpr -> SSAExpr
+mapExpr f = go
+  where
+    go expr = f $ case expr of
+      SSAUnary op e -> SSAUnary op (go e)
+      SSABinary op l r -> SSABinary op (go l) (go r)
+      SSATernary c t e -> SSATernary (go c) (go t) (go e)
+      SSACall n args -> SSACall n (map go args)
+      SSAInstanceCall t m args -> SSAInstanceCall (go t) m (map go args)
+      SSANewObject cn args -> SSANewObject cn (map go args)
+      SSAFieldAccess t field -> SSAFieldAccess (go t) field
+      e -> e  -- Leaves (literals, uses) unchanged
+
+-- | Fold over all sub-expressions in an expression
+foldExpr :: (a -> SSAExpr -> a) -> a -> SSAExpr -> a
+foldExpr f acc expr = case expr of
+  SSAUnary _ e -> f (foldExpr f acc e) expr
+  SSABinary _ l r -> f (foldExpr f (foldExpr f acc l) r) expr
+  SSATernary c t e -> f (foldExpr f (foldExpr f (foldExpr f acc c) t) e) expr
+  SSACall _ args -> f (foldl (foldExpr f) acc args) expr
+  SSAInstanceCall t _ args -> f (foldl (foldExpr f) (foldExpr f acc t) args) expr
+  SSANewObject _ args -> f (foldl (foldExpr f) acc args) expr
+  SSAFieldAccess t _ -> f (foldExpr f acc t) expr
+  e -> f acc e
+
+-- | Substitute a variable with an expression in an expression
+substVar :: VarKey -> SSAExpr -> SSAExpr -> SSAExpr
+substVar target replacement = mapExpr $ \case
+  SSAUse v | (ssaName v, ssaVersion v) == target -> replacement
+  e -> e
+
+-- | Substitute multiple variables at once
+substVars :: Map VarKey SSAExpr -> SSAExpr -> SSAExpr
+substVars substs = mapExpr $ \case
+  SSAUse v -> case Map.lookup (ssaName v, ssaVersion v) substs of
+    Just repl -> repl
+    Nothing -> SSAUse v
+  e -> e
+
+--------------------------------------------------------------------------------
+-- Expression Properties
+--------------------------------------------------------------------------------
+
+-- | Check if expression is a constant (literal)
+isConstant :: SSAExpr -> Bool
+isConstant = \case
+  SSAInt _ -> True
+  SSABool _ -> True
+  SSAStr _ -> True
+  SSANull -> True
+  _ -> False
+
+-- | Check if expression has any side effects when executed
+hasSideEffects :: SSAExpr -> Bool
+hasSideEffects = not . isPure
+
+-- | Get the size (number of nodes) of an expression tree
+exprSize :: SSAExpr -> Int
+exprSize = foldExpr (\acc _ -> acc + 1) 0
+
+-- | Check if expression contains a specific variable
+containsVar :: VarKey -> SSAExpr -> Bool
+containsVar key = foldExpr check False
+  where
+    check found (SSAUse v) = found || (ssaName v, ssaVersion v) == key
+    check found _ = found
+
+-- | Collect all variables used in an expression (with versions)
+collectVarKeys :: SSAExpr -> Set VarKey
+collectVarKeys = foldExpr collect Set.empty
+  where
+    collect acc (SSAUse v) = Set.insert (ssaName v, ssaVersion v) acc
+    collect acc _ = acc
+
+--------------------------------------------------------------------------------
+-- Instruction Utilities
+--------------------------------------------------------------------------------
+
+-- | Map a function over expressions in an instruction
+mapInstrExprs :: (SSAExpr -> SSAExpr) -> SSAInstr -> SSAInstr
+mapInstrExprs f = \case
+  SSAAssign v e -> SSAAssign v (f e)
+  SSAReturn (Just e) -> SSAReturn (Just (f e))
+  SSABranch c t el -> SSABranch (f c) t el
+  SSAFieldStore t fld off v -> SSAFieldStore (f t) fld off (f v)
+  SSAExprStmt e -> SSAExprStmt (f e)
+  i -> i  -- Other instructions unchanged
+
+-- | Substitute variables in an instruction
+substVarsInInstr :: Map VarKey SSAExpr -> SSAInstr -> SSAInstr
+substVarsInInstr substs = mapInstrExprs (substVars substs)
+
+-- | Get all expressions in an instruction
+instrExprs :: SSAInstr -> [SSAExpr]
+instrExprs = \case
+  SSAAssign _ e -> [e]
+  SSAReturn (Just e) -> [e]
+  SSAReturn Nothing -> []
+  SSAJump _ -> []
+  SSABranch c _ _ -> [c]
+  SSAFieldStore t _ _ v -> [t, v]
+  SSAExprStmt e -> [e]

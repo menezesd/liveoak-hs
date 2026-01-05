@@ -65,6 +65,9 @@ library
                     , LiveOak.OptContext
                     , LiveOak.OptStats
                     , LiveOak.SSAOptimize
+                    , LiveOak.SSAPipeline
+                    , LiveOak.Alias
+                    , LiveOak.ValueRange
     build-depends:    base >= 4.17 && < 5
                     , text >= 2.0
                     , megaparsec >= 9.0
