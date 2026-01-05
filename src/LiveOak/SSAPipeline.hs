@@ -64,6 +64,7 @@ import LiveOak.CFG (buildCFG)
 
 import Data.Maybe (fromMaybe)
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 
 --------------------------------------------------------------------------------
 -- Pipeline Execution
@@ -225,7 +226,9 @@ sccpMethod method =
       sccpResult = SCCP.runSCCP paramKeys (octCFG ctx) (ssaMethodBlocks method)
       constMap = Map.mapMaybe SCCP.getConstant (SCCP.sccpConstValues sccpResult)
       blocks' = map (applyConstPropagation constMap) (ssaMethodBlocks method)
-      liveBlocks = filter (\b -> blockLabel b `elem` SCCP.sccpReachableBlocks sccpResult) blocks'
+      -- Use Set for O(1) lookup instead of O(n) list elem
+      reachableSet = SCCP.sccpReachableBlocks sccpResult  -- Already a Set
+      liveBlocks = filter (\b -> blockLabel b `Set.member` reachableSet) blocks'
   in method { ssaMethodBlocks = liveBlocks }
 
 applyConstPropagation :: Map.Map VarKey SSAExpr -> SSABlock -> SSABlock

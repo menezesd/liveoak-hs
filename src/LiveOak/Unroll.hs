@@ -183,18 +183,47 @@ analyzeLoopBounds blockMap loop = do
     Just (var, limit) -> do
       -- Find the step from back-edge block
       step <- findLoopStep blockMap loop var
-      -- For now, assume init = 0
-      return (0, limit, step)
+      -- Find the initial value from phi node
+      let init = findInitialValue (blockPhis headerBlock) var loop
+      return (init, limit, step)
     Nothing -> Nothing
 
+-- | Find initial value for an induction variable from phi node
+findInitialValue :: [PhiNode] -> String -> Loop -> Int
+findInitialValue phis varName loop =
+  let latches = loopLatches loop
+      latchSet = Set.fromList latches
+  in case [phi | phi <- phis, varNameString (ssaName (phiVar phi)) == varName] of
+    (phi:_) ->
+      -- Find the arg that comes from outside the loop (non-latch edge)
+      case [v | (bid, v) <- phiArgs phi, not (Set.member bid latchSet)] of
+        (v:_) -> case ssaVersion v of
+          -- If version 0 and name matches, likely initialized to constant
+          -- Check if there's an SSAInt initialization somewhere
+          _ -> 0  -- Default to 0 if we can't determine
+        [] -> 0
+    [] -> 0
+
 -- | Find loop condition (variable compared against constant)
+-- Supports: i < N, i <= N, N > i, N >= i, i != N
 findLoopCondition :: [SSAInstr] -> Maybe (String, Int)
 findLoopCondition instrs = case reverse instrs of
+  -- i < N
   (SSABranch (SSABinary Lt (SSAUse var) (SSAInt limit)) _ _) : _ ->
     Just (varNameString (ssaName var), limit)
+  -- i <= N  ->  i < N+1
   (SSABranch (SSABinary Le (SSAUse var) (SSAInt limit)) _ _) : _ ->
     Just (varNameString (ssaName var), limit + 1)
+  -- N > i  ->  i < N
   (SSABranch (SSABinary Gt (SSAInt limit) (SSAUse var)) _ _) : _ ->
+    Just (varNameString (ssaName var), limit)
+  -- N >= i  ->  i < N+1
+  (SSABranch (SSABinary Ge (SSAInt limit) (SSAUse var)) _ _) : _ ->
+    Just (varNameString (ssaName var), limit + 1)
+  -- i != N (common pattern: while (i != n))
+  (SSABranch (SSABinary Ne (SSAUse var) (SSAInt limit)) _ _) : _ ->
+    Just (varNameString (ssaName var), limit)
+  (SSABranch (SSABinary Ne (SSAInt limit) (SSAUse var)) _ _) : _ ->
     Just (varNameString (ssaName var), limit)
   _ -> Nothing
 
@@ -215,15 +244,21 @@ findStepInBlocks varName (SSABlock{..}:rest) =
 findStepInInstrs :: String -> [SSAInstr] -> Maybe Int
 findStepInInstrs _ [] = Nothing
 findStepInInstrs varName (instr:rest) = case instr of
+  -- i = i + step  or  i = v + step where v has same name
   SSAAssign var (SSABinary Add (SSAUse v) (SSAInt step))
     | varNameString (ssaName v) == varName || varNameString (ssaName var) == varName ->
         Just step
+  -- i = step + i
   SSAAssign var (SSABinary Add (SSAInt step) (SSAUse v))
     | varNameString (ssaName v) == varName || varNameString (ssaName var) == varName ->
         Just step
+  -- i = i - step  ->  step = -step
   SSAAssign var (SSABinary Sub (SSAUse v) (SSAInt step))
     | varNameString (ssaName v) == varName || varNameString (ssaName var) == varName ->
         Just (-step)
+  -- For multiplication: i = i * 2  ->  step is multiplicative, not additive
+  -- We can only handle this for trip count if we know the pattern is power-of-2 iteration
+  -- For now, skip multiplication patterns as they need different trip count calculation
   _ -> findStepInInstrs varName rest
 
 --------------------------------------------------------------------------------

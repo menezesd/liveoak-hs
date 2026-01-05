@@ -30,7 +30,6 @@ import LiveOak.CFG (CFG, buildCFG)
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.List (nubBy)
 import Data.Maybe (mapMaybe)
 
 --------------------------------------------------------------------------------
@@ -85,18 +84,17 @@ simplifyBlockPhis SSABlock{..} =
 simplifyPhi :: PhiNode -> Maybe (VarKey, SSAExpr)
 simplifyPhi PhiNode{..} =
   let phiKey = (ssaName phiVar, ssaVersion phiVar)
-      -- Get unique values (excluding self-references)
+      -- Get unique values (excluding self-references) using Map for O(n log n) instead of O(n²)
       nonSelfArgs = [(b, v) | (b, v) <- phiArgs
                             , ssaName v /= ssaName phiVar || ssaVersion v /= ssaVersion phiVar]
-      uniqueVals = nubBy sameVar (map snd nonSelfArgs)
+      uniqueVals = Map.elems $ Map.fromList
+        [((ssaName v, ssaVersion v), v) | v <- map snd nonSelfArgs]
   in case uniqueVals of
     -- All arguments are the same (or all self-references)
     [] -> Nothing  -- Degenerate case
     [v] -> Just (phiKey, SSAUse v)  -- Can replace phi with single value
     -- Cannot simplify
     _ -> Nothing
-  where
-    sameVar v1 v2 = ssaName v1 == ssaName v2 && ssaVersion v1 == ssaVersion v2
 
 -- | Apply substitutions to a block
 applyPhiSubst :: Map VarKey SSAExpr -> SSABlock -> SSABlock

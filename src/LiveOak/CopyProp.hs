@@ -28,11 +28,11 @@ module LiveOak.CopyProp
   ) where
 
 import LiveOak.SSATypes
-import LiveOak.SSAUtils (substVars, substVarsInInstr)
+import LiveOak.SSAUtils (substVarsInInstr)
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.List (foldl')
+import qualified Data.Set as Set
 
 --------------------------------------------------------------------------------
 -- Types
@@ -97,18 +97,23 @@ buildSubstMap :: [(VarKey, VarKey)] -> Map VarKey SSAExpr
 buildSubstMap copies =
   let -- Initial map: dest -> src
       initial = Map.fromList [(dest, src) | (dest, src) <- copies]
-      -- Resolve transitively
-      resolved = Map.map (resolveChain initial) initial
+      -- Resolve all chains with memoization via lazy evaluation
+      resolved = resolveAllChains initial
   in Map.map (\vk -> SSAUse (SSAVar (fst vk) (snd vk) Nothing)) resolved
 
--- | Resolve a copy chain to find the ultimate source
-resolveChain :: Map VarKey VarKey -> VarKey -> VarKey
-resolveChain copies = go 100  -- Limit to prevent infinite loops
+-- | Resolve all copy chains with memoization
+-- Uses explicit iteration with a visited set to prevent infinite loops from cycles
+resolveAllChains :: Map VarKey VarKey -> Map VarKey VarKey
+resolveAllChains initial = Map.mapWithKey (\k _ -> resolve Set.empty k) initial
   where
-    go 0 key = key
-    go n key = case Map.lookup key copies of
-      Just next | next /= key -> go (n - 1) next
-      _ -> key
+    resolve :: Set.Set VarKey -> VarKey -> VarKey
+    resolve visited key
+      | Set.member key visited = key  -- Cycle detected, stop
+      | otherwise = case Map.lookup key initial of
+          Nothing -> key  -- Not a copy dest, it's ultimate source
+          Just src
+            | src == key -> key  -- Self-reference
+            | otherwise -> resolve (Set.insert key visited) src
 
 -- | Apply substitutions to a block
 applySubstBlock :: Map VarKey SSAExpr -> SSABlock -> (SSABlock, Int)

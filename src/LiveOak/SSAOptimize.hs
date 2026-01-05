@@ -16,11 +16,11 @@ module LiveOak.SSAOptimize
   ) where
 
 import LiveOak.SSATypes
+import LiveOak.SSAUtils (substVarsInInstr)
 import LiveOak.Ast (UnaryOp(..), BinaryOp(..))
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.List (foldl')
 
@@ -129,48 +129,38 @@ ssaCopyProp (SSAProgram classes) =
   SSAProgram [c { ssaClassMethods = map propMethod (ssaClassMethods c) } | c <- classes]
   where
     propMethod m =
-      let copies = findCopies (ssaMethodBlocks m)
-          blocks' = map (substBlock copies) (ssaMethodBlocks m)
+      let copyPairs = findCopies (ssaMethodBlocks m)
+          substMap = buildCopySubstMap copyPairs
+          blocks' = map (substBlock substMap) (ssaMethodBlocks m)
       in m { ssaMethodBlocks = blocks' }
 
-    -- Find x = y patterns
-    findCopies blocks = Map.fromList
-      [ ((ssaName v, ssaVersion v), src)
+    -- Find x = y patterns, returning (dest, src) pairs
+    findCopies blocks =
+      [ ((ssaName v, ssaVersion v), (ssaName src, ssaVersion src))
       | b <- blocks
       , SSAAssign v (SSAUse src) <- blockInstrs b
       ]
 
-    substBlock copies b = b
+    -- Build transitive substitution map with cycle detection
+    buildCopySubstMap :: [(VarKey, VarKey)] -> Map VarKey SSAExpr
+    buildCopySubstMap copies =
+      let initial = Map.fromList copies
+          -- Resolve chains with explicit cycle detection
+          resolved = Map.mapWithKey (\k _ -> resolve Set.empty k) initial
+          resolve visited key
+            | Set.member key visited = key  -- Cycle detected
+            | otherwise = case Map.lookup key initial of
+                Nothing -> key
+                Just src
+                  | src == key -> key  -- Self-reference
+                  | otherwise -> resolve (Set.insert key visited) src
+          toExpr vk = SSAUse (SSAVar (fst vk) (snd vk) Nothing)
+      in Map.map toExpr resolved
+
+    substBlock substMap b = b
       { blockPhis = blockPhis b  -- Don't substitute phi inputs (they refer to end-of-predecessor values)
-      , blockInstrs = map (substInstr copies) (blockInstrs b)
+      , blockInstrs = map (substVarsInInstr substMap) (blockInstrs b)
       }
-
-    substInstr copies = \case
-      SSAAssign v e -> SSAAssign v (substExpr copies e)
-      SSAFieldStore t f off v -> SSAFieldStore (substExpr copies t) f off (substExpr copies v)
-      SSAReturn e -> SSAReturn (substExpr copies <$> e)
-      SSABranch c t f -> SSABranch (substExpr copies c) t f
-      SSAExprStmt e -> SSAExprStmt (substExpr copies e)
-      i -> i
-
-    substVar copies = go Set.empty
-      where
-        go seen var
-          | Set.member (ssaName var, ssaVersion var) seen = var  -- Cycle detected, stop
-          | otherwise = case Map.lookup (ssaName var, ssaVersion var) copies of
-              Just src -> go (Set.insert (ssaName var, ssaVersion var) seen) src  -- Transitive
-              Nothing -> var
-
-    substExpr copies = \case
-      SSAUse v -> SSAUse (substVar copies v)
-      SSAUnary op e -> SSAUnary op (substExpr copies e)
-      SSABinary op l r -> SSABinary op (substExpr copies l) (substExpr copies r)
-      SSATernary c t e -> SSATernary (substExpr copies c) (substExpr copies t) (substExpr copies e)
-      SSACall n args -> SSACall n (map (substExpr copies) args)
-      SSAInstanceCall t m args -> SSAInstanceCall (substExpr copies t) m (map (substExpr copies) args)
-      SSANewObject cn args -> SSANewObject cn (map (substExpr copies) args)
-      SSAFieldAccess t f -> SSAFieldAccess (substExpr copies t) f
-      e -> e
 
 --------------------------------------------------------------------------------
 -- Phi Simplification

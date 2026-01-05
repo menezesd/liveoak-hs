@@ -221,11 +221,48 @@ collectDefs defs SSABlock{..} =
   in Set.union defs (Set.fromList $ phiDefs ++ instrDefs)
 
 -- | Check uses in a block against known definitions
--- Note: Currently conservative (returns []) because SSA renaming may leave
--- placeholder versions during construction that get fixed later.
--- TODO: Enable strict checking when SSA construction is fully validated.
+-- This validates that all variable uses reference defined variables.
+-- Note: We check against all definitions in the method, not just those that
+-- dominate the use. This is a conservative check - a more precise check would
+-- verify dominance, but catching completely undefined variables is still useful.
 checkBlockUses :: Set.Set VarKey -> SSABlock -> [SSAError]
-checkBlockUses _defs _block = []
+checkBlockUses defs SSABlock{..} =
+  let -- Get all uses from phi nodes (from all incoming edges)
+      phiUses = [varKey v | phi <- blockPhis, (_, v) <- phiArgs phi]
+      -- Get all uses from instructions
+      instrUses = concatMap instrVarUses blockInstrs
+      -- Filter to undefined uses
+      undefinedPhiUses = [vk | vk <- phiUses, not (Set.member vk defs)]
+      undefinedInstrUses = [vk | vk <- instrUses, not (Set.member vk defs)]
+  in [UndefinedVariable blockLabel vk | vk <- undefinedPhiUses ++ undefinedInstrUses]
+
+-- | Get variable uses from an instruction
+instrVarUses :: SSAInstr -> [VarKey]
+instrVarUses = \case
+  SSAAssign _ e -> exprVarUses e
+  SSAFieldStore t _ _ v -> exprVarUses t ++ exprVarUses v
+  SSAReturn (Just e) -> exprVarUses e
+  SSAReturn Nothing -> []
+  SSABranch c _ _ -> exprVarUses c
+  SSAExprStmt e -> exprVarUses e
+  SSAJump _ -> []
+
+-- | Get variable uses from an expression
+exprVarUses :: SSAExpr -> [VarKey]
+exprVarUses = \case
+  SSAUse v -> [varKey v]
+  SSAInt _ -> []
+  SSABool _ -> []
+  SSAStr _ -> []
+  SSANull -> []
+  SSAThis -> []
+  SSAUnary _ e -> exprVarUses e
+  SSABinary _ l r -> exprVarUses l ++ exprVarUses r
+  SSATernary c t e -> exprVarUses c ++ exprVarUses t ++ exprVarUses e
+  SSACall _ args -> concatMap exprVarUses args
+  SSAInstanceCall t _ args -> exprVarUses t ++ concatMap exprVarUses args
+  SSANewObject _ args -> concatMap exprVarUses args
+  SSAFieldAccess t _ -> exprVarUses t
 
 -- | Check that terminator is the last instruction
 checkBlockTerminator :: SSABlock -> [SSAError]

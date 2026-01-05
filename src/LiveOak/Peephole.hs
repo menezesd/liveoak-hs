@@ -20,6 +20,7 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
+import Text.Read (readMaybe)
 
 -- | SAM instruction representation
 data SamInstr
@@ -79,10 +80,10 @@ parseLine line
 -- | Parse a SAM instruction
 parseInstr :: Text -> Maybe SamInstr
 parseInstr txt = case T.words txt of
-  ["PUSHIMM", n] -> Just $ PUSHIMM (readInt n)
+  ["PUSHIMM", n] -> PUSHIMM <$> readInt n
   ("PUSHIMMSTR":rest) -> Just $ PUSHIMMSTR (T.unwords rest)
-  ["PUSHOFF", n] -> Just $ PUSHOFF (readInt n)
-  ["STOREOFF", n] -> Just $ STOREOFF (readInt n)
+  ["PUSHOFF", n] -> PUSHOFF <$> readInt n
+  ["STOREOFF", n] -> STOREOFF <$> readInt n
   ["PUSHIND"] -> Just PUSHIND
   ["STOREIND"] -> Just STOREIND
   ["DUP"] -> Just DUP
@@ -92,9 +93,9 @@ parseInstr txt = case T.words txt of
   ["TIMES"] -> Just TIMES
   ["DIV"] -> Just DIV
   ["MOD"] -> Just MOD
-  ["LSHIFT", n] -> Just $ LSHIFT (readInt n)
+  ["LSHIFT", n] -> LSHIFT <$> readInt n
   ["LSHIFTIND"] -> Just LSHIFTIND
-  ["RSHIFT", n] -> Just $ RSHIFT (readInt n)
+  ["RSHIFT", n] -> RSHIFT <$> readInt n
   ["RSHIFTIND"] -> Just RSHIFTIND
   ["AND"] -> Just AND
   ["OR"] -> Just OR
@@ -104,7 +105,7 @@ parseInstr txt = case T.words txt of
   ["CMP"] -> Just CMP
   ["ISNIL"] -> Just ISNIL
   ["ISNEG"] -> Just ISNEG
-  ["ADDSP", n] -> Just $ ADDSP (readInt n)
+  ["ADDSP", n] -> ADDSP <$> readInt n
   ["LINK"] -> Just LINK
   ["UNLINK"] -> Just UNLINK
   ["JSR", lbl] -> Just $ JSR lbl
@@ -115,11 +116,11 @@ parseInstr txt = case T.words txt of
   ["MALLOC"] -> Just MALLOC
   _ -> Nothing  -- Unknown instruction, skip
 
--- | Read an integer, handling negative numbers
-readInt :: Text -> Int
+-- | Read an integer safely, handling negative numbers
+readInt :: Text -> Maybe Int
 readInt t
-  | "-" `T.isPrefixOf` t = negate $ read $ T.unpack $ T.drop 1 t
-  | otherwise = read $ T.unpack t
+  | "-" `T.isPrefixOf` t = negate <$> readMaybe (T.unpack (T.drop 1 t))
+  | otherwise = readMaybe (T.unpack t)
 
 -- | Emit SAM instructions back to text
 emitSam :: [SamInstr] -> Text
