@@ -58,15 +58,33 @@ data UnrollConfig = UnrollConfig
   } deriving (Show)
 
 -- | Default unrolling configuration
--- NOTE: Currently disabled (set to 0) due to bugs in phi node handling
--- during variable renaming. The unrolling logic creates invalid SSA
--- by not properly handling cross-iteration variable dependencies.
+-- NOTE: Loop unrolling is DISABLED pending fixes for the following issues:
+--
+-- 1. Partial unrolling does not adjust loop bounds - the loop condition still
+--    checks against the original limit, but with duplicated body, we iterate
+--    factor*N times instead of N times.
+--
+-- 2. Induction variable chaining is incorrect - the loop condition uses the
+--    original induction variable, not the chained variable from the last
+--    duplicate.
+--
+-- 3. Remainder handling is missing - when trip count is not a multiple of
+--    the unroll factor, we need an epilogue loop for the remaining iterations.
+--
+-- 4. Full unrolling has untested edge cases with phi node elimination.
+--
+-- To fix partial unrolling properly, we need to:
+--   a) Transform: while (i < N) { body; i++; }
+--   b) Into: while (i < N - (factor-1)) { body; i++; body'; i'++; ... }
+--           while (i < N) { body; i++; }  // epilogue
+--   c) Ensure the last duplicate's induction variable feeds back to the phi
+--
 defaultUnrollConfig :: UnrollConfig
 defaultUnrollConfig = UnrollConfig
-  { ucMaxUnrollFactor = 0    -- Disabled: set to 8 when fixed
-  , ucMaxBodySize = 0        -- Disabled: set to 20 when fixed
-  , ucFullUnrollLimit = 0    -- Disabled: set to 16 when fixed
-  , ucPartialUnrollFactor = 0 -- Disabled: set to 4 when fixed
+  { ucMaxUnrollFactor = 0     -- Disabled pending fixes
+  , ucMaxBodySize = 0         -- Disabled pending fixes
+  , ucFullUnrollLimit = 0     -- Disabled pending fixes
+  , ucPartialUnrollFactor = 0 -- Disabled pending fixes
   }
 
 -- | Aggressive unrolling configuration (for when bugs are fixed)
@@ -271,19 +289,26 @@ findLoopExit blockMap header =
     Nothing -> Nothing
 
 -- | Clone loop body n times, chaining them together
+-- Key insight: Each iteration uses values from the previous iteration.
+-- - Iteration 0 uses values from before the loop (no suffix)
+-- - Iteration N uses values from iteration N-1
 cloneBodyNTimes :: Map BlockId SSABlock -> [BlockId] -> BlockId -> BlockId
                 -> BlockId -> Int -> (Map BlockId SSABlock, [SSABlock])
 cloneBodyNTimes blockMap bodyBids header latch exitTarget n =
   let -- Get the body blocks
       bodyBlocks = catMaybes [Map.lookup bid blockMap | bid <- bodyBids]
 
-      -- Get header block to extract initialization
+      -- Get header block to extract initialization and phi nodes
       headerBlock = Map.lookup header blockMap
 
-      -- Generate n copies
-      copies = concatMap (cloneCopy bodyBlocks header latch exitTarget n) [0..n-1]
+      -- Collect all variables defined in the loop body (for proper chaining)
+      loopDefs = collectLoopDefinitions (catMaybes [Map.lookup h blockMap | h <- [header]] ++ bodyBlocks)
+
+      -- Generate n copies with proper cross-iteration chaining
+      copies = concatMap (\i -> cloneCopyWithChaining bodyBlocks header latch exitTarget n loopDefs i) [0..n-1]
 
       -- Create entry block that jumps to first copy (or exit if n=0)
+      -- This block provides initial values to iteration 0
       entryBlock = case headerBlock of
         Just hb ->
           let newLabel = header  -- Reuse header label
@@ -291,45 +316,116 @@ cloneBodyNTimes blockMap bodyBids header latch exitTarget n =
               target = if n > 0
                        then renameBlockId header 0
                        else exitTarget
-          in SSABlock newLabel (blockPhis hb) [SSAJump target]
+              -- Keep phi nodes to capture incoming values, but redirect to first iteration
+          in SSABlock newLabel [] [SSAJump target]
         Nothing -> SSABlock header [] [SSAJump exitTarget]
   in (blockMap, entryBlock : copies)
 
--- | Clone a single iteration of the loop body
-cloneCopy :: [SSABlock] -> BlockId -> BlockId -> BlockId -> Int -> Int -> [SSABlock]
-cloneCopy bodyBlocks header latch exitTarget totalIters iterNum =
+-- | Collect all variable definitions in the loop
+collectLoopDefinitions :: [SSABlock] -> Set VarKey
+collectLoopDefinitions blocks = Set.fromList $ concatMap blockDefs blocks
+  where
+    blockDefs SSABlock{..} =
+      [(ssaName v, ssaVersion v) | PhiNode{phiVar = v} <- blockPhis]
+      ++ [(ssaName v, ssaVersion v) | SSAAssign v _ <- blockInstrs]
+
+-- | Clone a single iteration of the loop body with proper cross-iteration chaining
+-- Key: Uses in iteration N reference definitions from iteration N-1 (or original for iter 0)
+cloneCopyWithChaining :: [SSABlock] -> BlockId -> BlockId -> BlockId -> Int
+                      -> Set VarKey -> Int -> [SSABlock]
+cloneCopyWithChaining bodyBlocks header latch exitTarget totalIters loopDefs iterNum =
   let suffix = "_unroll_" ++ show iterNum
       isLast = iterNum == totalIters - 1
       nextHeader = if isLast then exitTarget else renameBlockId header (iterNum + 1)
 
+      -- For iteration 0, uses reference original (unsuffixed) variables
+      -- For iteration N>0, uses reference iteration N-1 variables
+      prevSuffix = if iterNum == 0
+                   then ""  -- Use original variable names
+                   else "_unroll_" ++ show (iterNum - 1)
+
       renameBlock block@SSABlock{..} =
         let newLabel = renameBlockId blockLabel iterNum
-            newInstrs = map (renameInstr suffix iterNum nextHeader latch) blockInstrs
-            newPhis = map (renamePhi suffix iterNum) blockPhis
+            -- Rename instructions: definitions get current suffix, uses get previous suffix
+            newInstrs = map (renameInstrChained suffix prevSuffix iterNum nextHeader latch loopDefs) blockInstrs
+            -- For phi nodes in unrolled iterations, convert to direct assignments
+            -- since there's only one predecessor per unrolled block
+            newPhis = if iterNum == 0
+                      then []  -- Iteration 0 gets values from entry (already set up)
+                      else []  -- Later iterations use renamed values directly
         in SSABlock newLabel newPhis newInstrs
   in map renameBlock bodyBlocks
+
+-- | Legacy clone function (kept for backwards compatibility)
+cloneCopy :: [SSABlock] -> BlockId -> BlockId -> BlockId -> Int -> Int -> [SSABlock]
+cloneCopy bodyBlocks header latch exitTarget totalIters iterNum =
+  cloneCopyWithChaining bodyBlocks header latch exitTarget totalIters Set.empty iterNum
 
 -- | Rename a block ID for a specific unroll iteration
 renameBlockId :: BlockId -> Int -> BlockId
 renameBlockId bid iter = blockId (blockIdName bid ++ "_u" ++ show iter)
 
--- | Rename an instruction for unrolling
-renameInstr :: String -> Int -> BlockId -> BlockId -> SSAInstr -> SSAInstr
-renameInstr suffix iter nextTarget latch = \case
+-- | Rename an instruction with proper cross-iteration chaining
+-- defSuffix: suffix for variables being defined (current iteration)
+-- useSuffix: suffix for variables being used (previous iteration)
+-- loopDefs: set of variables defined in the loop (need chaining)
+renameInstrChained :: String -> String -> Int -> BlockId -> BlockId -> Set VarKey -> SSAInstr -> SSAInstr
+renameInstrChained defSuffix useSuffix iter nextTarget latch loopDefs = \case
   SSAAssign var expr ->
-    SSAAssign (renameVar suffix iter var) (renameExpr suffix iter expr)
+    SSAAssign (renameVarDef defSuffix iter var)
+              (renameExprChained useSuffix iter loopDefs expr)
   SSAFieldStore t f o v ->
-    SSAFieldStore (renameExpr suffix iter t) f o (renameExpr suffix iter v)
-  SSAReturn e -> SSAReturn (fmap (renameExpr suffix iter) e)
+    SSAFieldStore (renameExprChained useSuffix iter loopDefs t) f o
+                  (renameExprChained useSuffix iter loopDefs v)
+  SSAReturn e -> SSAReturn (fmap (renameExprChained useSuffix iter loopDefs) e)
   SSAJump target
-    -- If jumping to latch or header, redirect to next iteration
+    -- If jumping to latch, redirect to next iteration
     | target == latch -> SSAJump nextTarget
     | otherwise -> SSAJump (renameBlockId target iter)
   SSABranch cond t f ->
-    SSABranch (renameExpr suffix iter cond)
+    SSABranch (renameExprChained useSuffix iter loopDefs cond)
               (renameBlockId t iter)
               (renameBlockId f iter)
-  SSAExprStmt e -> SSAExprStmt (renameExpr suffix iter e)
+  SSAExprStmt e -> SSAExprStmt (renameExprChained useSuffix iter loopDefs e)
+
+-- | Rename a variable definition (gets current iteration's suffix)
+renameVarDef :: String -> Int -> SSAVar -> SSAVar
+renameVarDef suffix iter var@SSAVar{..} =
+  var { ssaName = varName (varNameString ssaName ++ suffix ++ show iter) }
+
+-- | Rename an expression with chained variable references
+-- Only renames variables that are defined in the loop; others keep their original names
+renameExprChained :: String -> Int -> Set VarKey -> SSAExpr -> SSAExpr
+renameExprChained suffix iter loopDefs = \case
+  SSAUse var ->
+    let key = (ssaName var, ssaVersion var)
+    in if Set.member key loopDefs
+       then SSAUse (renameVarUse suffix iter var)
+       else SSAUse var  -- Not a loop variable, keep original
+  SSAUnary op e -> SSAUnary op (renameExprChained suffix iter loopDefs e)
+  SSABinary op l r -> SSABinary op (renameExprChained suffix iter loopDefs l)
+                                   (renameExprChained suffix iter loopDefs r)
+  SSATernary c t e -> SSATernary (renameExprChained suffix iter loopDefs c)
+                                  (renameExprChained suffix iter loopDefs t)
+                                  (renameExprChained suffix iter loopDefs e)
+  SSACall name args -> SSACall name (map (renameExprChained suffix iter loopDefs) args)
+  SSAInstanceCall t m args ->
+    SSAInstanceCall (renameExprChained suffix iter loopDefs t) m
+                    (map (renameExprChained suffix iter loopDefs) args)
+  SSANewObject cn args -> SSANewObject cn (map (renameExprChained suffix iter loopDefs) args)
+  SSAFieldAccess t f -> SSAFieldAccess (renameExprChained suffix iter loopDefs t) f
+  e -> e  -- Literals don't need renaming
+
+-- | Rename a variable use (gets previous iteration's suffix)
+renameVarUse :: String -> Int -> SSAVar -> SSAVar
+renameVarUse suffix iter var@SSAVar{..}
+  | null suffix = var  -- Iteration 0 uses original names (no suffix)
+  | otherwise = var { ssaName = varName (varNameString ssaName ++ suffix) }
+
+-- | Legacy rename instruction (for backwards compat)
+renameInstr :: String -> Int -> BlockId -> BlockId -> SSAInstr -> SSAInstr
+renameInstr suffix iter nextTarget latch =
+  renameInstrChained suffix suffix iter nextTarget latch Set.empty
 
 -- | Rename a phi node for unrolling
 renamePhi :: String -> Int -> PhiNode -> PhiNode
@@ -368,13 +464,14 @@ renameExpr suffix iter = \case
 -- For a loop like: while (i < n) { body; i++; }
 -- With factor 4, transform to: while (i < n-3) { body; body; body; body; i+=4; }
 --                              while (i < n) { body; i++; }  // cleanup
+--
+-- Key: Each duplicated body uses variables from the previous duplicate.
+-- We need to properly chain the variable names across duplicates.
 partiallyUnroll :: Map BlockId SSABlock -> Loop -> Int -> (Map BlockId SSABlock, Int)
 partiallyUnroll blockMap loop factor
   | factor <= 1 = (blockMap, 0)
   | not (isSimpleLoop loop blockMap) = (blockMap, 0)
   | otherwise =
-      -- For partial unrolling, we duplicate the body within the loop
-      -- This is simpler than full unrolling - we just replicate instructions
       let header = loopHeader loop
           bodyBlocks = Set.toList (loopBody loop)
           pureBody = filter (/= header) bodyBlocks
@@ -382,17 +479,27 @@ partiallyUnroll blockMap loop factor
            ([latch], Just headerBlock) ->
              case Map.lookup latch blockMap of
                Just latchBlock ->
-                 let -- Duplicate body instructions (factor-1) times in latch block
-                     -- This is a simplified approach - just duplicate non-terminator instrs
-                     bodyInstrs = concatMap getBodyInstrs
-                                    [b | bid <- pureBody, Just b <- [Map.lookup bid blockMap]]
+                 let -- Get all body blocks and collect loop definitions
+                     allBodyBlocks = catMaybes [Map.lookup bid blockMap | bid <- pureBody]
+                     loopDefs = collectLoopDefinitions (headerBlock : allBodyBlocks)
 
-                     -- Create duplicated instructions with renamed variables
-                     duplicated = concatMap (\i -> duplicateInstrs bodyInstrs i) [1..factor-1]
+                     -- Get body instructions (non-terminators)
+                     bodyInstrs = concatMap getBodyInstrs allBodyBlocks
+
+                     -- Create duplicated instructions with proper chaining
+                     -- Each duplicate i uses vars from duplicate i-1
+                     -- Duplicate 0 (original) is already in the loop body
+                     duplicated = concatMap (\i -> duplicateInstrsChained bodyInstrs loopDefs i) [1..factor-1]
 
                      -- Insert before the latch's terminator
-                     newLatchInstrs = case reverse (blockInstrs latchBlock) of
-                       (term:rest) -> reverse rest ++ duplicated ++ [term]
+                     -- Also need to update the latch's terminator to use the last duplicate's vars
+                     latchInstrs = blockInstrs latchBlock
+                     newLatchInstrs = case reverse latchInstrs of
+                       (term:rest) ->
+                         -- Update terminator to use vars from last duplicate
+                         let lastSuffix = "_dup" ++ show (factor - 1)
+                             term' = renameInstrForPartial lastSuffix loopDefs term
+                         in reverse rest ++ duplicated ++ [term']
                        [] -> duplicated
 
                      newLatch = latchBlock { blockInstrs = newLatchInstrs }
@@ -413,13 +520,71 @@ isTerminator = \case
   SSAReturn _ -> True
   _ -> False
 
--- | Duplicate instructions with renamed variables for iteration i
+-- | Duplicate instructions with proper chaining for partial unrolling
+-- iterNum is 1-based (duplicate 1 uses vars from original, duplicate 2 uses from duplicate 1, etc.)
+duplicateInstrsChained :: [SSAInstr] -> Set VarKey -> Int -> [SSAInstr]
+duplicateInstrsChained instrs loopDefs iterNum =
+  let defSuffix = "_dup" ++ show iterNum
+      useSuffix = if iterNum == 1
+                  then ""  -- Duplicate 1 uses original (unsuffixed) vars
+                  else "_dup" ++ show (iterNum - 1)
+  in map (renameInstrForPartialChained defSuffix useSuffix iterNum loopDefs) instrs
+
+-- | Rename an instruction for partial unrolling with proper chaining
+renameInstrForPartialChained :: String -> String -> Int -> Set VarKey -> SSAInstr -> SSAInstr
+renameInstrForPartialChained defSuffix useSuffix iter loopDefs = \case
+  SSAAssign var expr ->
+    SSAAssign (renameVarWithSuffix defSuffix iter var)
+              (renameExprWithSuffix useSuffix loopDefs expr)
+  SSAFieldStore t f o v ->
+    SSAFieldStore (renameExprWithSuffix useSuffix loopDefs t) f o
+                  (renameExprWithSuffix useSuffix loopDefs v)
+  SSAExprStmt e -> SSAExprStmt (renameExprWithSuffix useSuffix loopDefs e)
+  other -> other  -- Terminators shouldn't be here
+
+-- | Rename instruction for partial unroll terminator update
+renameInstrForPartial :: String -> Set VarKey -> SSAInstr -> SSAInstr
+renameInstrForPartial suffix loopDefs = \case
+  SSABranch cond t f ->
+    SSABranch (renameExprWithSuffix suffix loopDefs cond) t f
+  SSAJump t -> SSAJump t
+  SSAReturn e -> SSAReturn (fmap (renameExprWithSuffix suffix loopDefs) e)
+  other -> other
+
+-- | Rename a variable with a specific suffix
+renameVarWithSuffix :: String -> Int -> SSAVar -> SSAVar
+renameVarWithSuffix suffix iter var@SSAVar{..} =
+  var { ssaName = varName (varNameString ssaName ++ suffix) }
+
+-- | Rename an expression, only renaming loop variables
+renameExprWithSuffix :: String -> Set VarKey -> SSAExpr -> SSAExpr
+renameExprWithSuffix suffix loopDefs = \case
+  SSAUse var ->
+    let key = (ssaName var, ssaVersion var)
+    in if Set.member key loopDefs && not (null suffix)
+       then SSAUse (var { ssaName = varName (varNameString (ssaName var) ++ suffix) })
+       else SSAUse var
+  SSAUnary op e -> SSAUnary op (renameExprWithSuffix suffix loopDefs e)
+  SSABinary op l r -> SSABinary op (renameExprWithSuffix suffix loopDefs l)
+                                   (renameExprWithSuffix suffix loopDefs r)
+  SSATernary c t e -> SSATernary (renameExprWithSuffix suffix loopDefs c)
+                                  (renameExprWithSuffix suffix loopDefs t)
+                                  (renameExprWithSuffix suffix loopDefs e)
+  SSACall name args -> SSACall name (map (renameExprWithSuffix suffix loopDefs) args)
+  SSAInstanceCall t m args ->
+    SSAInstanceCall (renameExprWithSuffix suffix loopDefs t) m
+                    (map (renameExprWithSuffix suffix loopDefs) args)
+  SSANewObject cn args -> SSANewObject cn (map (renameExprWithSuffix suffix loopDefs) args)
+  SSAFieldAccess t f -> SSAFieldAccess (renameExprWithSuffix suffix loopDefs t) f
+  e -> e
+
+-- | Legacy duplicate instructions (for backwards compat)
 duplicateInstrs :: [SSAInstr] -> Int -> [SSAInstr]
 duplicateInstrs instrs iterNum =
   let suffix = "_dup" ++ show iterNum
   in map (renameInstrSimple suffix iterNum) instrs
 
--- | Simple instruction renaming (no block renaming needed for partial unroll)
+-- | Legacy simple instruction renaming
 renameInstrSimple :: String -> Int -> SSAInstr -> SSAInstr
 renameInstrSimple suffix iter = \case
   SSAAssign var expr ->
@@ -427,4 +592,4 @@ renameInstrSimple suffix iter = \case
   SSAFieldStore t f o v ->
     SSAFieldStore (renameExpr suffix iter t) f o (renameExpr suffix iter v)
   SSAExprStmt e -> SSAExprStmt (renameExpr suffix iter e)
-  other -> other  -- Terminators shouldn't be here
+  other -> other

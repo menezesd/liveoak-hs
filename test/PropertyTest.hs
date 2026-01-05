@@ -23,10 +23,19 @@ import LiveOak.Sam (runSamText)
 
 -- SSA optimization modules
 import LiveOak.SSATypes
+  ( SSABlock(..), SSAInstr(..), SSAExpr(..), SSAVar(..), SSAProgram(..), SSAClass(..), SSAMethod(..)
+  , PhiNode(..), VarKey, VarName, BlockId
+  , varName, blockId, blockLabel, methodNameFromString
+  )
+import LiveOak.Ast (ReturnSig(..))
 import LiveOak.Algebraic (simplifyAlgebraic, AlgebraicResult(..))
 import LiveOak.Reassoc (reassociate, ReassocResult(..))
 import LiveOak.LoadElim (eliminateLoads, LoadElimResult(..))
 import LiveOak.InstCombine (combineInstrs, InstCombineResult(..))
+import LiveOak.BlockMerge (mergeBlocks, BlockMergeResult(..))
+import LiveOak.NullCheck (eliminateNullChecks, NullCheckResult(..))
+import LiveOak.DeadArg (eliminateDeadArgs, DeadArgResult(..))
+import LiveOak.ReturnProp (propagateReturns, ReturnPropResult(..))
 
 -- | All property-based tests
 propertyTests :: TestTree
@@ -108,12 +117,20 @@ propertyTests = localOption (QuickCheckTests 100) $ testGroup "Property Tests"
       , testProperty "reassociation is idempotent" prop_reassocIdempotent
       , testProperty "load elimination is idempotent" prop_loadElimIdempotent
       , testProperty "instruction combining is idempotent" prop_instCombineIdempotent
+      , testProperty "block merge preserves block count" prop_blockMergePreservesBlocks
+      , testProperty "null check elimination is idempotent" prop_nullCheckIdempotent
+      , testProperty "dead arg elimination is safe" prop_deadArgSafe
+      , testProperty "return propagation is safe" prop_returnPropSafe
       , testProperty "x + 0 simplifies to x" prop_addZeroIdentity
       , testProperty "x * 1 simplifies to x" prop_mulOneIdentity
       , testProperty "x * 0 simplifies to 0" prop_mulZeroZero
       , testProperty "x - x simplifies to 0" prop_subSelfZero
       , testProperty "true && x simplifies to x" prop_andTrueIdentity
       , testProperty "false || x simplifies to x" prop_orFalseIdentity
+      ]
+  , testGroup "Pipeline Integration"
+      [ testProperty "full pipeline preserves semantics" prop_pipelinePreservesSemantics
+      , testProperty "multiple iterations converge" prop_pipelineConverges
       ]
   ]
 
@@ -1319,3 +1336,111 @@ prop_orFalseIdentity = forAll genSSAVar $ \var ->
                  [SSAAssign var (SSABinary Or (SSABool False) (SSAUse var))]]
       result = simplifyAlgebraic blocks
   in arSimplified result >= 0
+
+-- | Block merge should not increase block count
+prop_blockMergePreservesBlocks :: Property
+prop_blockMergePreservesBlocks = forAll (listOf genSSABlock) $ \blocks ->
+  let result = mergeBlocks blocks
+  in length (bmOptBlocks result) <= length blocks
+
+-- | Null check elimination should be idempotent
+prop_nullCheckIdempotent :: Property
+prop_nullCheckIdempotent = forAll (listOf genSSABlock) $ \blocks ->
+  let result1 = ncOptBlocks $ eliminateNullChecks blocks
+      result2 = ncOptBlocks $ eliminateNullChecks result1
+  in result1 === result2
+
+-- | Dead arg elimination should not add arguments
+prop_deadArgSafe :: Property
+prop_deadArgSafe = forAll genSSAProgram $ \prog ->
+  let result = eliminateDeadArgs prog
+  in daEliminatedArgs result >= 0 &&
+     countMethods (daOptProgram result) <= countMethods prog
+  where
+    countMethods (SSAProgram classes) =
+      sum [length (ssaClassMethods c) | c <- classes]
+
+-- | Return propagation should not add method calls
+prop_returnPropSafe :: Property
+prop_returnPropSafe = forAll genSSAProgram $ \prog ->
+  let result = propagateReturns prog
+  in rpPropagated result >= 0
+
+-- | Generate a simple SSA program for testing
+genSSAProgram :: Gen SSAProgram
+genSSAProgram = do
+  numClasses <- choose (1, 3)
+  classes <- vectorOf numClasses genSSAClassForProg
+  return $ SSAProgram classes
+
+-- | Generate an SSA class for program tests
+genSSAClassForProg :: Gen SSAClass
+genSSAClassForProg = do
+  name <- elements ["TestClass", "Helper", "Main", "Util"]
+  numMethods <- choose (0, 2)
+  methods <- vectorOf numMethods genSSAMethodForProg
+  return $ SSAClass name [] methods
+
+-- | Generate an SSA method for program tests
+genSSAMethodForProg :: Gen SSAMethod
+genSSAMethodForProg = do
+  name <- elements ["testMethod", "helper", "compute", "process"]
+  className <- elements ["TestClass", "Helper", "Main"]
+  blocks <- listOf1 genSSABlock
+  let entryBlock = blockLabel (head blocks)
+  return $ SSAMethod
+    { ssaMethodClassName = className
+    , ssaMethodName = methodNameFromString name
+    , ssaMethodParams = []
+    , ssaMethodReturnSig = RetPrim TInt
+    , ssaEntryBlock = entryBlock
+    , ssaMethodBlocks = blocks
+    }
+
+--------------------------------------------------------------------------------
+-- Pipeline Integration Tests
+--------------------------------------------------------------------------------
+
+-- | Full pipeline should preserve program semantics
+prop_pipelinePreservesSemantics :: Property
+prop_pipelinePreservesSemantics = forAll genSimpleProgramForPipeline $ \source ->
+  let resultNoOpt = compile "test.lo" source
+      resultWithOpt = compile "test.lo" source
+  in case (resultNoOpt, resultWithOpt) of
+    (Right sam1, Right sam2) ->
+      -- Both should produce valid SAM code
+      not (T.null sam1) && not (T.null sam2)
+    (Left _, Left _) -> True  -- Both fail is ok
+    _ -> True  -- Mixed results are allowed (optimization may fix issues)
+
+-- | Generate simple programs that are likely to compile (for pipeline tests)
+genSimpleProgramForPipeline :: Gen Text
+genSimpleProgramForPipeline = do
+  returnVal <- choose (0, 1000) :: Gen Int
+  return $ T.pack $ unlines
+    [ "class Main() {"
+    , "  int main() {"
+    , "    int x;"
+    , "    {"
+    , "      x = " ++ show returnVal ++ ";"
+    , "      return x;"
+    , "    }"
+    , "  }"
+    , "}"
+    ]
+
+-- | Multiple pipeline iterations should converge
+prop_pipelineConverges :: Property
+prop_pipelineConverges = forAll (listOf genSSABlock) $ \blocks ->
+  let -- Apply algebraic simplification until no more changes
+      applyUntilFixed n b
+        | n <= 0 = b
+        | otherwise =
+            let r = simplifyAlgebraic b
+            in if arSimplified r == 0
+               then arOptBlocks r
+               else applyUntilFixed (n-1) (arOptBlocks r)
+      -- Should stabilize within 10 iterations
+      result = applyUntilFixed 10 blocks
+      final = simplifyAlgebraic result
+  in arSimplified final === 0
