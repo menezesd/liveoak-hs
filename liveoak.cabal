@@ -69,6 +69,12 @@ library
                     , LiveOak.Alias
                     , LiveOak.ValueRange
                     , LiveOak.LoadForward
+                    , LiveOak.CopyProp
+                    , LiveOak.PhiSimplify
+                    , LiveOak.BlockMerge
+                    , LiveOak.NullCheck
+                    , LiveOak.DeadArg
+                    , LiveOak.ReturnProp
     build-depends:    base >= 4.17 && < 5
                     , text >= 2.0
                     , megaparsec >= 9.0
