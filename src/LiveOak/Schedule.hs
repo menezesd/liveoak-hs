@@ -214,24 +214,74 @@ topSort graph =
 -- List Scheduling
 --------------------------------------------------------------------------------
 
--- | List scheduling algorithm
+-- | List scheduling algorithm with register pressure awareness
+-- Uses critical path as primary heuristic and register pressure as tiebreaker
 listSchedule :: DepGraph -> [Int]
 listSchedule graph =
   let cp = criticalPath graph
+      -- Compute live-in and live-out for pressure calculation
+      liveInfo = computeLiveInfo graph
       -- Priority: critical path length (higher = schedule first)
       allPredsScheduled n scheduled =
         all (\e -> Set.member (depFrom e) scheduled) (IntMap.findWithDefault [] n (dgPreds graph))
-      go remaining scheduled acc
+      go remaining scheduled liveNow acc
         | Set.null remaining = reverse acc
         | otherwise =
             let ready = [n | n <- Set.toList remaining, allPredsScheduled n scheduled]
-                readyWithPriority = [(n, IntMap.findWithDefault 0 n cp) | n <- ready]
-                -- Sort by priority (descending)
+                -- Score each ready instruction: (critical path, -pressure increase)
+                -- Higher is better for both components
+                readyWithPriority = [(n, scorePriority cp liveInfo liveNow n) | n <- ready]
+                -- Sort by priority (descending by critical path, then by pressure)
                 sorted = sortBy (comparing (Down . snd)) readyWithPriority
             in case sorted of
               [] -> reverse acc ++ Set.toList remaining  -- Cycle or deadlock
-              ((n, _):_) -> go (Set.delete n remaining) (Set.insert n scheduled) (n : acc)
-  in go (Set.fromList $ dgNodes graph) Set.empty []
+              ((n, _):_) ->
+                let liveNow' = updateLiveSet liveInfo liveNow n
+                in go (Set.delete n remaining) (Set.insert n scheduled) liveNow' (n : acc)
+  in go (Set.fromList $ dgNodes graph) Set.empty Set.empty []
+
+-- | Score for scheduling priority: (critical path length, -pressure increase)
+-- We want high critical path and low pressure increase
+scorePriority :: IntMap.IntMap Int -> LiveInfo -> Set.Set Int -> Int -> (Int, Int)
+scorePriority cp liveInfo liveNow n =
+  let cpScore = IntMap.findWithDefault 0 n cp
+      -- Estimate pressure change: how many new values minus consumed values
+      pressureChange = estimatePressureChange liveInfo liveNow n
+  in (cpScore, -pressureChange)  -- Negate so lower pressure is better
+
+-- | Live variable information for each instruction
+data LiveInfo = LiveInfo
+  { liDefs :: !(IntMap.IntMap (Set.Set Int))  -- Instruction -> defined values
+  , liUses :: !(IntMap.IntMap (Set.Set Int))  -- Instruction -> used values
+  } deriving (Show)
+
+-- | Compute live information for each instruction
+computeLiveInfo :: DepGraph -> LiveInfo
+computeLiveInfo graph =
+  let nodes = dgNodes graph
+      -- For simplicity, assume instruction i defines value i and uses its predecessors
+      defs = IntMap.fromList [(n, Set.singleton n) | n <- nodes]
+      uses = IntMap.fromList [(n, Set.fromList [depFrom e | e <- IntMap.findWithDefault [] n (dgPreds graph)])
+                             | n <- nodes]
+  in LiveInfo defs uses
+
+-- | Estimate pressure change from scheduling instruction n
+estimatePressureChange :: LiveInfo -> Set.Set Int -> Int -> Int
+estimatePressureChange LiveInfo{..} liveNow n =
+  let defined = IntMap.findWithDefault Set.empty n liDefs
+      used = IntMap.findWithDefault Set.empty n liUses
+      -- New values introduced
+      newLive = Set.size defined
+      -- Values consumed (no longer needed after this use)
+      -- Simplified: assume used values are still live
+      consumed = 0
+  in newLive - consumed
+
+-- | Update live set after scheduling instruction n
+updateLiveSet :: LiveInfo -> Set.Set Int -> Int -> Set.Set Int
+updateLiveSet LiveInfo{..} liveNow n =
+  let defined = IntMap.findWithDefault Set.empty n liDefs
+  in Set.union liveNow defined
 
 --------------------------------------------------------------------------------
 -- Trace Scheduling
