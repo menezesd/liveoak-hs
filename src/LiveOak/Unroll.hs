@@ -59,21 +59,11 @@ data UnrollConfig = UnrollConfig
 
 -- | Default unrolling configuration
 -- Full unrolling is enabled for small loops with constant trip counts.
--- Partial unrolling is DISABLED due to remaining issues:
---
--- 1. Partial unrolling does not adjust loop bounds - the loop condition still
---    checks against the original limit, but with duplicated body, we iterate
---    factor*N times instead of N times.
---
--- 2. Remainder handling is missing - when trip count is not a multiple of
---    the unroll factor, we need an epilogue loop for the remaining iterations.
---
--- To fix partial unrolling properly, we need to:
---   a) Transform: while (i < N) { body; i++; }
---   b) Into: while (i < N - (factor-1)) { body; i++; body'; i'++; ... }
---           while (i < N) { body; i++; }  // epilogue
---   c) Ensure the last duplicate's induction variable feeds back to the phi
---
+-- Partial unrolling is enabled for loops with unknown/large trip counts:
+--   - Adjusts loop bounds (e.g., i < N becomes i < N - (factor-1))
+--   - Generates epilogue loop for remainder iterations
+--   - Supports both countup (i < N) and countdown (i > 0) loops
+--   - Chains variables properly across unrolled copies
 defaultUnrollConfig :: UnrollConfig
 defaultUnrollConfig = UnrollConfig
   { ucMaxUnrollFactor = 8     -- Maximum unroll factor for full unrolling
@@ -149,8 +139,8 @@ unrollLoop config cfg (blockMap, fullCount, partialCount) loop =
     -- Partial unrolling for unknown or large trip counts
     _ | bodySize <= ucMaxBodySize config ->
           let factor = ucPartialUnrollFactor config
-              (newBlocks, _) = partiallyUnroll blockMap loop factor
-          in (newBlocks, fullCount, partialCount + 1)
+              (newBlocks, count) = partiallyUnroll blockMap loop factor
+          in (newBlocks, fullCount, partialCount + count)
 
     -- No unrolling - loop too large
     _ -> (blockMap, fullCount, partialCount)
@@ -720,8 +710,20 @@ doPartialUnroll blockMap loop factor
          case (analyzeInductionVar headerBlock latch pureBody blockMap,
                findLoopBound (blockInstrs headerBlock),
                findExitTarget (blockInstrs headerBlock)) of
-           (Just (inductionPhi, inductionStep), Just (boundVar, boundVal), Just (bodyTarget, exitTarget)) ->
-             let -- Get all body blocks
+           (Just (inductionPhi, inductionStep), Just (boundVar, boundVal, _condDir), Just (thenTarget, elseTarget)) ->
+             let -- Determine actual loop direction from the step, not the condition
+                 -- Positive step = CountUp, Negative step = CountDown
+                 loopDir = if inductionStep > 0 then CountUp else CountDown
+
+                 -- Determine which branch target is body vs exit by checking loop membership
+                 -- The body target is inside the loop, the exit target is outside
+                 loopBodySet = loopBody loop
+                 (bodyTarget, exitTarget) =
+                   if Set.member thenTarget loopBodySet
+                   then (thenTarget, elseTarget)  -- thenBlock is body
+                   else (elseTarget, thenTarget)  -- elseBlock is body
+
+                 -- Get all body blocks
                  allBodyBlocks = catMaybes [Map.lookup bid blockMap | bid <- pureBody]
 
                  -- Collect definitions in the body (for renaming)
@@ -737,19 +739,28 @@ doPartialUnroll blockMap loop factor
 
                  -- Build new header with adjusted bound
                  newHeaderBlock = buildAdjustedHeader headerBlock boundVar boundVal factor
-                                                      bodyTarget exitTarget latch
+                                                      bodyTarget exitTarget latch loopDir
 
                  -- Build epilogue loop (original loop structure, new labels)
                  epilogueBlocks = buildEpilogue headerBlock allBodyBlocks bodyDefs
-                                               latch exitTarget factor
+                                               latch bodyTarget exitTarget factor
+
+                 -- Update exit block to use epilogue phi variables instead of main loop phi vars
+                 -- The exit block now only receives from epilogue, so it should use sum_e not sum
+                 phiKeys = Set.fromList [varKey (phiVar phi) | phi <- blockPhis headerBlock]
+                 updatedExitBlock = case Map.lookup exitTarget blockMap of
+                   Just exitBlock -> renameExitBlockVars "_e" phiKeys exitBlock
+                   Nothing -> Nothing
 
                  -- Remove original body blocks (keep header for now)
                  withoutBody = foldl' (flip Map.delete) blockMap pureBody
 
-                 -- Insert new header, unrolled body, and epilogue
+                 -- Insert new header, unrolled body, epilogue, and updated exit block
+                 blocksToInsert = newHeaderBlock : unrolledBodyBlocks ++ epilogueBlocks
+                                  ++ maybe [] (:[]) updatedExitBlock
                  finalMap = foldl' (\m b -> Map.insert (blockLabel b) b m)
                                    withoutBody
-                                   (newHeaderBlock : unrolledBodyBlocks ++ epilogueBlocks)
+                                   blocksToInsert
 
              in (finalMap, 1)
            _ -> (blockMap, 0)  -- Can't analyze loop structure
@@ -777,28 +788,51 @@ findPhiStep phi latch bodyBlocks =
 -- | Find step value for a variable
 findStepForVar :: String -> [SSABlock] -> Maybe Int
 findStepForVar varName blocks =
-  case [(step, src) | SSABlock{..} <- blocks
+  case -- i = i + step
+       [(step, src) | SSABlock{..} <- blocks
                     , SSAAssign v (SSABinary Add (SSAUse src) (SSAInt step)) <- blockInstrs
                     , varNameString (ssaName v) == varName] ++
+       -- i = step + i
        [(step, src) | SSABlock{..} <- blocks
                     , SSAAssign v (SSABinary Add (SSAInt step) (SSAUse src)) <- blockInstrs
-                    , varNameString (ssaName v) == varName] of
+                    , varNameString (ssaName v) == varName] ++
+       -- i = i - step (countdown loop)
+       [(-step, src) | SSABlock{..} <- blocks
+                     , SSAAssign v (SSABinary Sub (SSAUse src) (SSAInt step)) <- blockInstrs
+                     , varNameString (ssaName v) == varName] of
     ((step, _):_) -> Just step
     [] -> Nothing
 
--- | Find loop bound from header branch
-findLoopBound :: [SSAInstr] -> Maybe (SSAVar, Int)
+-- | Loop direction for bound adjustment
+data LoopDir = CountUp | CountDown deriving (Eq, Show)
+
+-- | Find loop bound from header branch, including direction
+findLoopBound :: [SSAInstr] -> Maybe (SSAVar, Int, LoopDir)
 findLoopBound instrs = case reverse instrs of
+  -- Countup loops: i < N, i <= N
   (SSABranch (SSABinary Lt (SSAUse var) (SSAInt limit)) _ _) : _ ->
-    Just (var, limit)
+    Just (var, limit, CountUp)
   (SSABranch (SSABinary Le (SSAUse var) (SSAInt limit)) _ _) : _ ->
-    Just (var, limit + 1)  -- <= N is same as < N+1
+    Just (var, limit + 1, CountUp)  -- <= N is same as < N+1
+  -- Countdown loops: i > N, i >= N
+  (SSABranch (SSABinary Gt (SSAUse var) (SSAInt limit)) _ _) : _ ->
+    Just (var, limit, CountDown)
+  (SSABranch (SSABinary Ge (SSAUse var) (SSAInt limit)) _ _) : _ ->
+    Just (var, limit - 1, CountDown)  -- >= N is same as > N-1
+  -- Not-equal loops: treat as countup (need step info to determine direction)
+  (SSABranch (SSABinary Ne (SSAUse var) (SSAInt limit)) _ _) : _ ->
+    Just (var, limit, CountUp)
   _ -> Nothing
 
 -- | Find exit target from header branch (body target, exit target)
+-- We can't determine semantics from the condition operator alone, since:
+-- - while (a < 100) { body } -> br (a Lt 100) body exit (continue when true)
+-- - if (n <= 0) exit; body;  -> br (n Le 0) exit body (exit when true)
+-- Instead, just return the raw branch targets. The caller must use loop analysis
+-- to determine which is the body (leads to latch) vs exit (leaves the loop).
 findExitTarget :: [SSAInstr] -> Maybe (BlockId, BlockId)
 findExitTarget instrs = case reverse instrs of
-  (SSABranch _ bodyTarget exitTarget) : _ -> Just (bodyTarget, exitTarget)
+  (SSABranch _ thenTarget elseTarget) : _ -> Just (thenTarget, elseTarget)
   _ -> Nothing
 
 -- | Build unrolled body blocks
@@ -928,10 +962,14 @@ transformUnrollExpr useSubst phiSubst = \case
 -- Changes: i < N  ->  i < N - (factor - 1)
 -- Also changes exit target to epilogue instead of original exit
 buildAdjustedHeader :: SSABlock -> SSAVar -> Int -> Int
-                    -> BlockId -> BlockId -> BlockId -> SSABlock
-buildAdjustedHeader headerBlock boundVar boundVal factor bodyTarget exitTarget latch =
+                    -> BlockId -> BlockId -> BlockId -> LoopDir -> SSABlock
+buildAdjustedHeader headerBlock boundVar boundVal factor bodyTarget exitTarget latch loopDir =
   let -- Adjusted bound: need at least `factor` iterations available
-      adjustedBound = boundVal - (factor - 1)
+      -- For countup: subtract (factor-1) from upper bound
+      -- For countdown: add (factor-1) to lower bound
+      adjustedBound = case loopDir of
+        CountUp   -> boundVal - (factor - 1)
+        CountDown -> boundVal + (factor - 1)
       -- New exit goes to epilogue header
       epilogueHeader = blockId "epilogue_header"
       -- Update phi back-edges to receive from last unrolled copy
@@ -945,23 +983,33 @@ buildAdjustedHeader headerBlock boundVar boundVal factor bodyTarget exitTarget l
                                  | (bid, v) <- phiArgs phi] }
                 | phi <- blockPhis headerBlock]
       -- Update branch instruction with new bound
-      newInstrs = map (adjustBranchBound adjustedBound epilogueHeader) (blockInstrs headerBlock)
+      newInstrs = map (adjustBranchBound adjustedBound bodyTarget exitTarget epilogueHeader) (blockInstrs headerBlock)
   in headerBlock { blockPhis = newPhis, blockInstrs = newInstrs }
 
 -- | Adjust branch bound in instruction
-adjustBranchBound :: Int -> BlockId -> SSAInstr -> SSAInstr
-adjustBranchBound newBound epilogueTarget = \case
-  SSABranch (SSABinary Lt (SSAUse var) (SSAInt _)) bodyT _exitT ->
-    SSABranch (SSABinary Lt (SSAUse var) (SSAInt newBound)) bodyT epilogueTarget
-  SSABranch (SSABinary Le (SSAUse var) (SSAInt _)) bodyT _exitT ->
-    SSABranch (SSABinary Le (SSAUse var) (SSAInt (newBound - 1))) bodyT epilogueTarget
+-- The newBound is already adjusted for loop direction.
+-- We preserve the original branch structure but update:
+-- 1. The bound value with newBound (adjusted for factor)
+-- 2. The "exit" target to go to epilogue instead of original exit
+-- The thenTarget/elseTarget order is preserved from the original.
+adjustBranchBound :: Int -> BlockId -> BlockId -> BlockId -> SSAInstr -> SSAInstr
+adjustBranchBound newBound bodyTarget originalExit epilogueTarget = \case
+  SSABranch (SSABinary op (SSAUse var) (SSAInt _)) thenT elseT ->
+    let adjustedBound = case op of
+          Le -> newBound - 1  -- <= N-1 is same as < N
+          Ge -> newBound + 1  -- >= N+1 is same as > N
+          _  -> newBound
+        -- Replace original exit with epilogue, keep body as-is
+        newThen = if thenT == originalExit then epilogueTarget else thenT
+        newElse = if elseT == originalExit then epilogueTarget else elseT
+    in SSABranch (SSABinary op (SSAUse var) (SSAInt adjustedBound)) newThen newElse
   other -> other
 
 -- | Build epilogue loop to handle remaining iterations
 -- This is a copy of the original loop with new labels
 buildEpilogue :: SSABlock -> [SSABlock] -> Set VarKey
-              -> BlockId -> BlockId -> Int -> [SSABlock]
-buildEpilogue headerBlock bodyBlocks bodyDefs latch exitTarget factor =
+              -> BlockId -> BlockId -> BlockId -> Int -> [SSABlock]
+buildEpilogue headerBlock bodyBlocks bodyDefs latch bodyTarget exitTarget factor =
   let epilogueHeader = blockId "epilogue_header"
       epilogueLatch = blockId "epilogue_latch"
 
@@ -987,7 +1035,8 @@ buildEpilogue headerBlock bodyBlocks bodyDefs latch exitTarget factor =
       phiKeys = Set.fromList [varKey (phiVar phi) | phi <- blockPhis headerBlock]
 
       -- Epilogue header instructions (same condition as original, but with epilogue phis)
-      epilogueHeaderInstrs = map (renameEpilogueInstr "_e" phiKeys epilogueLatch exitTarget) (blockInstrs headerBlock)
+      -- Replace body target with epilogueLatch, keep exit target
+      epilogueHeaderInstrs = map (renameEpilogueInstr "_e" phiKeys bodyTarget epilogueLatch exitTarget) (blockInstrs headerBlock)
 
       -- Epilogue body (copy of original body with renamed variables)
       -- Uses epilogue phi vars, produces epilogue latch vars
@@ -998,12 +1047,44 @@ buildEpilogue headerBlock bodyBlocks bodyDefs latch exitTarget factor =
 
   in [epilogueHeaderBlock, epilogueLatchBlock]
 
+-- | Rename exit block variables to use epilogue phi variables
+-- When partial unrolling redirects the main loop to an epilogue, the exit block
+-- now only receives from the epilogue, so uses of main loop phi vars (like sum_2)
+-- should be renamed to epilogue phi vars (like sum_e_1)
+renameExitBlockVars :: String -> Set VarKey -> SSABlock -> Maybe SSABlock
+renameExitBlockVars suffix phiKeys SSABlock{..} =
+  let newInstrs = map (renameExitInstr suffix phiKeys) blockInstrs
+  in Just $ SSABlock blockLabel blockPhis newInstrs
+
+-- | Rename instruction for exit block
+renameExitInstr :: String -> Set VarKey -> SSAInstr -> SSAInstr
+renameExitInstr suffix phiKeys = \case
+  SSAAssign var expr ->
+    SSAAssign var (renameEpilogueExpr suffix phiKeys expr)
+  SSAReturn (Just expr) ->
+    SSAReturn (Just (renameEpilogueExpr suffix phiKeys expr))
+  SSABranch cond thenB elseB ->
+    SSABranch (renameEpilogueExpr suffix phiKeys cond) thenB elseB
+  SSAExprStmt expr ->
+    SSAExprStmt (renameEpilogueExpr suffix phiKeys expr)
+  SSAFieldStore target field off value ->
+    SSAFieldStore (renameEpilogueExpr suffix phiKeys target) field off
+                  (renameEpilogueExpr suffix phiKeys value)
+  other -> other
+
 -- | Rename instruction for epilogue header
-renameEpilogueInstr :: String -> Set VarKey -> BlockId -> BlockId -> SSAInstr -> SSAInstr
-renameEpilogueInstr suffix phiKeys epilogueLatch exitTarget = \case
-  SSABranch cond _bodyT _exitT ->
-    let bodyT = epilogueLatch
-    in SSABranch (renameEpilogueExpr suffix phiKeys cond) bodyT exitTarget
+-- The epilogue preserves the same branch structure as the original, but:
+-- 1. Renames variables in the condition
+-- 2. Replaces the body target with epilogueLatch
+-- 3. Keeps the exit target as exitTarget
+renameEpilogueInstr :: String -> Set VarKey -> BlockId -> BlockId -> BlockId -> SSAInstr -> SSAInstr
+renameEpilogueInstr suffix phiKeys bodyTarget epilogueLatch exitTarget = \case
+  SSABranch cond thenT elseT ->
+    let cond' = renameEpilogueExpr suffix phiKeys cond
+        -- Replace body with epilogueLatch, keep exit as exitTarget
+        newThen = if thenT == bodyTarget then epilogueLatch else exitTarget
+        newElse = if elseT == bodyTarget then epilogueLatch else exitTarget
+    in SSABranch cond' newThen newElse
   other -> other
 
 -- | Rename expression for epilogue
