@@ -29,7 +29,6 @@ module LiveOak.InstCombine
   ) where
 
 import LiveOak.SSATypes
-import LiveOak.SSAUtils (substVarsInInstr)
 import LiveOak.Ast (BinaryOp(..), UnaryOp(..))
 
 import Data.Map.Strict (Map)
@@ -99,7 +98,7 @@ combineBlock defMap block@SSABlock{..} =
 combinePhi :: DefMap -> PhiNode -> (PhiNode, Int)
 combinePhi _defMap phi@PhiNode{..}
   -- Trivial phi with single argument
-  | [(_, val)] <- phiArgs = (phi, 0)  -- Keep but mark for later elimination
+  | [(_, _)] <- phiArgs = (phi, 0)  -- Keep but mark for later elimination
   | otherwise = (phi, 0)
 
 -- | Combine an instruction
@@ -181,10 +180,36 @@ combineInstr defMap = \case
     in case Map.lookup negKey defMap of
       Just (SSAUnary Neg inner) ->
         (SSAAssign var (SSABinary Add left inner), 1)
+      Just (SSABinary Sub b c) ->
+        -- a - (b - c) -> a - b + c
+        (SSAAssign var (SSABinary Add (SSABinary Sub left b) c), 1)
       _ -> (SSAAssign var (SSABinary Sub left (SSAUse negVar)), 0)
 
-  -- Combine multiplication by power of 2 to shift (not applicable without shift op)
-  -- Keep as is for now
+  -- Handle reversed order: true == (x < y) -> x < y
+  SSAAssign var (SSABinary Eq (SSABool True) (SSAUse cmpVar)) ->
+    let cmpKey = (ssaName cmpVar, ssaVersion cmpVar)
+    in case Map.lookup cmpKey defMap of
+      Just cmp@(SSABinary op _ _) | isComparisonOp op ->
+        (SSAAssign var cmp, 1)
+      _ -> (SSAAssign var (SSABinary Eq (SSABool True) (SSAUse cmpVar)), 0)
+
+  -- Handle reversed order: false == (x < y) -> !(x < y)
+  SSAAssign var (SSABinary Eq (SSABool False) (SSAUse cmpVar)) ->
+    let cmpKey = (ssaName cmpVar, ssaVersion cmpVar)
+    in case Map.lookup cmpKey defMap of
+      Just cmp@(SSABinary op l r) | isComparisonOp op ->
+        case negateComparison op of
+          Just op' -> (SSAAssign var (SSABinary op' l r), 1)
+          Nothing -> (SSAAssign var (SSAUnary Not cmp), 1)
+      _ -> (SSAAssign var (SSABinary Eq (SSABool False) (SSAUse cmpVar)), 0)
+
+  -- x != true -> !x (for boolean x)
+  SSAAssign var (SSABinary Ne (SSAUse boolVar) (SSABool True)) ->
+    (SSAAssign var (SSAUnary Not (SSAUse boolVar)), 1)
+
+  -- x != false -> x (for boolean x)
+  SSAAssign var (SSABinary Ne (SSAUse boolVar) (SSABool False)) ->
+    (SSAAssign var (SSAUse boolVar), 1)
 
   instr -> (instr, 0)
 

@@ -233,9 +233,11 @@ evalBinaryRange op (Range lo1 hi1) (Range lo2 hi2) = case op of
   Div
     | lo2 > 0 -> Range (lo1 `div` hi2) (hi1 `div` lo2)
     | hi2 < 0 -> Range (hi1 `div` hi2) (lo1 `div` lo2)
-    | otherwise -> RangeTop  -- Division by zero possible
+    | lo2 == 0 && hi2 == 0 -> RangeBottom  -- Definite division by zero (unreachable)
+    | otherwise -> RangeTop  -- Division by zero possible but not certain
   Mod
     | lo2 > 0 -> Range 0 (hi2 - 1)
+    | lo2 == 0 && hi2 == 0 -> RangeBottom  -- Definite mod by zero (unreachable)
     | otherwise -> RangeTop
   -- Comparison operations return boolean (0 or 1)
   Lt -> boolRange (hi1 < lo2) (lo1 < hi2)

@@ -42,6 +42,14 @@ import qualified Data.Map.Strict as Map
 -- Types
 --------------------------------------------------------------------------------
 
+-- | Key for identifying a target expression efficiently
+-- Avoids string concatenation for Map lookups
+data TargetKey
+  = TKThis                          -- ^ 'this' object
+  | TKVar !VarName !Int             -- ^ SSA variable (name + version)
+  | TKUnknown                       -- ^ Unknown/complex expression
+  deriving (Eq, Ord, Show)
+
 -- | Tracked store information
 data TrackedStore = TrackedStore
   { tsTarget :: !SSAExpr     -- ^ Store target object
@@ -76,7 +84,7 @@ forwardBlockLoadsSimple block@SSABlock{..} =
   in (block { blockInstrs = instrs' }, count)
 
 -- | Process instructions for load forwarding (simple version)
-processInstrsSimple :: Map (String, String) SSAExpr -> Int -> [SSAInstr] -> ([SSAInstr], Int)
+processInstrsSimple :: Map (TargetKey, String) SSAExpr -> Int -> [SSAInstr] -> ([SSAInstr], Int)
 processInstrsSimple _ count [] = ([], count)
 processInstrsSimple stores count (instr:rest) =
   case instr of
@@ -116,7 +124,7 @@ processInstrsSimple stores count (instr:rest) =
       in (instr : rest', count')
 
 -- | Try to forward a field access in an expression
-forwardExprSimple :: Map (String, String) SSAExpr -> SSAExpr -> (SSAExpr, Bool)
+forwardExprSimple :: Map (TargetKey, String) SSAExpr -> SSAExpr -> (SSAExpr, Bool)
 forwardExprSimple stores = go
   where
     go expr = case expr of
@@ -151,12 +159,13 @@ forwardExprSimple stores = go
         in (SSANewObject cn args', or fwds)
       e -> (e, False)
 
--- | Get a string key for a target expression (for simple matching)
-targetKey :: SSAExpr -> String
+-- | Get a key for a target expression (for efficient Map lookups)
+-- Uses a dedicated data type instead of string concatenation
+targetKey :: SSAExpr -> TargetKey
 targetKey = \case
-  SSAThis -> "this"
-  SSAUse var -> "var:" ++ varNameString (ssaName var) ++ ":" ++ show (ssaVersion var)
-  _ -> "unknown"
+  SSAThis -> TKThis
+  SSAUse var -> TKVar (ssaName var) (ssaVersion var)
+  _ -> TKUnknown
 
 -- | Check if expression has a call
 hasCall :: SSAExpr -> Bool

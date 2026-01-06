@@ -486,10 +486,23 @@ recordExpr key num _expr = do
     }
 
 -- | Record a variable replacement
+-- Follows the replacement chain to find the ultimate target
 recordReplacement :: VarKey -> VarKey -> GVN ()
 recordReplacement from to = do
+  -- Follow the chain to find the ultimate replacement target
+  ultimate <- followReplacementChain 10 to
   modify $ \s -> s
-    { gvnReplacements = Map.insert from to (gvnReplacements s)
-    , gvnAllReplacements = Map.insert from to (gvnAllReplacements s)
+    { gvnReplacements = Map.insert from ultimate (gvnReplacements s)
+    , gvnAllReplacements = Map.insert from ultimate (gvnAllReplacements s)
     , gvnElimCount = gvnElimCount s + 1
     }
+
+-- | Follow replacement chain to find ultimate target
+-- Limited depth to avoid infinite loops (shouldn't happen in valid SSA)
+followReplacementChain :: Int -> VarKey -> GVN VarKey
+followReplacementChain 0 key = return key  -- Depth limit reached
+followReplacementChain n key = do
+  repls <- gets gvnAllReplacements
+  case Map.lookup key repls of
+    Just target | target /= key -> followReplacementChain (n - 1) target
+    _ -> return key

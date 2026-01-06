@@ -180,19 +180,35 @@ propagateCP graph cpMap node =
           maxSucc = foldl' (\acc e -> max acc (IntMap.findWithDefault 0 (depTo e) cpMap + depLatency e)) 0 succs
       in IntMap.insert node (lat + maxSucc) cpMap
 
--- | Topological sort of the dependency graph
+-- | Topological sort of the dependency graph using Kahn's algorithm
+-- Time complexity: O(V + E) instead of O(V²)
 topSort :: DepGraph -> [Int]
-topSort graph = go (dgNodes graph) Set.empty []
+topSort graph =
+  let -- Compute in-degree for each node
+      inDegree0 = IntMap.fromList [(n, 0) | n <- dgNodes graph]
+      inDegree = foldl' countPreds inDegree0 (dgNodes graph)
+      -- Find initially ready nodes (in-degree = 0)
+      ready0 = [n | n <- dgNodes graph, IntMap.findWithDefault 0 n inDegree == 0]
+  in go ready0 inDegree []
   where
-    go [] _ acc = acc
-    go remaining visited acc =
-      let ready = [n | n <- remaining,
-                      all (`Set.member` visited) (predNodes n)]
-      in case ready of
-        [] -> remaining ++ acc  -- Cycle detected, just append remaining
-        (n:_) -> go (filter (/= n) remaining) (Set.insert n visited) (n : acc)
+    countPreds deg n =
+      let preds = IntMap.findWithDefault [] n (dgPreds graph)
+      in IntMap.insert n (length preds) deg
 
-    predNodes n = [depFrom e | e <- IntMap.findWithDefault [] n (dgPreds graph)]
+    go [] _ acc = reverse acc
+    go (n:ready) inDeg acc =
+      let -- Decrement in-degree of successors
+          succs = [depTo e | e <- IntMap.findWithDefault [] n (dgSuccs graph)]
+          (newReady, newInDeg) = foldl' (decrementDeg n) (ready, inDeg) succs
+      in go newReady newInDeg (n : acc)
+
+    decrementDeg _ (ready, inDeg) succ =
+      let oldDeg = IntMap.findWithDefault 0 succ inDeg
+          newDeg = oldDeg - 1
+          newInDeg = IntMap.insert succ newDeg inDeg
+      in if newDeg == 0
+         then (succ : ready, newInDeg)
+         else (ready, newInDeg)
 
 --------------------------------------------------------------------------------
 -- List Scheduling

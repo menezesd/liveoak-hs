@@ -28,6 +28,10 @@ module LiveOak.Unroll
   , UnrollConfig(..)
   , defaultUnrollConfig
   , aggressiveUnrollConfig
+
+    -- * Diagnostics
+  , UnrollSkipReason(..)
+  , diagnoseLoop
   ) where
 
 import LiveOak.SSATypes
@@ -80,6 +84,36 @@ aggressiveUnrollConfig = UnrollConfig
   , ucFullUnrollLimit = 16
   , ucPartialUnrollFactor = 4
   }
+
+-- | Reasons why a loop might not be unrolled
+data UnrollSkipReason
+  = SkipMultipleLatches !Int        -- ^ Loop has multiple back edges
+  | SkipNestedLoops !Int            -- ^ Loop has nested child loops
+  | SkipBodyTooLarge !Int !Int      -- ^ Body size exceeds limit (actual, max)
+  | SkipNoHeader                    -- ^ Loop header block not found
+  | SkipNoExit                      -- ^ Could not determine loop exit
+  | SkipUnknownTripCount            -- ^ Trip count could not be determined
+  | SkipTripCountTooLarge !Int !Int -- ^ Trip count exceeds limit (actual, max)
+  | SkipEmptyBody                   -- ^ Loop has no body blocks
+  | SkipOk                          -- ^ Loop can be unrolled
+  deriving (Show, Eq)
+
+-- | Diagnose why a loop would or wouldn't be unrolled
+-- Useful for debugging optimization decisions
+diagnoseLoop :: UnrollConfig -> Map BlockId SSABlock -> Loop -> UnrollSkipReason
+diagnoseLoop config blockMap loop
+  | latchCount /= 1 = SkipMultipleLatches latchCount
+  | not (null (loopChildren loop)) = SkipNestedLoops (length (loopChildren loop))
+  | bodySize > ucMaxBodySize config = SkipBodyTooLarge bodySize (ucMaxBodySize config)
+  | Map.notMember (loopHeader loop) blockMap = SkipNoHeader
+  | otherwise = case analyzeTripCount blockMap loop of
+      ConstantTrip n
+        | n > ucFullUnrollLimit config -> SkipTripCountTooLarge n (ucFullUnrollLimit config)
+        | otherwise -> SkipOk
+      UnknownTrip -> SkipOk  -- Partial unrolling still possible
+  where
+    latchCount = length (loopLatches loop)
+    bodySize = computeBodySize blockMap loop
 
 -- | Unroll result
 data UnrollResult = UnrollResult
