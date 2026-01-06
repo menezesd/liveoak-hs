@@ -11,6 +11,10 @@ module LiveOak.Compiler
   , compileWithSSA
   , compileWithSSAOptimizations
 
+    -- * x86_64 Compilation
+  , compileToX86
+  , compileToX86WithWarnings
+
     -- * Compilation Stages
   , CompilationStage (..)
 
@@ -30,6 +34,7 @@ import LiveOak.Validation (validateEntrypoint, validateEntrypointErrors)
 import qualified LiveOak.Peephole as Peephole
 import qualified LiveOak.SSA as SSA
 import qualified LiveOak.SSACodegen as SSACodegen
+import qualified LiveOak.X86Codegen as X86Codegen
 
 -- | Compilation stages.
 data CompilationStage
@@ -129,3 +134,37 @@ compileWithSSA path source =
 compileWithSSAOptimizations :: FilePath -> Text -> Result Text
 compileWithSSAOptimizations path source =
   fst <$> compileCore defaultConfig path source
+
+--------------------------------------------------------------------------------
+-- x86_64 Compilation
+--------------------------------------------------------------------------------
+
+-- | Compile source text to x86_64 assembly (GAS syntax).
+compileToX86 :: FilePath -> Text -> Result Text
+compileToX86 path source = fst <$> compileToX86WithWarnings path source
+
+-- | Compile source text to x86_64 assembly, also returning warnings.
+compileToX86WithWarnings :: FilePath -> Text -> Result (Text, [Warning])
+compileToX86WithWarnings path source = do
+  -- Parse program and build symbol table
+  (program, symbols) <- parseProgram path source
+
+  -- Validate entry point
+  validateEntrypoint symbols
+
+  -- Semantic analysis
+  checkProgram program symbols
+
+  -- Collect warnings
+  let warnings = collectWarnings program symbols
+
+  -- AST optimization and SSA conversion
+  let optimizedProgram = optimize symbols program
+      ssaProg = SSA.toSSAWithCFG symbols optimizedProgram
+      -- Use safe SSA pipeline for x86 (excludes loop unrolling and LICM)
+      finalSSA = SSA.ssaX86SafePipeline ssaProg
+
+  -- x86_64 code generation
+  code <- X86Codegen.generateX86FromSSA finalSSA symbols
+
+  return (code, warnings)

@@ -57,6 +57,7 @@ module LiveOak.SSA
   , optimizeSSAProgram  -- ^ Optimize SSA program, return SSA (for use with SSACodegen)
   , optimizeSSAProgramWithSymbols  -- ^ Optimize with SROA (needs symbols)
   , ssaBasicPipeline    -- ^ Basic safe SSA optimizations
+  , ssaX86SafePipeline  -- ^ Conservative pipeline for x86 (excludes loop transforms)
   , ssaTailCallOpt      -- ^ Tail call optimization
   , strengthReduce      -- ^ Strength reduction (multiply -> add in loops)
   , ssaInline           -- ^ Function inlining
@@ -830,6 +831,25 @@ ssaBasicPipeline =
   . strengthReduce
   . ssaUnroll
   . licm
+  . pre
+  . gvn
+  . sccp
+  . ssaJumpThread
+  . ssaInline
+  . ssaTailCallOpt
+  . Opt.simplifyPhis
+
+-- | SSA pipeline for x86 code generation
+-- Includes loop optimizations (unroll, LICM)
+ssaX86SafePipeline :: SSAProgram -> SSAProgram
+ssaX86SafePipeline =
+    Opt.ssaDeadCodeElim
+  . Opt.ssaPeephole
+  . Opt.ssaCopyProp
+  . ssaDSE
+  . strengthReduce
+  . ssaUnroll  -- Loop unrolling
+  . licm       -- LICM
   . pre
   . gvn
   . sccp

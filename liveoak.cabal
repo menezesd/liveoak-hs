@@ -82,6 +82,11 @@ library
                     , LiveOak.LoadElim
                     , LiveOak.LCSSA
                     , LiveOak.InstCombine
+                    , LiveOak.X86
+                    , LiveOak.X86Codegen
+                    , LiveOak.X86Runtime
+                    , LiveOak.X86Liveness
+                    , LiveOak.X86RegAlloc
     build-depends:    base >= 4.17 && < 5
                     , text >= 2.0
                     , megaparsec >= 9.0
