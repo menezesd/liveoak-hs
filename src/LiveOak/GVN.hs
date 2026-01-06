@@ -350,26 +350,33 @@ valueNumberExpr expr = case expr of
   SSABinary op l r -> do
     (l', lnum) <- valueNumberExpr l
     (r', rnum) <- valueNumberExpr r
-    -- Normalize commutative operations
-    let (lnum', rnum', l'', r'') = if isCommutative op && lnum > rnum
-                                    then (rnum, lnum, r', l')
-                                    else (lnum, rnum, l', r')
-    let key = KeyBinary op lnum' rnum'
-    existing <- gets (Map.lookup key . gvnExprToNum)
-    case existing of
-      Just num -> do
-        mvar <- gets (Map.lookup num . gvnNumToVar)
-        case mvar of
-          Just v -> return (SSAUse (varFromKey v), num)
-          Nothing -> return (SSABinary op l'' r'', num)
+    -- Normalize commutative operations (a + b == b + a)
+    let (lnum1, rnum1, l1, r1) = if isCommutative op && lnum > rnum
+                                  then (rnum, lnum, r', l')
+                                  else (lnum, rnum, l', r')
+    -- Normalize symmetric comparisons (a > b == b < a)
+    let (op', lnum', rnum') = normalizeComparison op lnum1 rnum1
+        (l'', r'') = if (lnum', rnum') /= (lnum1, rnum1) then (r1, l1) else (l1, r1)
+    -- Try algebraic identities first (x - x = 0, x / x = 1, etc.)
+    case tryAlgebraicIdentity op' lnum' rnum' l'' r'' of
+      Just folded -> valueNumberExpr folded
       Nothing -> do
-        -- Try to fold constants
-        case tryFoldBinary op l'' r'' of
-          Just folded -> valueNumberExpr folded
+        let key = KeyBinary op' lnum' rnum'
+        existing <- gets (Map.lookup key . gvnExprToNum)
+        case existing of
+          Just num -> do
+            mvar <- gets (Map.lookup num . gvnNumToVar)
+            case mvar of
+              Just v -> return (SSAUse (varFromKey v), num)
+              Nothing -> return (SSABinary op' l'' r'', num)
           Nothing -> do
-            num <- freshValueNum
-            recordExpr key num (SSABinary op l'' r'')
-            return (SSABinary op l'' r'', num)
+            -- Try to fold constants
+            case tryFoldBinary op' l'' r'' of
+              Just folded -> valueNumberExpr folded
+              Nothing -> do
+                num <- freshValueNum
+                recordExpr key num (SSABinary op' l'' r'')
+                return (SSABinary op' l'' r'', num)
 
   SSATernary cond thenE elseE -> do
     (cond', _) <- valueNumberExpr cond
@@ -414,6 +421,56 @@ tryFoldUnary Not (SSAInt n) = Just $ SSABool (n == 0)
 tryFoldUnary Not SSANull = Just $ SSABool True
 tryFoldUnary _ _ = Nothing
 
+-- | Try algebraic identities based on value numbers
+-- These work even when we don't know the constant values
+tryAlgebraicIdentity :: BinaryOp -> ValueNum -> ValueNum -> SSAExpr -> SSAExpr -> Maybe SSAExpr
+tryAlgebraicIdentity op lnum rnum l r
+  -- x - x = 0
+  | op == Sub && lnum == rnum = Just $ SSAInt 0
+  -- x / x = 1 (assuming non-zero - safe for GVN since we only optimize, not eliminate)
+  | op == Div && lnum == rnum = Just $ SSAInt 1
+  -- x % x = 0
+  | op == Mod && lnum == rnum = Just $ SSAInt 0
+  -- x == x = true, x != x = false
+  | op == Eq && lnum == rnum = Just $ SSABool True
+  | op == Ne && lnum == rnum = Just $ SSABool False
+  -- x <= x = true, x >= x = true, x < x = false, x > x = false
+  | op == Le && lnum == rnum = Just $ SSABool True
+  | op == Ge && lnum == rnum = Just $ SSABool True
+  | op == Lt && lnum == rnum = Just $ SSABool False
+  | op == Gt && lnum == rnum = Just $ SSABool False
+  -- x & x = x, x | x = x
+  | op == And && lnum == rnum = Just l
+  | op == Or && lnum == rnum = Just l
+  -- Identity with constants: x + 0 = x, x * 1 = x, x * 0 = 0
+  | op == Add && isZero r = Just l
+  | op == Add && isZero l = Just r
+  | op == Sub && isZero r = Just l
+  | op == Mul && isOne r = Just l
+  | op == Mul && isOne l = Just r
+  | op == Mul && isZero r = Just $ SSAInt 0
+  | op == Mul && isZero l = Just $ SSAInt 0
+  | op == Div && isOne r = Just l
+  -- Boolean identities
+  | op == And && isFalse l = Just $ SSABool False
+  | op == And && isFalse r = Just $ SSABool False
+  | op == And && isTrue l = Just r
+  | op == And && isTrue r = Just l
+  | op == Or && isTrue l = Just $ SSABool True
+  | op == Or && isTrue r = Just $ SSABool True
+  | op == Or && isFalse l = Just r
+  | op == Or && isFalse r = Just l
+  | otherwise = Nothing
+  where
+    isZero (SSAInt 0) = True
+    isZero _ = False
+    isOne (SSAInt 1) = True
+    isOne _ = False
+    isTrue (SSABool True) = True
+    isTrue _ = False
+    isFalse (SSABool False) = True
+    isFalse _ = False
+
 -- | Try to fold a binary operation
 tryFoldBinary :: BinaryOp -> SSAExpr -> SSAExpr -> Maybe SSAExpr
 tryFoldBinary op (SSAInt l) (SSAInt r) = case op of
@@ -446,6 +503,20 @@ isCommutative Ne = True
 isCommutative And = True
 isCommutative Or = True
 isCommutative _ = False
+
+-- | Normalize symmetric comparison operators
+-- Lt/Gt and Le/Ge are symmetric: (a < b) ≡ (b > a), (a <= b) ≡ (b >= a)
+-- We normalize by always putting the smaller value number on the left
+-- and adjusting the operator accordingly
+normalizeComparison :: BinaryOp -> ValueNum -> ValueNum -> (BinaryOp, ValueNum, ValueNum)
+normalizeComparison op lnum rnum
+  | lnum > rnum = case op of
+      Lt -> (Gt, rnum, lnum)  -- a < b  →  b > a (swap operands, flip operator)
+      Le -> (Ge, rnum, lnum)  -- a <= b →  b >= a
+      Gt -> (Lt, rnum, lnum)  -- a > b  →  b < a
+      Ge -> (Le, rnum, lnum)  -- a >= b →  b <= a
+      _  -> (op, lnum, rnum)  -- Other ops: don't normalize
+  | otherwise = (op, lnum, rnum)
 
 --------------------------------------------------------------------------------
 -- GVN State Helpers

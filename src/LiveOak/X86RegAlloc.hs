@@ -121,7 +121,10 @@ expireOldIntervals pos state =
 assignRegister :: ScanState -> LiveInterval -> ScanState
 assignRegister state interval =
   case ssFreeRegs state of
-    [] -> error "assignRegister: no free registers"  -- Should not happen
+    [] ->
+      -- No free registers - fall back to spilling (defensive, should not happen
+      -- since caller checks ssFreeRegs, but better than crashing)
+      spillAtInterval state interval
     (reg:rest) ->
       let newActive = insertByEnd (interval, reg) (ssActive state)
       in state

@@ -153,10 +153,15 @@ exprPointsTo pt = \case
         pt' = pt { ptAllocCounter = allocId + 1 }
     in (Set.singleton (LocAlloc allocId), pt')
 
-  SSAFieldAccess base _field ->
-    -- Field access could point to anything the base points to
+  SSAFieldAccess base field ->
+    -- Field-sensitive: track which field is being accessed on which base
+    -- This allows us to determine that obj.x and obj.y don't alias
     let baseLocs = exprToLocs pt base
-    in (baseLocs, pt)  -- Conservative: same as base
+        -- Create field locations for each possible base
+        -- Use field name hash as offset approximation (real offset would need type info)
+        fieldOffset = abs (hash field) `mod` 1000
+        fieldLocs = Set.map (\bl -> LocField bl field fieldOffset) baseLocs
+    in (fieldLocs, pt)
 
   SSACall _ _ ->
     -- Function calls can return anything
@@ -169,13 +174,21 @@ exprPointsTo pt = \case
   -- Non-pointer expressions don't have locations
   _ -> (Set.empty, pt)
 
+-- | Simple hash for field names (for offset approximation)
+hash :: String -> Int
+hash = foldl' (\h c -> 31 * h + fromEnum c) 0
+
 -- | Get points-to set for an expression (without updating state)
 exprToLocs :: PointsToInfo -> SSAExpr -> Set AbstractLoc
 exprToLocs pt = \case
   SSAThis -> Set.singleton LocThis
   SSAUse var -> lookupPointsTo (ssaName var, ssaVersion var) pt
   SSANewObject _ _ -> Set.singleton LocUnknown  -- Can't determine without context
-  SSAFieldAccess base _ -> exprToLocs pt base
+  SSAFieldAccess base field ->
+    -- Field-sensitive: create LocField locations
+    let baseLocs = exprToLocs pt base
+        fieldOffset = abs (hash field) `mod` 1000
+    in Set.map (\bl -> LocField bl field fieldOffset) baseLocs
   _ -> Set.empty
 
 -- | Lookup points-to set for a variable
