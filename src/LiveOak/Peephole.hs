@@ -676,7 +676,7 @@ removeUnreferencedLabels instrs =
   let referenced = collectReferencedLabels instrs
   in filter (keepLabel referenced) instrs
   where
-    keepLabel _ (Label lbl) = lbl `Set.member` collectReferencedLabels instrs
+    keepLabel refs (Label lbl) = lbl `Set.member` refs
     keepLabel _ _ = True
 
 -- | Collect all labels that are jumped to

@@ -47,6 +47,7 @@
 module LiveOak.SCCP
   ( -- * SCCP Optimization
     runSCCP
+  , applySCCP
   , SCCPResult(..)
 
     -- * Lattice Values
@@ -65,6 +66,7 @@ import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.List (foldl')
+import Data.Maybe (mapMaybe)
 import Control.Monad (foldM, forM, forM_, when, unless)
 import Control.Monad.State.Strict
 
@@ -448,3 +450,111 @@ setVarValue var val = do
 addCFGEdge :: BlockId -> BlockId -> SCCP ()
 addCFGEdge from to = do
   modify $ \s -> s { sccpCFGWorklist = (from, to) : sccpCFGWorklist s }
+
+--------------------------------------------------------------------------------
+-- Apply SCCP Results
+--------------------------------------------------------------------------------
+
+-- | Apply SCCP results to transform blocks:
+-- 1. Remove unreachable blocks
+-- 2. Simplify conditional branches with known conditions
+-- 3. Update phi nodes to remove dead predecessor edges
+-- 4. Replace constant variables with their values
+applySCCP :: SCCPResult -> [SSABlock] -> [SSABlock]
+applySCCP result blocks =
+  let reachable = sccpReachableBlocks result
+      constVals = sccpConstValues result
+      -- Filter to only reachable blocks
+      liveBlocks = filter (\b -> Set.member (blockLabel b) reachable) blocks
+      -- Transform each block
+      transformed = map (transformBlock reachable constVals) liveBlocks
+  in transformed
+
+-- | Transform a single block
+transformBlock :: Set BlockId -> Map VarKey LatticeValue -> SSABlock -> SSABlock
+transformBlock reachable constVals block@SSABlock{..} =
+  block
+    { blockPhis = transformPhis reachable constVals blockPhis
+    , blockInstrs = transformInstrs reachable constVals blockInstrs
+    }
+
+-- | Transform phi nodes to remove dead predecessor edges and substitute constants
+transformPhis :: Set BlockId -> Map VarKey LatticeValue -> [PhiNode] -> [PhiNode]
+transformPhis reachable constVals = mapMaybe transformPhi
+  where
+    transformPhi phi@PhiNode{..} =
+      let -- Remove arguments from unreachable predecessors
+          liveArgs = [(pred, v) | (pred, v) <- phiArgs, Set.member pred reachable]
+          -- Substitute constants in arguments
+          newArgs = [(pred, substConstVar constVals v) | (pred, v) <- liveArgs]
+      in case newArgs of
+        [] -> Nothing  -- All predecessors dead, remove phi
+        [(_, v)] ->
+          -- Single predecessor - phi becomes a simple copy
+          -- We keep it for now; DCE will clean it up if unused
+          Just phi { phiArgs = [(fst (head liveArgs), v)] }
+        _ -> Just phi { phiArgs = newArgs }
+
+    substConstVar constVals v =
+      case Map.lookup (varKey v) constVals of
+        Just (ConstInt _) -> v  -- Keep variable, constant prop happens in instrs
+        Just (ConstBool _) -> v
+        Just ConstNull -> v
+        _ -> v
+
+-- | Transform instructions
+transformInstrs :: Set BlockId -> Map VarKey LatticeValue -> [SSAInstr] -> [SSAInstr]
+transformInstrs reachable constVals = map transformInstr
+  where
+    transformInstr = \case
+      -- Substitute constants in assignments
+      SSAAssign var expr ->
+        SSAAssign var (substConstExpr constVals expr)
+
+      -- Simplify branches with known conditions
+      SSABranch cond thenB elseB ->
+        let cond' = substConstExpr constVals cond
+        in case evaluateCond cond' of
+          Just True -> SSAJump thenB   -- Branch always taken
+          Just False -> SSAJump elseB  -- Branch never taken
+          Nothing -> SSABranch cond' thenB elseB
+
+      -- Substitute constants in returns
+      SSAReturn (Just expr) ->
+        SSAReturn (Just $ substConstExpr constVals expr)
+
+      -- Substitute constants in field stores
+      SSAFieldStore target field off value ->
+        SSAFieldStore (substConstExpr constVals target) field off (substConstExpr constVals value)
+
+      -- Substitute constants in expression statements
+      SSAExprStmt expr ->
+        SSAExprStmt (substConstExpr constVals expr)
+
+      instr -> instr
+
+    -- Evaluate a condition to a boolean if possible
+    evaluateCond (SSABool b) = Just b
+    evaluateCond (SSAInt n) = Just (n /= 0)
+    evaluateCond SSANull = Just False
+    evaluateCond _ = Nothing
+
+-- | Substitute constant values in an expression
+substConstExpr :: Map VarKey LatticeValue -> SSAExpr -> SSAExpr
+substConstExpr constVals = go
+  where
+    go = \case
+      SSAUse var ->
+        case Map.lookup (varKey var) constVals of
+          Just (ConstInt n) -> SSAInt n
+          Just (ConstBool b) -> SSABool b
+          Just ConstNull -> SSANull
+          _ -> SSAUse var
+      SSAUnary op e -> SSAUnary op (go e)
+      SSABinary op l r -> SSABinary op (go l) (go r)
+      SSATernary c t e -> SSATernary (go c) (go t) (go e)
+      SSACall n args -> SSACall n (map go args)
+      SSAInstanceCall t m args -> SSAInstanceCall (go t) m (map go args)
+      SSANewObject cn args -> SSANewObject cn (map go args)
+      SSAFieldAccess t f -> SSAFieldAccess (go t) f
+      e -> e

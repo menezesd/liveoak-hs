@@ -190,11 +190,19 @@ processChildLocal blockMap domTree baseState (acc, stGlobal) childId = do
 
 resetLocalState :: GVNState -> GVNState
 resetLocalState st = st
-  { gvnExprToNum = Map.empty
+  { -- Preserve constant expressions (they're always valid across iterations)
+    gvnExprToNum = Map.filterWithKey isConstantKey (gvnExprToNum st)
   , gvnVarToNum = Map.empty
   , gvnNumToVar = Map.empty
   , gvnReplacements = Map.empty
   }
+  where
+    -- Constant keys are always safe to preserve
+    isConstantKey (KeyInt _) _ = True
+    isConstantKey (KeyBool _) _ = True
+    isConstantKey KeyNull _ = True
+    isConstantKey (KeyStr _) _ = True
+    isConstantKey _ _ = False
 
 -- | Process a single block
 processBlock :: SSABlock -> GVN SSABlock

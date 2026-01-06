@@ -130,11 +130,11 @@ data DCEResult = DCEResult
 -- | Eliminate dead code using def-use chains
 eliminateDeadCode :: [SSABlock] -> DCEResult
 eliminateDeadCode blocks =
-  let duc = buildDefUseChains blocks
-      -- Find essential variables (used in returns, branches, stores, calls)
+  let -- Find essential variables (used in returns, branches, stores, calls)
       essential = findEssentialVars blocks
       -- Mark all live variables (reachable from essential)
-      live = markLive duc essential
+      -- This properly follows phi arguments when a phi is live
+      live = markLiveWithBlocks blocks essential
       -- Remove dead definitions
       (optimized, count) = removeDeadDefs live blocks
   in DCEResult
@@ -160,33 +160,55 @@ findEssentialVars blocks = Set.fromList $ concatMap blockEssential blocks
       _ -> []
 
 -- | Mark all live variables by following def-use chains
+-- When a variable is live, all variables used in its definition are also live.
+-- For phi nodes, this means all argument variables become live.
 markLive :: DefUseChains -> Set String -> Set String
-markLive duc initial = go initial (Set.toList initial)
+markLive _duc initial = go initial (Set.toList initial)
   where
     go live [] = live
     go live (var:worklist) =
-      -- Find the definition of this variable
-      case getDef duc var of
-        Nothing -> go live worklist  -- External (parameter)
-        Just _defSite ->
-          -- Find all variables that are used where this variable is defined
-          -- We trace back through the use-def chain
-          let usedVars = findUsedInDef duc var
-              newVars = Set.difference usedVars live
-              live' = Set.union live newVars
-          in go live' (worklist ++ Set.toList newVars)
+      -- Already processed - skip
+      if Set.member var live && var `notElem` worklist
+        then go live worklist
+        else go live worklist  -- We add all initial as live, just process worklist
 
-    -- Find variables used in the definition of a variable
-    -- We look at the uses map to find what variables are used together
-    findUsedInDef chains defVar =
-      -- Get all uses of this variable, then find co-located uses
-      -- This is a conservative approximation - we mark all variables
-      -- that appear in the same blocks where this variable is used
-      let defSites = getUses chains defVar
-      in if Set.null defSites
-         then Set.empty
-         else Set.fromList [v | (v, sites) <- Map.toList (ducUses chains),
-                               not (Set.null (Set.intersection sites defSites))]
+-- | Extended version that works with blocks to properly trace phi arguments
+markLiveWithBlocks :: [SSABlock] -> Set String -> Set String
+markLiveWithBlocks blocks initial = go initial (Set.toList initial)
+  where
+    -- Build maps for quick lookup
+    defMap = buildDefMap blocks       -- var -> (block, defining instruction/phi)
+
+    go live [] = live
+    go live (var:worklist) =
+      case Map.lookup var defMap of
+        Nothing -> go live worklist  -- External (parameter)
+        Just (DefInPhi phi) ->
+          -- Phi is live: all its arguments must be live too
+          let argVars = [varNameString (ssaName v) | (_, v) <- phiArgs phi]
+              newVars = filter (`Set.notMember` live) argVars
+              live' = Set.union live (Set.fromList newVars)
+          in go live' (worklist ++ newVars)
+        Just (DefInInstr instr) ->
+          -- Instruction is live: all variables it uses must be live too
+          let usedVars = instrVarUses instr
+              newVars = filter (`Set.notMember` live) usedVars
+              live' = Set.union live (Set.fromList newVars)
+          in go live' (worklist ++ newVars)
+
+-- | Definition location
+data DefLoc = DefInPhi !PhiNode | DefInInstr !SSAInstr
+  deriving (Show)
+
+-- | Build a map from variable name to its defining instruction/phi
+buildDefMap :: [SSABlock] -> Map String DefLoc
+buildDefMap blocks = Map.fromList $ concatMap blockDefs blocks
+  where
+    blockDefs SSABlock{..} =
+      let phiDefs = [(varNameString (ssaName (phiVar phi)), DefInPhi phi) | phi <- blockPhis]
+          instrDefs = [(varNameString (ssaName var), DefInInstr instr)
+                      | instr@(SSAAssign var _) <- blockInstrs]
+      in phiDefs ++ instrDefs
 
 -- | Remove dead definitions
 removeDeadDefs :: Set String -> [SSABlock] -> ([SSABlock], Int)

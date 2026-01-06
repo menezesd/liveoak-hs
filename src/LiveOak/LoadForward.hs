@@ -77,51 +77,99 @@ forwardLoads blocks =
     , lfForwarded = sum counts
     }
 
+-- | Value substitution map for chaining
+type ValueSubst = Map VarKey SSAExpr
+
 -- | Forward loads in a single block (simple version without alias analysis)
 forwardBlockLoadsSimple :: SSABlock -> (SSABlock, Int)
 forwardBlockLoadsSimple block@SSABlock{..} =
-  let (instrs', count) = processInstrsSimple Map.empty 0 blockInstrs
+  let (instrs', count) = processInstrsSimple Map.empty Map.empty 0 blockInstrs
   in (block { blockInstrs = instrs' }, count)
 
 -- | Process instructions for load forwarding (simple version)
-processInstrsSimple :: Map (TargetKey, String) SSAExpr -> Int -> [SSAInstr] -> ([SSAInstr], Int)
-processInstrsSimple _ count [] = ([], count)
-processInstrsSimple stores count (instr:rest) =
+-- Now also tracks value substitutions for chaining
+processInstrsSimple :: Map (TargetKey, String) SSAExpr -> ValueSubst -> Int -> [SSAInstr] -> ([SSAInstr], Int)
+processInstrsSimple _ _ count [] = ([], count)
+processInstrsSimple stores valSubst count (instr:rest) =
   case instr of
     -- Track stores (using target string representation for simple matching)
     SSAFieldStore target field _ value ->
-      let key = (targetKey target, field)
-          stores' = Map.insert key value stores
-          (rest', count') = processInstrsSimple stores' count rest
-      in (instr : rest', count')
+      let -- Substitute values in the store target and value for chaining
+          target' = substValues valSubst target
+          value' = substValues valSubst value
+          key = (targetKey target', field)
+          stores' = Map.insert key value' stores
+          (rest', count') = processInstrsSimple stores' valSubst count rest
+      in (SSAFieldStore target' field 0 value' : rest', count')
 
     -- Forward loads in assignments
     SSAAssign var expr ->
-      let (expr', didForward) = forwardExprSimple stores expr
+      let -- First apply value substitutions for chaining
+          exprSubst = substValues valSubst expr
+          -- Then try to forward field loads
+          (expr', didForward) = forwardExprSimple stores exprSubst
           count' = if didForward then count + 1 else count
+          -- Track this assignment for value chaining if it's a simple value
+          varK = (ssaName var, ssaVersion var)
+          valSubst' = case expr' of
+            -- Track constants and variable copies
+            SSAInt _ -> Map.insert varK expr' valSubst
+            SSABool _ -> Map.insert varK expr' valSubst
+            SSANull -> Map.insert varK expr' valSubst
+            SSAUse v ->
+              -- Follow the chain: if v maps to something, use that
+              let vKey = (ssaName v, ssaVersion v)
+              in case Map.lookup vKey valSubst of
+                Just ultimate -> Map.insert varK ultimate valSubst
+                Nothing -> Map.insert varK expr' valSubst
+            _ -> valSubst
           -- If the expression is a call, invalidate stores
           stores' = if hasCall expr' then Map.empty else stores
-          (rest', count'') = processInstrsSimple stores' count' rest
+          (rest', count'') = processInstrsSimple stores' valSubst' count' rest
       in (SSAAssign var expr' : rest', count'')
 
     -- Calls invalidate all stores
     SSAExprStmt expr | hasCall expr ->
-      let (rest', count') = processInstrsSimple Map.empty count rest
+      let (rest', count') = processInstrsSimple Map.empty valSubst count rest
       in (instr : rest', count')
 
     -- Returns may escape objects
-    SSAReturn (Just _) ->
-      let (rest', count') = processInstrsSimple Map.empty count rest
-      in (instr : rest', count')
+    SSAReturn (Just expr) ->
+      let expr' = substValues valSubst expr
+          (rest', count') = processInstrsSimple Map.empty valSubst count rest
+      in (SSAReturn (Just expr') : rest', count')
+
+    -- Substitute in branch conditions
+    SSABranch cond thenB elseB ->
+      let cond' = substValues valSubst cond
+      in ([SSABranch cond' thenB elseB], count)
 
     -- Control flow ends the block
     SSAJump _ -> ([instr], count)
-    SSABranch _ _ _ -> ([instr], count)
 
     -- Other instructions pass through
     _ ->
-      let (rest', count') = processInstrsSimple stores count rest
+      let (rest', count') = processInstrsSimple stores valSubst count rest
       in (instr : rest', count')
+
+-- | Substitute known values in an expression
+substValues :: ValueSubst -> SSAExpr -> SSAExpr
+substValues valSubst = go
+  where
+    go = \case
+      SSAUse var ->
+        let key = (ssaName var, ssaVersion var)
+        in case Map.lookup key valSubst of
+          Just val -> val
+          Nothing -> SSAUse var
+      SSAUnary op e -> SSAUnary op (go e)
+      SSABinary op l r -> SSABinary op (go l) (go r)
+      SSATernary c t e -> SSATernary (go c) (go t) (go e)
+      SSACall n args -> SSACall n (map go args)
+      SSAInstanceCall t m args -> SSAInstanceCall (go t) m (map go args)
+      SSANewObject cn args -> SSANewObject cn (map go args)
+      SSAFieldAccess t f -> SSAFieldAccess (go t) f
+      e -> e
 
 -- | Try to forward a field access in an expression
 forwardExprSimple :: Map (TargetKey, String) SSAExpr -> SSAExpr -> (SSAExpr, Bool)
