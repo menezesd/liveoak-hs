@@ -266,16 +266,16 @@ computeLiveInfo graph =
   in LiveInfo defs uses
 
 -- | Estimate pressure change from scheduling instruction n
+-- The change is: (+1 for each defined) - (+0 for consumed, conservative estimate)
+-- A more accurate estimate would track last uses, but this is safe
 estimatePressureChange :: LiveInfo -> Set.Set Int -> Int -> Int
-estimatePressureChange LiveInfo{..} liveNow n =
+estimatePressureChange LiveInfo{..} _liveNow n =
   let defined = IntMap.findWithDefault Set.empty n liDefs
-      used = IntMap.findWithDefault Set.empty n liUses
-      -- New values introduced
+      -- New values introduced (each definition increases pressure)
       newLive = Set.size defined
-      -- Values consumed (no longer needed after this use)
-      -- Simplified: assume used values are still live
-      consumed = 0
-  in newLive - consumed
+      -- Note: We conservatively assume values aren't consumed (last used) here
+      -- This makes scheduling slightly less optimal but is always safe
+  in newLive
 
 -- | Update live set after scheduling instruction n
 updateLiveSet :: LiveInfo -> Set.Set Int -> Int -> Set.Set Int

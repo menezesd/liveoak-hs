@@ -122,6 +122,7 @@ runIterations config n prog stats =
      else runIterations config (n - 1) prog' stats'
 
 -- | Run one iteration of the pipeline
+-- Pass ordering preserves original behavior while being documented
 runOneIteration :: OptConfig -> SSAProgram -> (SSAProgram, OptStats)
 runOneIteration OptConfig{..} prog =
   let flags = ocPasses

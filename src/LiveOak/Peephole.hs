@@ -205,7 +205,20 @@ jumpThread :: [SamInstr] -> [SamInstr]
 jumpThread instrs =
   let labelMap = buildJumpMap instrs
       finalMap = resolveChains labelMap
-  in eliminateBranchToBranch $ map (rewriteJump finalMap) instrs
+  in eliminateBranchToBranch $ eliminateDeadAfterJump $ map (rewriteJump finalMap) instrs
+
+-- | Remove dead code after unconditional jumps (until next label)
+-- This is safe because code after JUMP is unreachable
+eliminateDeadAfterJump :: [SamInstr] -> [SamInstr]
+eliminateDeadAfterJump = go
+  where
+    go [] = []
+    go (x@(JUMP _) : rest) = x : go (dropToNextLabel rest)
+    go (x : rest) = x : go rest
+
+    dropToNextLabel [] = []
+    dropToNextLabel (x@(Label _) : rest) = x : rest
+    dropToNextLabel (_ : rest) = dropToNextLabel rest
 
 -- | Build a map from labels to their immediate jump targets.
 -- A label maps to a target if the label is immediately followed by JUMP target.
