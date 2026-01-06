@@ -48,19 +48,24 @@ data PhiSimplifyResult = PhiSimplifyResult
 --------------------------------------------------------------------------------
 
 -- | Simplify phi nodes in blocks (takes pre-built CFG)
+-- Uses iterative simplification to handle phi chains.
 simplifyPhis :: CFG -> [SSABlock] -> PhiSimplifyResult
-simplifyPhis _cfg blocks =
-  let -- First pass: identify which phis can be simplified
-      (substMap, elimCount) = collectSimplifications blocks
-      -- Apply substitutions
-      blocks' = map (applyPhiSubst substMap) blocks
-      -- Remove eliminated phis
-      blocks'' = map (removeEliminatedPhis substMap) blocks'
-  in PhiSimplifyResult
-    { psOptBlocks = blocks''
-    , psSimplified = Map.size substMap
-    , psEliminated = elimCount
-    }
+simplifyPhis _cfg blocks = go 10 blocks Map.empty 0
+  where
+    go :: Int -> [SSABlock] -> Map VarKey SSAExpr -> Int -> PhiSimplifyResult
+    go 0 bs accSubst accElim = PhiSimplifyResult bs (Map.size accSubst) accElim
+    go n bs accSubst accElim =
+      let -- Identify which phis can be simplified this iteration
+          (newSubst, newElim) = collectSimplifications bs
+          -- Combine with previous substitutions
+          combinedSubst = Map.union newSubst accSubst
+          -- Apply substitutions
+          bs' = map (applyPhiSubst newSubst) bs
+          -- Remove eliminated phis
+          bs'' = map (removeEliminatedPhis newSubst) bs'
+      in if Map.null newSubst
+         then PhiSimplifyResult bs'' (Map.size combinedSubst) (accElim + newElim)
+         else go (n - 1) bs'' combinedSubst (accElim + newElim)
 
 -- | Simplify phi nodes in a method
 simplifyPhisMethod :: SSAMethod -> PhiSimplifyResult
@@ -81,6 +86,11 @@ simplifyBlockPhis SSABlock{..} =
   mapMaybe simplifyPhi blockPhis
 
 -- | Try to simplify a single phi node
+-- Handles:
+-- 1. Same-value phi: all arguments are the same value
+-- 2. Self-referential phi: phi refers to itself plus one other value
+-- 3. Single-argument phi: phi has only one incoming value
+-- 4. Copy phi: phi(x) where all non-self args resolve to same variable
 simplifyPhi :: PhiNode -> Maybe (VarKey, SSAExpr)
 simplifyPhi PhiNode{..} =
   let phiKey = (ssaName phiVar, ssaVersion phiVar)
@@ -90,10 +100,20 @@ simplifyPhi PhiNode{..} =
       uniqueVals = Map.elems $ Map.fromList
         [((ssaName v, ssaVersion v), v) | v <- map snd nonSelfArgs]
   in case uniqueVals of
-    -- All arguments are the same (or all self-references)
-    [] -> Nothing  -- Degenerate case
-    [v] -> Just (phiKey, SSAUse v)  -- Can replace phi with single value
-    -- Cannot simplify
+    -- Case 1: Single incoming value (ignoring self-refs) - can replace with that value
+    [v] -> Just (phiKey, SSAUse v)
+
+    -- Case 2: Two values where one dominates - check if they're related
+    -- e.g., phi(x_1, x_2) might be simplifiable if x_1 and x_2 are both versions of x
+    -- and one is defined in a dominating block
+    [v1, v2]
+      | ssaName v1 == ssaName v2 ->
+          -- Same base variable, different versions - keep the phi for now
+          -- (would need dominator info to pick the right one)
+          Nothing
+      | otherwise -> Nothing
+
+    -- Case 3: Empty (degenerate) or too many unique values - cannot simplify
     _ -> Nothing
 
 -- | Apply substitutions to a block

@@ -59,7 +59,7 @@ data MethodInfo = MethodInfo
   { miName :: !String
   , miClassName :: !String
   , miSize :: !Int                    -- ^ Instruction count
-  , miCallCount :: !Int               -- ^ Number of call sites
+  , miCallCount :: !Int               -- ^ Number of outgoing calls (calls made BY this method)
   , miIsRecursive :: !Bool            -- ^ Calls itself?
   , miBlocks :: ![SSABlock]           -- ^ Method blocks
   , miParams :: ![SSAVar]             -- ^ Parameters
@@ -153,14 +153,19 @@ shouldInline h info
   | otherwise = inlineBenefit info > 0
 
 -- | Calculate inlining benefit (positive = should inline)
+-- Note: Without call graph info, we use a size-based heuristic.
+-- Smaller functions are more likely to benefit from inlining.
+-- Functions that call other functions (outgoing calls) are less beneficial
+-- because they have more complex behavior and may not optimize well.
 inlineBenefit :: MethodInfo -> Int
 inlineBenefit info =
-  let -- Benefit: eliminate call overhead (estimated at 10 instructions)
-      callOverhead = 10
-      benefit = miCallCount info * callOverhead
-      -- Cost: code size increase
-      cost = (miCallCount info - 1) * miSize info  -- -1 because we keep one copy
-  in benefit - cost
+  let -- Small functions (< 10 instrs) likely benefit from inlining
+      sizeBonus = max 0 (15 - miSize info)
+      -- Functions that make many calls are more complex, penalize
+      callPenalty = miCallCount info * 5
+      -- Leaf functions (no calls) get a bonus
+      leafBonus = if miCallCount info == 0 then 10 else 0
+  in sizeBonus + leafBonus - callPenalty
 
 --------------------------------------------------------------------------------
 -- Inlining Transformation

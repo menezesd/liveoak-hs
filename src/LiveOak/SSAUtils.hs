@@ -4,15 +4,23 @@
 -- | Shared SSA Utilities.
 -- Common helper functions for traversing and analyzing SSA constructs.
 module LiveOak.SSAUtils
-  ( -- * Variable Uses
+  ( -- * Variable Uses (by name only)
     exprUses
   , instrUses
   , blockUses
   , phiUses
 
+    -- * Variable Uses (with version info)
+  , exprVarKeys
+  , instrVarKeys
+  , blockVarKeys
+  , phiVarKeys
+
     -- * Variable Definitions
   , instrDefs
   , blockDefs
+  , instrDefKey
+  , blockDefKeys
 
     -- * Expression Predicates
   , isPure
@@ -102,20 +110,71 @@ blockUses SSABlock{..} = Set.unions $
   map phiUses blockPhis ++ map instrUses blockInstrs
 
 --------------------------------------------------------------------------------
+-- Variable Uses (with version info)
+--------------------------------------------------------------------------------
+
+-- | Get all variable keys (name + version) used in an expression
+-- This is an alias for collectVarKeys but more discoverable.
+exprVarKeys :: SSAExpr -> Set VarKey
+exprVarKeys = \case
+  SSAUse var -> Set.singleton (ssaName var, ssaVersion var)
+  SSAUnary _ e -> exprVarKeys e
+  SSABinary _ l r -> exprVarKeys l `Set.union` exprVarKeys r
+  SSATernary c t e -> exprVarKeys c `Set.union` exprVarKeys t `Set.union` exprVarKeys e
+  SSACall _ args -> Set.unions (map exprVarKeys args)
+  SSAInstanceCall target _ args ->
+    exprVarKeys target `Set.union` Set.unions (map exprVarKeys args)
+  SSANewObject _ args -> Set.unions (map exprVarKeys args)
+  SSAFieldAccess target _ -> exprVarKeys target
+  _ -> Set.empty
+
+-- | Get all variable keys used in an instruction
+instrVarKeys :: SSAInstr -> Set VarKey
+instrVarKeys = \case
+  SSAAssign _ expr -> exprVarKeys expr
+  SSAReturn (Just expr) -> exprVarKeys expr
+  SSAReturn Nothing -> Set.empty
+  SSAJump _ -> Set.empty
+  SSABranch cond _ _ -> exprVarKeys cond
+  SSAFieldStore target _ _ value -> exprVarKeys target `Set.union` exprVarKeys value
+  SSAExprStmt expr -> exprVarKeys expr
+
+-- | Get all variable keys used in a phi node
+phiVarKeys :: PhiNode -> Set VarKey
+phiVarKeys PhiNode{..} = Set.fromList [(ssaName v, ssaVersion v) | (_, v) <- phiArgs]
+
+-- | Get all variable keys used in a block (including phi nodes)
+blockVarKeys :: SSABlock -> Set VarKey
+blockVarKeys SSABlock{..} = Set.unions $
+  map phiVarKeys blockPhis ++ map instrVarKeys blockInstrs
+
+--------------------------------------------------------------------------------
 -- Variable Definitions
 --------------------------------------------------------------------------------
 
--- | Get the variable defined by an instruction (if any)
+-- | Get the variable defined by an instruction (if any) - name only
 instrDefs :: SSAInstr -> Set String
 instrDefs = \case
   SSAAssign var _ -> Set.singleton (varNameString (ssaName var))
   _ -> Set.empty
 
--- | Get all variables defined in a block (phi nodes + instructions)
+-- | Get the variable key defined by an instruction (if any)
+instrDefKey :: SSAInstr -> Maybe VarKey
+instrDefKey = \case
+  SSAAssign var _ -> Just (ssaName var, ssaVersion var)
+  _ -> Nothing
+
+-- | Get all variables defined in a block (phi nodes + instructions) - names only
 blockDefs :: SSABlock -> Set String
 blockDefs SSABlock{..} = Set.fromList $
   [varNameString (ssaName (phiVar phi)) | phi <- blockPhis] ++
   [varNameString (ssaName var) | SSAAssign var _ <- blockInstrs]
+
+-- | Get all variable keys defined in a block (phi nodes + instructions)
+blockDefKeys :: SSABlock -> Set VarKey
+blockDefKeys SSABlock{..} = Set.fromList $
+  [(ssaName (phiVar phi), ssaVersion (phiVar phi)) | phi <- blockPhis] ++
+  [(ssaName var, ssaVersion var) | SSAAssign var _ <- blockInstrs]
 
 --------------------------------------------------------------------------------
 -- Expression Predicates

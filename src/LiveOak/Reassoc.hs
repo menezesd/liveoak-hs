@@ -199,13 +199,20 @@ foldConstants op consts = case op of
   Mul -> SSAInt $ product [n | SSAInt n <- consts]
   And -> SSABool $ and [b | SSABool b <- consts]
   Or  -> SSABool $ or [b | SSABool b <- consts]
-  _   -> head consts  -- Shouldn't happen
+  _   -> case consts of
+           (c:_) -> c
+           []    -> SSAInt 0  -- Identity for Add, shouldn't happen
 
--- | Build a tree from a list of operands
+-- | Build a balanced tree from a list of operands
+-- Balanced trees allow better instruction parallelism than right-skewed trees
 buildTree :: BinaryOp -> [SSAExpr] -> SSAExpr
+buildTree _ [] = SSAInt 0  -- Shouldn't happen, but safe fallback
 buildTree _ [e] = e
-buildTree op (e:es) = SSABinary op e (buildTree op es)
-buildTree _ [] = error "buildTree: empty list"
+buildTree op [e1, e2] = SSABinary op e1 e2
+buildTree op es =
+  let mid = length es `div` 2
+      (left, right) = splitAt mid es
+  in SSABinary op (buildTree op left) (buildTree op right)
 
 -- | Group same variables (e.g., a + a -> 2 * a)
 groupSameVars :: BinaryOp -> [SSAExpr] -> ([SSAExpr], Int)

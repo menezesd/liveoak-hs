@@ -217,18 +217,35 @@ buildJumpMap = go
     go (_ : rest) = go rest
 
 -- | Resolve chains: if A -> B and B -> C, then A -> C.
--- Limit iterations to avoid infinite loops on cycles.
+-- Uses fixed-point iteration with a limit to avoid infinite loops on cycles.
 resolveChains :: Map Text Text -> Map Text Text
-resolveChains = applyN 10 resolveOnce
+resolveChains mp
+  | Map.null mp = mp
+  | otherwise = fixedPointN 10 resolveOnce mp
   where
-    applyN :: Int -> (a -> a) -> a -> a
-    applyN 0 _ x = x
-    applyN n f x = applyN (n - 1) f $! f x
+    -- Apply function until fixed point or iteration limit reached
+    fixedPointN :: Eq a => Int -> (a -> a) -> a -> a
+    fixedPointN 0 _ x = x  -- Max iterations reached
+    fixedPointN n f x =
+      let x' = f x
+      in if x' == x then x else fixedPointN (n - 1) f $! x'
 
-    resolveOnce mp = Map.map (resolve mp) mp
-    resolve mp lbl = case Map.lookup lbl mp of
-      Just target | target /= lbl -> target
+    resolveOnce m = Map.map (resolve m) m
+
+    -- Resolve one step, detecting self-loops
+    resolve m lbl = case Map.lookup lbl m of
+      Just target | target /= lbl && not (isCycle m lbl target) -> target
       _ -> lbl
+
+    -- Check if following this edge would create a cycle back to the original
+    isCycle m start target = go 10 target
+      where
+        go 0 _ = True  -- Give up and assume cycle to be safe
+        go n cur
+          | cur == start = True
+          | otherwise = case Map.lookup cur m of
+              Just next | next /= cur -> go (n - 1) next
+              _ -> False
 
 -- | Rewrite a jump instruction to use the resolved target.
 rewriteJump :: Map Text Text -> SamInstr -> SamInstr

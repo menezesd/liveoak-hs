@@ -414,7 +414,7 @@ computeBlockKills safeObjs SSABlock{..} =
 -- A store is dead if it is killed in ALL paths before being read
 findInterBlockDeadStores :: CFG -> Map BlockId SSABlock -> Set StoreObj
                          -> Map BlockId (Set StoreLoc) -> Set (BlockId, Int)
-findInterBlockDeadStores cfg blockMap safeObjs killSets =
+findInterBlockDeadStores cfg blockMap safeObjs _killSets =
   let blocks = Map.elems blockMap
 
       -- For each store, check if it's dead
@@ -425,29 +425,101 @@ findInterBlockDeadStores cfg blockMap safeObjs killSets =
                   , Set.member obj safeObjs
                   , let loc = (obj, field)]
 
-      -- A store is dead if:
-      -- 1. Within the same block, there's a later store that overwrites it
-      -- 2. OR in all successor blocks, the location is killed before read
-      deadSet = foldl' (checkStoreDead cfg blockMap safeObjs killSets) Set.empty allStores
+      -- A store is dead if on ALL paths from the store, the location is
+      -- overwritten before being read
+      deadSet = foldl' (checkStoreDead cfg blockMap safeObjs) Set.empty allStores
 
   in deadSet
 
--- | Check if a specific store is dead
+-- | Check if a specific store is dead using inter-block analysis
+-- A store is dead if:
+-- 1. Within the same block, there's a later store that kills it (no intervening read), OR
+-- 2. On ALL successor paths, the location is killed before being read
 checkStoreDead :: CFG -> Map BlockId SSABlock -> Set StoreObj
-               -> Map BlockId (Set StoreLoc)
                -> Set (BlockId, Int) -> (BlockId, Int, StoreLoc)
                -> Set (BlockId, Int)
-checkStoreDead _cfg blockMap safeObjs _killSets dead (bid, idx, loc) =
+checkStoreDead cfg blockMap safeObjs dead (bid, idx, loc) =
   case Map.lookup bid blockMap of
     Nothing -> dead
     Just block ->
-      -- Check if there's a later store in the same block that kills this one
       let laterInstrs = drop (idx + 1) (blockInstrs block)
-          killedInBlock = any (storeKillsLoc safeObjs loc) laterInstrs
-          readInBlock = any (instrReadsLoc loc) laterInstrs
-      in if killedInBlock && not readInBlock
-         then Set.insert (bid, idx) dead
-         else dead
+      in case checkInstrsForKill safeObjs loc laterInstrs of
+           Killed -> Set.insert (bid, idx) dead  -- Killed in same block
+           Read -> dead                           -- Read before kill
+           Escaped -> dead                        -- Value may have escaped
+           Unknown ->
+             -- Need to check successor blocks
+             let succs = successors cfg bid
+             in if null succs
+                then dead  -- No successors means exit, store needed
+                else if allSuccessorsKill cfg blockMap safeObjs loc succs Set.empty
+                     then Set.insert (bid, idx) dead
+                     else dead
+
+-- | Result of checking instructions for kill/read
+data KillCheckResult = Killed | Read | Escaped | Unknown
+  deriving (Eq, Show)
+
+-- | Check a list of instructions to see if they kill or read a location
+checkInstrsForKill :: Set StoreObj -> StoreLoc -> [SSAInstr] -> KillCheckResult
+checkInstrsForKill safeObjs loc = go
+  where
+    go [] = Unknown
+    go (instr:rest) = case instr of
+      SSAFieldStore target _field _ _ ->
+        if storeKillsLoc safeObjs loc instr
+        then Killed  -- Found a kill
+        else if exprReadsLoc loc target
+             then Read  -- Target read the location
+             else go rest
+
+      SSAAssign _ expr ->
+        if exprHasCall expr
+        then Escaped  -- Call might read/write
+        else if exprReadsLoc loc expr
+             then Read
+             else go rest
+
+      SSAReturn (Just _) -> Escaped  -- Value may escape through return
+
+      SSABranch cond _ _ ->
+        if exprReadsLoc loc cond
+        then Read
+        else go rest
+
+      SSAExprStmt expr ->
+        if exprHasCall expr
+        then Escaped
+        else if exprReadsLoc loc expr
+             then Read
+             else go rest
+
+      SSAJump _ -> Unknown  -- Control flow, need to check successors
+      SSAReturn Nothing -> Unknown  -- Void return, location not needed
+
+-- | Check if ALL successor paths kill the location before reading it
+-- Uses depth-limited exploration to avoid infinite loops
+allSuccessorsKill :: CFG -> Map BlockId SSABlock -> Set StoreObj
+                  -> StoreLoc -> [BlockId] -> Set BlockId -> Bool
+allSuccessorsKill _ _ _ _ [] _ = True  -- All paths checked, all killed
+allSuccessorsKill cfg blockMap safeObjs loc (bid:rest) visited
+  | Set.member bid visited = allSuccessorsKill cfg blockMap safeObjs loc rest visited
+  | Set.size visited > 20 = False  -- Depth limit to avoid infinite analysis
+  | otherwise =
+      case Map.lookup bid blockMap of
+        Nothing -> False  -- Unknown block, assume not killed
+        Just block ->
+          case checkInstrsForKill safeObjs loc (blockInstrs block) of
+            Killed -> allSuccessorsKill cfg blockMap safeObjs loc rest (Set.insert bid visited)
+            Read -> False  -- This path reads, store is needed
+            Escaped -> False  -- Value escapes, store is needed
+            Unknown ->
+              -- Check this block's successors
+              let succs = successors cfg bid
+                  visited' = Set.insert bid visited
+              in if null succs
+                 then False  -- Exit without kill, store needed
+                 else allSuccessorsKill cfg blockMap safeObjs loc (succs ++ rest) visited'
 
 -- | Check if an instruction stores to the given location
 storeKillsLoc :: Set StoreObj -> StoreLoc -> SSAInstr -> Bool
@@ -456,17 +528,6 @@ storeKillsLoc safeObjs (obj, field) = \case
     case getTargetObj target of
       Just tObj -> tObj == obj && f == field && Set.member tObj safeObjs
       Nothing -> False
-  _ -> False
-
--- | Check if an instruction reads from the given location
-instrReadsLoc :: StoreLoc -> SSAInstr -> Bool
-instrReadsLoc loc = \case
-  SSAAssign _ expr -> exprReadsLoc loc expr || exprHasCall expr
-  SSAFieldStore target _ _ value ->
-    exprReadsLoc loc target || exprReadsLoc loc value
-  SSAReturn (Just expr) -> exprReadsLoc loc expr
-  SSABranch cond _ _ -> exprReadsLoc loc cond
-  SSAExprStmt expr -> exprReadsLoc loc expr || exprHasCall expr
   _ -> False
 
 -- | Check if an expression reads from the given location

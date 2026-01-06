@@ -274,8 +274,8 @@ doFullUnroll blockMap loop n =
       bodyBlocks = Set.toList (loopBody loop)
       latches = loopLatches loop
       pureBody = filter (/= header) bodyBlocks
-  in case latches of
-       [latch] ->
+  in case (latches, pureBody) of
+       ([latch], firstBody:_) ->  -- Require at least one body block
          case (findLoopExit blockMap header, Map.lookup header blockMap) of
            (Just exitTarget, Just headerBlock) ->
              let -- Extract phi node mappings from header
@@ -299,7 +299,7 @@ doFullUnroll blockMap loop n =
 
                  -- Create new header that just jumps to first iteration (or exit if n=0)
                  newHeader = if n > 0
-                   then SSABlock header [] [SSAJump (renameBlockId (head pureBody) 0)]
+                   then SSABlock header [] [SSAJump (renameBlockId firstBody 0)]
                    else SSABlock header [] [SSAJump exitTarget]
 
                  -- Remove original loop blocks
@@ -392,7 +392,8 @@ extractPhiMappings headerBlock latch preheader =
 -- | Create fully unrolled copies of the loop body
 fullUnrollCopies :: Map BlockId SSABlock -> [BlockId] -> BlockId -> BlockId
                  -> BlockId -> Int -> Map VarKey SSAVar -> Map VarKey SSAVar -> [SSABlock]
-fullUnrollCopies blockMap bodyBids header latch exitTarget n phiInitials phiLatches =
+fullUnrollCopies _ [] _ _ _ _ _ _ = []  -- No body blocks to unroll
+fullUnrollCopies blockMap bodyBids@(firstBid:_) header latch exitTarget n phiInitials phiLatches =
   let bodyBlocks = catMaybes [Map.lookup bid blockMap | bid <- bodyBids]
       -- Collect variables defined in the body (not phi nodes)
       bodyDefs = collectBodyDefinitions bodyBlocks
@@ -402,7 +403,7 @@ fullUnrollCopies blockMap bodyBids header latch exitTarget n phiInitials phiLatc
     makeUnrollCopy bodies defs hdr ltch exit total phiLatch i =
       let isLast = i == total - 1
           -- Where to go after this iteration
-          nextTarget = if isLast then exit else renameBlockId (head bodyBids) (i + 1)
+          nextTarget = if isLast then exit else renameBlockId firstBid (i + 1)
           -- Build substitution: phi var -> value for this iteration
           subst = if i == 0
             then phiInitials  -- Use initial values
