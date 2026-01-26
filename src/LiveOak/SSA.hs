@@ -57,7 +57,9 @@ module LiveOak.SSA
   , optimizeSSAProgram  -- ^ Optimize SSA program, return SSA (for use with SSACodegen)
   , optimizeSSAProgramWithSymbols  -- ^ Optimize with SROA (needs symbols)
   , ssaBasicPipeline    -- ^ Basic safe SSA optimizations
-  , ssaX86SafePipeline  -- ^ Conservative pipeline for x86 (excludes loop transforms)
+  , ssaBasicPipelineWithSymbols  -- ^ Pipeline with Devirt/StackAlloc
+  , ssaX86SafePipeline  -- ^ Conservative pipeline for x86
+  , ssaX86SafePipelineWithSymbols  -- ^ x86 pipeline with Devirt/StackAlloc
   , ssaTailCallOpt      -- ^ Tail call optimization
   , strengthReduce      -- ^ Strength reduction (multiply -> add in loops)
   , ssaInline           -- ^ Function inlining
@@ -65,6 +67,17 @@ module LiveOak.SSA
   , ssaJumpThread       -- ^ Jump threading
   , ssaSROA             -- ^ Scalar replacement of aggregates
   , ssaUnroll           -- ^ Loop unrolling
+    -- * New Optimizations
+  , ssaStoreForward     -- ^ Store-to-load forwarding across blocks
+  , ssaLoopFusion       -- ^ Loop fusion
+  , ssaIPCP             -- ^ Interprocedural constant propagation
+  , ssaDevirtualize     -- ^ Devirtualization
+  , ssaPartialInline    -- ^ Partial inlining of hot paths
+  , ssaLoopVersion      -- ^ Loop versioning with guards
+  , ssaLoopInterchange  -- ^ Loop interchange for cache locality
+  , ssaRangeOpt         -- ^ Range-based optimizations
+  , ssaStackAlloc       -- ^ Stack allocation for non-escaping objects
+  , ssaIVTransform      -- ^ Induction variable transformations
 
     -- * Statistics-Aware Optimization
   , optimizeWithStats
@@ -99,6 +112,17 @@ import qualified LiveOak.SROA as SROA
 import qualified LiveOak.Unroll as Unroll
 import qualified LiveOak.OptStats as OptStats
 import qualified LiveOak.SSAOptimize as Opt
+import qualified LiveOak.StoreForward as SF
+import qualified LiveOak.LoopFusion as LF
+import qualified LiveOak.IPCP as IPCP
+import qualified LiveOak.Devirtualize as Devirt
+import qualified LiveOak.PartialInline as PI
+import qualified LiveOak.LoopVersion as LV
+import qualified LiveOak.LoopInterchange as LI
+import qualified LiveOak.BranchProb as BP
+import qualified LiveOak.RangeOpt as RO
+import qualified LiveOak.StackAlloc as SA
+import qualified LiveOak.IVTransform as IVT
 import LiveOak.OptContext (OptContext(..), buildOptContext)
 import LiveOak.SSAUtils (blockMapFromList, fixedPointWithLimit)
 import LiveOak.MapUtils (lookupInt, lookupSet)
@@ -817,11 +841,9 @@ optimizeSSAProgram =
 optimizeSSAProgramWithSymbols :: ProgramSymbols -> SSAProgram -> SSAProgram
 optimizeSSAProgramWithSymbols syms prog =
   let sroaOptimized = ssaSROA syms prog
-  in fixedPointWithLimit 3 ssaBasicPipeline sroaOptimized
+  in fixedPointWithLimit 3 (ssaBasicPipelineWithSymbols syms) sroaOptimized
 
--- | Basic SSA optimization pipeline (safe, fast optimizations only)
--- Order: simplifyPhis -> TCO -> Inline -> JumpThread -> SCCP -> GVN -> PRE -> LICM
---        -> Unroll -> StrengthReduce -> DSE -> copyProp -> peephole -> DCE
+-- | Basic SSA optimization pipeline (without symbols - for backwards compatibility)
 ssaBasicPipeline :: SSAProgram -> SSAProgram
 ssaBasicPipeline =
     Opt.ssaDeadCodeElim
@@ -830,17 +852,52 @@ ssaBasicPipeline =
   . ssaDSE
   . strengthReduce
   . ssaUnroll
+  . ssaIVTransform       -- Induction variable transformations
+  . ssaLoopVersion       -- Loop versioning with guards
+  . ssaLoopInterchange   -- Loop interchange for cache locality
+  . ssaLoopFusion        -- Loop fusion
   . licm
   . pre
+  . ssaRangeOpt          -- Range-based optimizations
+  . ssaStoreForward      -- Store-to-load forwarding
   . gvn
   . sccp
   . ssaJumpThread
+  . ssaPartialInline     -- Partial inlining of hot paths
   . ssaInline
+  . ssaIPCP              -- Interprocedural constant propagation
   . ssaTailCallOpt
   . Opt.simplifyPhis
 
--- | SSA pipeline for x86 code generation
--- Includes loop optimizations (unroll, LICM)
+-- | Basic SSA optimization pipeline with symbol table access
+-- Enables additional optimizations: StackAlloc
+ssaBasicPipelineWithSymbols :: ProgramSymbols -> SSAProgram -> SSAProgram
+ssaBasicPipelineWithSymbols syms =
+    Opt.ssaDeadCodeElim
+  . Opt.ssaPeephole
+  . Opt.ssaCopyProp
+  . ssaDSE
+  . ssaStackAllocWithSymbols syms  -- Stack allocation for non-escaping objects
+  . strengthReduce
+  . ssaUnroll
+  . ssaIVTransform       -- Induction variable transformations
+  . ssaLoopVersion       -- Loop versioning with guards
+  . ssaLoopInterchange   -- Loop interchange for cache locality
+  . ssaLoopFusion        -- Loop fusion
+  . licm
+  . pre
+  . ssaRangeOpt          -- Range-based optimizations
+  . ssaStoreForward      -- Store-to-load forwarding
+  . gvn
+  . sccp
+  . ssaJumpThread
+  . ssaPartialInline     -- Partial inlining of hot paths
+  . ssaInline
+  . ssaIPCP              -- Interprocedural constant propagation
+  . ssaTailCallOpt
+  . Opt.simplifyPhis
+
+-- | SSA pipeline for x86 code generation (without symbols)
 ssaX86SafePipeline :: SSAProgram -> SSAProgram
 ssaX86SafePipeline =
     Opt.ssaDeadCodeElim
@@ -848,13 +905,49 @@ ssaX86SafePipeline =
   . Opt.ssaCopyProp
   . ssaDSE
   . strengthReduce
-  . ssaUnroll  -- Loop unrolling
-  . licm       -- LICM
+  . ssaUnroll            -- Loop unrolling
+  . ssaIVTransform       -- Induction variable transformations
+  . ssaLoopVersion       -- Loop versioning with guards
+  . ssaLoopInterchange   -- Loop interchange for cache locality
+  . ssaLoopFusion        -- Loop fusion
+  . licm                 -- LICM
   . pre
+  . ssaRangeOpt          -- Range-based optimizations
+  . ssaStoreForward      -- Store-to-load forwarding
   . gvn
   . sccp
   . ssaJumpThread
+  . ssaPartialInline     -- Partial inlining of hot paths
   . ssaInline
+  . ssaIPCP              -- Interprocedural constant propagation
+  . ssaTailCallOpt
+  . Opt.simplifyPhis
+
+-- | SSA pipeline for x86 code generation with symbol table
+-- Enables StackAlloc (Devirtualize not needed - no inheritance)
+ssaX86SafePipelineWithSymbols :: ProgramSymbols -> SSAProgram -> SSAProgram
+ssaX86SafePipelineWithSymbols syms =
+    Opt.ssaDeadCodeElim
+  . Opt.ssaPeephole
+  . Opt.ssaCopyProp
+  . ssaDSE
+  . ssaStackAllocWithSymbols syms  -- Stack allocation for non-escaping objects
+  . strengthReduce
+  . ssaUnroll            -- Loop unrolling
+  . ssaIVTransform       -- Induction variable transformations
+  . ssaLoopVersion       -- Loop versioning with guards
+  . ssaLoopInterchange   -- Loop interchange for cache locality
+  . ssaLoopFusion        -- Loop fusion
+  . licm                 -- LICM
+  . pre
+  . ssaRangeOpt          -- Range-based optimizations
+  . ssaStoreForward      -- Store-to-load forwarding
+  . gvn
+  . sccp
+  . ssaJumpThread
+  . ssaPartialInline     -- Partial inlining of hot paths
+  . ssaInline
+  . ssaIPCP              -- Interprocedural constant propagation
   . ssaTailCallOpt
   . Opt.simplifyPhis
 
@@ -901,6 +994,104 @@ ssaUnroll (SSAProgram classes) = SSAProgram (map unrollClass classes)
     unrollMethod method =
       let result = Unroll.unrollLoops Unroll.defaultUnrollConfig method
       in method { ssaMethodBlocks = Unroll.urOptBlocks result }
+
+--------------------------------------------------------------------------------
+-- New Optimization Wrappers (integrated into pipeline)
+--------------------------------------------------------------------------------
+
+-- | Store-to-load forwarding across blocks
+ssaStoreForward :: SSAProgram -> SSAProgram
+ssaStoreForward (SSAProgram classes) = SSAProgram (map sfClass classes)
+  where
+    sfClass cls = cls { ssaClassMethods = map sfMethod (ssaClassMethods cls) }
+    sfMethod method =
+      let result = SF.forwardStores method
+      in method { ssaMethodBlocks = SF.sfOptBlocks result }
+
+-- | Loop fusion (combine adjacent loops with same bounds)
+ssaLoopFusion :: SSAProgram -> SSAProgram
+ssaLoopFusion (SSAProgram classes) = SSAProgram (map lfClass classes)
+  where
+    lfClass cls = cls { ssaClassMethods = map lfMethod (ssaClassMethods cls) }
+    lfMethod method =
+      let result = LF.fuseLoops method
+      in method { ssaMethodBlocks = LF.fuseOptBlocks result }
+
+-- | Interprocedural constant propagation
+ssaIPCP :: SSAProgram -> SSAProgram
+ssaIPCP prog =
+  let result = IPCP.propagateIPConstants prog
+  in IPCP.ipcpOptProgram result
+
+-- | Devirtualization (convert indirect calls to direct calls)
+-- Version without symbols - no-op
+ssaDevirtualize :: SSAProgram -> SSAProgram
+ssaDevirtualize = id
+
+-- | Devirtualization with symbol table access
+ssaDevirtualizeWithSymbols :: ProgramSymbols -> SSAProgram -> SSAProgram
+ssaDevirtualizeWithSymbols syms (SSAProgram classes) = SSAProgram (map dvClass classes)
+  where
+    dvClass cls = cls { ssaClassMethods = map dvMethod (ssaClassMethods cls) }
+    dvMethod method =
+      let result = Devirt.devirtualize syms method
+      in method { ssaMethodBlocks = Devirt.dvOptBlocks result }
+
+-- | Partial inlining (inline hot paths from functions)
+ssaPartialInline :: SSAProgram -> SSAProgram
+ssaPartialInline prog =
+  let result = PI.partialInline prog
+  in PI.piOptProgram result
+
+-- | Loop versioning (create fast/slow versions with runtime checks)
+ssaLoopVersion :: SSAProgram -> SSAProgram
+ssaLoopVersion (SSAProgram classes) = SSAProgram (map lvClass classes)
+  where
+    lvClass cls = cls { ssaClassMethods = map lvMethod (ssaClassMethods cls) }
+    lvMethod method =
+      let result = LV.versionLoops method
+      in method { ssaMethodBlocks = LV.lvOptBlocks result }
+
+-- | Loop interchange (swap nested loop order for better cache locality)
+ssaLoopInterchange :: SSAProgram -> SSAProgram
+ssaLoopInterchange (SSAProgram classes) = SSAProgram (map liClass classes)
+  where
+    liClass cls = cls { ssaClassMethods = map liMethod (ssaClassMethods cls) }
+    liMethod method =
+      let result = LI.interchangeLoops method
+      in method { ssaMethodBlocks = LI.liOptBlocks result }
+
+-- | Range-based optimizations (eliminate redundant bounds checks, etc.)
+ssaRangeOpt :: SSAProgram -> SSAProgram
+ssaRangeOpt (SSAProgram classes) = SSAProgram (map roClass classes)
+  where
+    roClass cls = cls { ssaClassMethods = map roMethod (ssaClassMethods cls) }
+    roMethod method =
+      let result = RO.optimizeWithRanges method
+      in method { ssaMethodBlocks = RO.roOptBlocks result }
+
+-- | Stack allocation for non-escaping objects
+-- Version without symbols - no-op
+ssaStackAlloc :: SSAProgram -> SSAProgram
+ssaStackAlloc = id
+
+-- | Stack allocation with symbol table access
+ssaStackAllocWithSymbols :: ProgramSymbols -> SSAProgram -> SSAProgram
+ssaStackAllocWithSymbols syms (SSAProgram classes) = SSAProgram (map saClass classes)
+  where
+    saClass cls = cls { ssaClassMethods = map saMethod (ssaClassMethods cls) }
+    saMethod method =
+      let result = SA.promoteToStack syms method
+      in method { ssaMethodBlocks = SA.saOptBlocks result }
+
+-- | Induction variable transformations (widening/narrowing)
+ssaIVTransform :: SSAProgram -> SSAProgram
+ssaIVTransform (SSAProgram classes) = SSAProgram (map ivClass classes)
+  where
+    ivClass cls = cls { ssaClassMethods = map ivMethod (ssaClassMethods cls) }
+    ivMethod method =
+      let result = IVT.transformIVs method
+      in method { ssaMethodBlocks = IVT.ivtOptBlocks result }
 
 --------------------------------------------------------------------------------
 -- Statistics-Aware Optimization

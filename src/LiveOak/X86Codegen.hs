@@ -25,6 +25,7 @@ import qualified Data.Set as Set
 import Data.List (foldl', sort)
 import Data.Char (isDigit)
 import Data.Maybe (fromMaybe, isJust)
+import Data.Bits (countTrailingZeros, popCount)
 
 import LiveOak.Ast (UnaryOp(..), BinaryOp(..))
 import LiveOak.SSATypes
@@ -475,39 +476,46 @@ emitExpr = \case
       And -> emitShortCircuitAnd l r
       Or  -> emitShortCircuitOr l r
       _ -> do
-        emitExpr l
-        emit "    pushq %rax\n"
-        emitExpr r
-        emit "    movq %rax, %rcx\n"  -- Right operand in RCX
-        emit "    popq %rax\n"        -- Left operand in RAX
         -- Check if this is a string operation using type inference
         syms <- asks xcgSymbols
         typeEnv <- asks xcgTypeEnv
         clsName <- asks xcgClassName
         let isStringExpr = isStringTyped syms typeEnv clsName l || isStringTyped syms typeEnv clsName r
         if isStringExpr
-          then case op of
-            Eq -> emitStringCompare op
-            Ne -> emitStringCompare op
-            Lt -> emitStringCompare op
-            Le -> emitStringCompare op
-            Gt -> emitStringCompare op
-            Ge -> emitStringCompare op
-            Add -> emitStringConcat  -- String concatenation uses Add
-            _ -> emitBinaryOp op
-          else emitBinaryOp op
+          then do
+            emitExpr l
+            emit "    pushq %rax\n"
+            emitExpr r
+            emit "    movq %rax, %rcx\n"
+            emit "    popq %rax\n"
+            case op of
+              Eq -> emitStringCompare op
+              Ne -> emitStringCompare op
+              Lt -> emitStringCompare op
+              Le -> emitStringCompare op
+              Gt -> emitStringCompare op
+              Ge -> emitStringCompare op
+              Add -> emitStringConcat
+              _ -> emitBinaryOp op
+          else emitOptimizedBinary op l r
 
-  SSATernary cond thenE elseE -> do
-    elseLabel <- freshLabel "else"
-    endLabel <- freshLabel "endif"
-    emitExpr cond
-    emit "    testq %rax, %rax\n"
-    emit $ "    jz " <> elseLabel <> "\n"
-    emitExpr thenE
-    emit $ "    jmp " <> endLabel <> "\n"
-    emit $ elseLabel <> ":\n"
-    emitExpr elseE
-    emit $ endLabel <> ":\n"
+  SSATernary cond thenE elseE ->
+    -- Try to use cmov for simple ternary expressions
+    -- ALL three must be simple (no side effects, no calls)
+    if isSimpleExpr cond && isSimpleExpr thenE && isSimpleExpr elseE
+    then emitCmov cond thenE elseE
+    else do
+      -- Fall back to branches for complex expressions
+      elseLabel <- freshLabel "else"
+      endLabel <- freshLabel "endif"
+      emitExpr cond
+      emit "    testq %rax, %rax\n"
+      emit $ "    jz " <> elseLabel <> "\n"
+      emitExpr thenE
+      emit $ "    jmp " <> endLabel <> "\n"
+      emit $ elseLabel <> ":\n"
+      emitExpr elseE
+      emit $ endLabel <> ":\n"
 
   SSACall name args -> do
     emitStaticCall name args
@@ -575,6 +583,178 @@ emitBinaryOp = \case
     emit "    movq %rax, %rdi\n"
     emit "    movq %rcx, %rsi\n"
     emit "    call __str_concat\n"
+
+--------------------------------------------------------------------------------
+-- Peephole-Optimized Binary Operations
+--------------------------------------------------------------------------------
+
+-- | Emit optimized binary operation with peephole patterns
+-- Applies optimizations for constant operands:
+-- - Multiply by power of 2 -> shift left
+-- - Multiply by 3, 5, 9 -> lea
+-- - Add/Sub 1 -> inc/dec
+-- - Compare with 0 -> test
+-- - Add/Sub 0 -> nop
+emitOptimizedBinary :: BinaryOp -> SSAExpr -> SSAExpr -> X86Codegen ()
+emitOptimizedBinary op l r = case (op, l, r) of
+  -- Multiply by power of 2: x * 2^n -> x << n
+  (Mul, _, SSAInt n) | n > 0 && isPowerOf2 n -> do
+    emitExpr l
+    emit $ "    shlq $" <> tshow (countTrailingZeros n) <> ", %rax\n"
+
+  (Mul, SSAInt n, _) | n > 0 && isPowerOf2 n -> do
+    emitExpr r
+    emit $ "    shlq $" <> tshow (countTrailingZeros n) <> ", %rax\n"
+
+  -- Multiply by 3: x * 3 -> lea (%rax, %rax, 2), %rax
+  (Mul, _, SSAInt 3) -> do
+    emitExpr l
+    emit "    leaq (%rax, %rax, 2), %rax\n"
+
+  (Mul, SSAInt 3, _) -> do
+    emitExpr r
+    emit "    leaq (%rax, %rax, 2), %rax\n"
+
+  -- Multiply by 5: x * 5 -> lea (%rax, %rax, 4), %rax
+  (Mul, _, SSAInt 5) -> do
+    emitExpr l
+    emit "    leaq (%rax, %rax, 4), %rax\n"
+
+  (Mul, SSAInt 5, _) -> do
+    emitExpr r
+    emit "    leaq (%rax, %rax, 4), %rax\n"
+
+  -- Multiply by 9: x * 9 -> lea (%rax, %rax, 8), %rax
+  (Mul, _, SSAInt 9) -> do
+    emitExpr l
+    emit "    leaq (%rax, %rax, 8), %rax\n"
+
+  (Mul, SSAInt 9, _) -> do
+    emitExpr r
+    emit "    leaq (%rax, %rax, 8), %rax\n"
+
+  -- Add 1: x + 1 -> inc
+  (Add, _, SSAInt 1) -> do
+    emitExpr l
+    emit "    incq %rax\n"
+
+  (Add, SSAInt 1, _) -> do
+    emitExpr r
+    emit "    incq %rax\n"
+
+  -- Sub 1: x - 1 -> dec
+  (Sub, _, SSAInt 1) -> do
+    emitExpr l
+    emit "    decq %rax\n"
+
+  -- Add 0: identity
+  (Add, _, SSAInt 0) -> emitExpr l
+  (Add, SSAInt 0, _) -> emitExpr r
+
+  -- Sub 0: identity
+  (Sub, _, SSAInt 0) -> emitExpr l
+
+  -- Multiply by 0: result is 0
+  (Mul, _, SSAInt 0) -> emit "    xorq %rax, %rax\n"
+  (Mul, SSAInt 0, _) -> emit "    xorq %rax, %rax\n"
+
+  -- Multiply by 1: identity
+  (Mul, _, SSAInt 1) -> emitExpr l
+  (Mul, SSAInt 1, _) -> emitExpr r
+
+  -- Compare with 0: use test instead of cmp
+  (Eq, _, SSAInt 0) -> do
+    emitExpr l
+    emit "    testq %rax, %rax\n"
+    emit "    sete %al\n"
+    emit "    movzbl %al, %eax\n"
+
+  (Eq, SSAInt 0, _) -> do
+    emitExpr r
+    emit "    testq %rax, %rax\n"
+    emit "    sete %al\n"
+    emit "    movzbl %al, %eax\n"
+
+  (Ne, _, SSAInt 0) -> do
+    emitExpr l
+    emit "    testq %rax, %rax\n"
+    emit "    setne %al\n"
+    emit "    movzbl %al, %eax\n"
+
+  (Ne, SSAInt 0, _) -> do
+    emitExpr r
+    emit "    testq %rax, %rax\n"
+    emit "    setne %al\n"
+    emit "    movzbl %al, %eax\n"
+
+  -- Add/Sub with immediate: use immediate form
+  (Add, _, SSAInt n) | n > 0 && n < 2147483648 -> do
+    emitExpr l
+    emit $ "    addq $" <> tshow n <> ", %rax\n"
+
+  (Sub, _, SSAInt n) | n > 0 && n < 2147483648 -> do
+    emitExpr l
+    emit $ "    subq $" <> tshow n <> ", %rax\n"
+
+  -- Default: standard two-operand emission
+  _ -> do
+    emitExpr l
+    emit "    pushq %rax\n"
+    emitExpr r
+    emit "    movq %rax, %rcx\n"
+    emit "    popq %rax\n"
+    emitBinaryOp op
+
+-- | Check if a number is a power of 2
+isPowerOf2 :: Int -> Bool
+isPowerOf2 n = n > 0 && popCount n == 1
+
+--------------------------------------------------------------------------------
+-- Conditional Move Optimization
+--------------------------------------------------------------------------------
+
+-- | Check if an expression is simple enough for cmov
+-- Simple expressions: literals, variable uses (that don't use RAX/RCX)
+-- We're conservative here to avoid corrupting registers during cmov
+isSimpleExpr :: SSAExpr -> Bool
+isSimpleExpr = \case
+  SSAInt _ -> True
+  SSABool _ -> True
+  SSANull -> True
+  SSAUse _ -> True
+  SSAThis -> True
+  -- Field access involves a load from memory, but is still simple
+  -- However, evaluating the target might be complex
+  SSAFieldAccess SSAThis _ -> True
+  SSAFieldAccess (SSAUse _) _ -> True
+  -- Unary ops are only simple if operand is a literal (avoids register conflicts)
+  SSAUnary _ (SSAInt _) -> True
+  SSAUnary _ (SSABool _) -> True
+  SSAUnary _ (SSAUse _) -> True
+  _ -> False  -- Everything else (calls, binary ops, new objects) is complex
+
+-- | Emit conditional move: cond ? thenE : elseE
+-- Uses cmov to avoid branch misprediction penalty
+emitCmov :: SSAExpr -> SSAExpr -> SSAExpr -> X86Codegen ()
+emitCmov cond thenE elseE = do
+  -- For simple expressions, cmov is beneficial
+  -- Pattern: else_val in RAX, then_val in RCX, cmovne to select
+
+  -- 1. Evaluate else value (default)
+  emitExpr elseE
+  emit "    pushq %rax\n"        -- Save else value
+
+  -- 2. Evaluate then value
+  emitExpr thenE
+  emit "    movq %rax, %rcx\n"   -- then value in RCX
+
+  -- 3. Evaluate condition
+  emitExpr cond
+  emit "    testq %rax, %rax\n"  -- Set flags based on condition
+
+  -- 4. Select result
+  emit "    popq %rax\n"         -- else value in RAX
+  emit "    cmovneq %rcx, %rax\n"  -- If cond != 0, RAX = RCX (then value)
 
 -- | Check if an expression has string type using type inference
 isStringTyped :: ProgramSymbols -> TypeEnv -> String -> SSAExpr -> Bool

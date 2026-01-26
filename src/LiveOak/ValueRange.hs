@@ -33,6 +33,10 @@ module LiveOak.ValueRange
   , rangeProvePositive
   , rangeProveNonNegative
   , rangeProveLessThan
+
+    -- * Range Evaluation
+  , evalBinaryRange
+  , evalExprRangeInBlock
   ) where
 
 import LiveOak.SSATypes hiding (varKey)

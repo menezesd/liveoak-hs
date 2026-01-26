@@ -161,8 +161,8 @@ compileToX86WithWarnings path source = do
   -- AST optimization and SSA conversion
   let optimizedProgram = optimize symbols program
       ssaProg = SSA.toSSAWithCFG symbols optimizedProgram
-      -- Use safe SSA pipeline for x86 (excludes loop unrolling and LICM)
-      finalSSA = SSA.ssaX86SafePipeline ssaProg
+      -- Use symbols-aware SSA pipeline for x86 (includes Devirtualize, StackAlloc)
+      finalSSA = SSA.ssaX86SafePipelineWithSymbols symbols ssaProg
 
   -- x86_64 code generation
   code <- X86Codegen.generateX86FromSSA finalSSA symbols

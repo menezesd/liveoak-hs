@@ -58,10 +58,12 @@ data ScanState = ScanState
 --------------------------------------------------------------------------------
 
 -- | Registers available for allocation.
--- We use callee-saved registers so we don't need to save/restore around every call.
--- This simplifies code but requires saving them in prologue if used.
+-- We use a mix of callee-saved and caller-saved registers.
+-- Callee-saved (RBX, R12-R15): Preserved across calls, good for long-lived values
+-- Caller-saved (R10, R11): Must save around calls, good for temporaries
+-- Note: RAX, RCX, RDX, RSI, RDI, R8, R9 are used for argument passing/return
 allocatableRegs :: [X86Reg]
-allocatableRegs = [RBX, R12, R13, R14, R15]  -- 5 callee-saved registers
+allocatableRegs = [RBX, R12, R13, R14, R15, R10, R11]  -- 7 registers (5 callee + 2 caller)
 
 --------------------------------------------------------------------------------
 -- Register Allocation
@@ -190,7 +192,20 @@ insertByEnd item@(li, _) = go
 getVarLocation :: String -> RegAllocation -> Maybe VarLocation
 getVarLocation var alloc = Map.lookup var (raLocations alloc)
 
+-- | Callee-saved registers (subset of allocatable)
+calleeSavedAlloc :: [X86Reg]
+calleeSavedAlloc = [RBX, R12, R13, R14, R15]
+
+-- | Caller-saved registers (subset of allocatable)
+callerSavedAlloc :: [X86Reg]
+callerSavedAlloc = [R10, R11]
+
 -- | Get the list of callee-saved registers that were used (need to be saved in prologue)
 usedCalleeRegs :: RegAllocation -> [X86Reg]
 usedCalleeRegs alloc =
-  filter (`Set.member` raUsedRegs alloc) allocatableRegs
+  filter (`Set.member` raUsedRegs alloc) calleeSavedAlloc
+
+-- | Get the list of caller-saved registers that were used (need to be saved around calls)
+usedCallerRegs :: RegAllocation -> [X86Reg]
+usedCallerRegs alloc =
+  filter (`Set.member` raUsedRegs alloc) callerSavedAlloc

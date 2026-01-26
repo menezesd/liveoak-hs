@@ -87,6 +87,20 @@ library
                     , LiveOak.X86Runtime
                     , LiveOak.X86Liveness
                     , LiveOak.X86RegAlloc
+                    , LiveOak.StoreForward
+                    , LiveOak.LoopFusion
+                    , LiveOak.IPCP
+                    , LiveOak.Devirtualize
+                    , LiveOak.PartialInline
+                    , LiveOak.X86Peephole
+                    , LiveOak.RegCoalesce
+                    , LiveOak.LoopVersion
+                    , LiveOak.LoopInterchange
+                    , LiveOak.BranchProb
+                    , LiveOak.RangeOpt
+                    , LiveOak.CmovLower
+                    , LiveOak.StackAlloc
+                    , LiveOak.IVTransform
     build-depends:    base >= 4.17 && < 5
                     , text >= 2.0
                     , megaparsec >= 9.0
