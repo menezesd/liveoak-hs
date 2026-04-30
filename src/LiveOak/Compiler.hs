@@ -15,6 +15,10 @@ module LiveOak.Compiler
   , compileToX86
   , compileToX86WithWarnings
 
+    -- * AArch64 Compilation
+  , compileToARM
+  , compileToARMWithWarnings
+
     -- * Compilation Stages
   , CompilationStage (..)
 
@@ -35,6 +39,7 @@ import qualified LiveOak.Peephole as Peephole
 import qualified LiveOak.SSA as SSA
 import qualified LiveOak.SSACodegen as SSACodegen
 import qualified LiveOak.X86Codegen as X86Codegen
+import qualified LiveOak.ARMCodegen as ARMCodegen
 
 -- | Compilation stages.
 data CompilationStage
@@ -166,5 +171,39 @@ compileToX86WithWarnings path source = do
 
   -- x86_64 code generation
   code <- X86Codegen.generateX86FromSSA finalSSA symbols
+
+  return (code, warnings)
+
+--------------------------------------------------------------------------------
+-- AArch64 Compilation
+--------------------------------------------------------------------------------
+
+-- | Compile source text to AArch64 assembly (GAS syntax).
+compileToARM :: FilePath -> Text -> Result Text
+compileToARM path source = fst <$> compileToARMWithWarnings path source
+
+-- | Compile source text to AArch64 assembly, also returning warnings.
+compileToARMWithWarnings :: FilePath -> Text -> Result (Text, [Warning])
+compileToARMWithWarnings path source = do
+  -- Parse program and build symbol table
+  (program, symbols) <- parseProgram path source
+
+  -- Validate entry point
+  validateEntrypoint symbols
+
+  -- Semantic analysis
+  checkProgram program symbols
+
+  -- Collect warnings
+  let warnings = collectWarnings program symbols
+
+  -- AST optimization and SSA conversion
+  let optimizedProgram = optimize symbols program
+      ssaProg = SSA.toSSAWithCFG symbols optimizedProgram
+      -- Use same SSA pipeline as x86 (optimizations are target-independent)
+      finalSSA = SSA.ssaX86SafePipelineWithSymbols symbols ssaProg
+
+  -- AArch64 code generation
+  code <- ARMCodegen.generateARMFromSSA finalSSA symbols
 
   return (code, warnings)

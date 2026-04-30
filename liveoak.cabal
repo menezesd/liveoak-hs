@@ -93,6 +93,11 @@ library
                     , LiveOak.Devirtualize
                     , LiveOak.PartialInline
                     , LiveOak.X86Peephole
+                    , LiveOak.ARM
+                    , LiveOak.ARMCodegen
+                    , LiveOak.ARMRuntime
+                    , LiveOak.ARMRegAlloc
+                    , LiveOak.ARMPeephole
                     , LiveOak.RegCoalesce
                     , LiveOak.LoopVersion
                     , LiveOak.LoopInterchange

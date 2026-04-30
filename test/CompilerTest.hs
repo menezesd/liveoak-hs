@@ -9,6 +9,7 @@ import System.Directory (listDirectory, doesFileExist)
 import System.FilePath ((</>), takeExtension, takeBaseName)
 import Data.List (sort)
 import Control.Monad (forM)
+import qualified Data.Text.IO as TIO
 import LiveOak.Compiler
 
 -- | All compiler tests.
@@ -16,6 +17,8 @@ compilerTests :: TestTree
 compilerTests = testGroup "Compiler"
   [ validProgramTests
   , invalidProgramTests
+  , x86BackendTests
+  , armBackendTests
   ]
 
 -- | Test directory paths.
@@ -55,6 +58,40 @@ invalidProgramTests = testGroup "Invalid Programs" $
         else assertFailure $ unlines $
           "The following invalid programs compiled successfully (should have failed):" :
           map takeBaseName successes
+  ]
+
+-- | Tests for x86_64 backend (all valid programs should compile).
+x86BackendTests :: TestTree
+x86BackendTests = testGroup "x86_64 Backend" $
+  [ testCase "All valid programs compile to x86_64" $ do
+      files <- getLoFiles validProgramsDir
+      results <- forM files $ \file -> do
+        source <- TIO.readFile file
+        let result = compileToX86 file source
+        return (file, result)
+      let failures = [(f, d) | (f, Left d) <- results]
+      if null failures
+        then return ()
+        else assertFailure $ unlines $
+          "The following valid programs failed to compile to x86_64:" :
+          [takeBaseName f ++ ": " ++ formatDiag d | (f, d) <- failures]
+  ]
+
+-- | Tests for AArch64 backend (all valid programs should compile).
+armBackendTests :: TestTree
+armBackendTests = testGroup "AArch64 Backend" $
+  [ testCase "All valid programs compile to AArch64" $ do
+      files <- getLoFiles validProgramsDir
+      results <- forM files $ \file -> do
+        source <- TIO.readFile file
+        let result = compileToARM file source
+        return (file, result)
+      let failures = [(f, d) | (f, Left d) <- results]
+      if null failures
+        then return ()
+        else assertFailure $ unlines $
+          "The following valid programs failed to compile to AArch64:" :
+          [takeBaseName f ++ ": " ++ formatDiag d | (f, d) <- failures]
   ]
 
 -- | Get all .lo files in a directory.
