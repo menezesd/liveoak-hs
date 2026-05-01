@@ -40,7 +40,7 @@ import LiveOak.SSATypeInfer (TypeEnv, buildTypeEnv, inferSSAExprClassWithCtx, in
 import LiveOak.Types (ValueType(..), Type(..))
 import LiveOak.X86
 import LiveOak.X86Runtime (emitX86Runtime)
-import LiveOak.X86Liveness (computeLiveness, buildIntervals)
+import LiveOak.Liveness (computeLiveness, buildIntervals)
 import LiveOak.X86RegAlloc (RegAllocation(..), VarLocation(..), allocateRegisters, getVarLocation, usedCalleeRegs)
 
 --------------------------------------------------------------------------------

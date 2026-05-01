@@ -85,7 +85,7 @@ library
                     , LiveOak.X86
                     , LiveOak.X86Codegen
                     , LiveOak.X86Runtime
-                    , LiveOak.X86Liveness
+                    , LiveOak.Liveness
                     , LiveOak.X86RegAlloc
                     , LiveOak.StoreForward
                     , LiveOak.LoopFusion

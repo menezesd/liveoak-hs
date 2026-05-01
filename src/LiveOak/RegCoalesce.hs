@@ -27,7 +27,7 @@ module LiveOak.RegCoalesce
   ) where
 
 import LiveOak.X86
-import LiveOak.X86Liveness (LivenessInfo, LiveInterval(..), liVar)
+import LiveOak.Liveness (LivenessInfo, LiveInterval(..), liVar)
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map

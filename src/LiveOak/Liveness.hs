@@ -1,9 +1,9 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE RecordWildCards #-}
 
--- | Liveness analysis for x86_64 register allocation.
+-- | Target-independent liveness analysis for register allocation.
 -- Computes which SSA variables are live at each point in the program.
-module LiveOak.X86Liveness
+module LiveOak.Liveness
   ( -- * Types
     LivenessInfo(..)
   , LiveInterval(..)

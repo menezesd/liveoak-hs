@@ -41,7 +41,7 @@ import LiveOak.Types (ValueType(..), Type(..))
 import LiveOak.ARM (ARMReg(..), regName)
 import LiveOak.ARMRuntime (emitARMRuntime)
 import qualified LiveOak.ARM as ARM
-import LiveOak.X86Liveness (computeLiveness, buildIntervals)
+import LiveOak.Liveness (computeLiveness, buildIntervals)
 import LiveOak.ARMRegAlloc (RegAllocation(..), VarLocation(..), allocateRegisters, getVarLocation, usedCalleeRegs)
 
 --------------------------------------------------------------------------------

@@ -25,7 +25,7 @@ import Data.List (sortBy, foldl')
 import Data.Ord (comparing)
 
 import LiveOak.X86 (X86Reg(..))
-import LiveOak.X86Liveness (LiveInterval(..))
+import LiveOak.Liveness (LiveInterval(..))
 
 --------------------------------------------------------------------------------
 -- Types
