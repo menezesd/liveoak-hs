@@ -98,6 +98,7 @@ library
                     , LiveOak.ARMRuntime
                     , LiveOak.ARMRegAlloc
                     , LiveOak.ARMPeephole
+                    , LiveOak.LLVMCodegen
                     , LiveOak.RegCoalesce
                     , LiveOak.LoopVersion
                     , LiveOak.LoopInterchange

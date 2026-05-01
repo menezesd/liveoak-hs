@@ -19,6 +19,7 @@ compilerTests = testGroup "Compiler"
   , invalidProgramTests
   , x86BackendTests
   , armBackendTests
+  , llvmBackendTests
   ]
 
 -- | Test directory paths.
@@ -74,6 +75,23 @@ x86BackendTests = testGroup "x86_64 Backend" $
         then return ()
         else assertFailure $ unlines $
           "The following valid programs failed to compile to x86_64:" :
+          [takeBaseName f ++ ": " ++ formatDiag d | (f, d) <- failures]
+  ]
+
+-- | Tests for LLVM IR backend (all valid programs should compile).
+llvmBackendTests :: TestTree
+llvmBackendTests = testGroup "LLVM IR Backend" $
+  [ testCase "All valid programs compile to LLVM IR" $ do
+      files <- getLoFiles validProgramsDir
+      results <- forM files $ \file -> do
+        source <- TIO.readFile file
+        let result = compileToLLVM file source
+        return (file, result)
+      let failures = [(f, d) | (f, Left d) <- results]
+      if null failures
+        then return ()
+        else assertFailure $ unlines $
+          "The following valid programs failed to compile to LLVM IR:" :
           [takeBaseName f ++ ": " ++ formatDiag d | (f, d) <- failures]
   ]
 

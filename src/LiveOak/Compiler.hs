@@ -19,6 +19,10 @@ module LiveOak.Compiler
   , compileToARM
   , compileToARMWithWarnings
 
+    -- * LLVM IR Compilation
+  , compileToLLVM
+  , compileToLLVMWithWarnings
+
     -- * Compilation Stages
   , CompilationStage (..)
 
@@ -40,6 +44,7 @@ import qualified LiveOak.SSA as SSA
 import qualified LiveOak.SSACodegen as SSACodegen
 import qualified LiveOak.X86Codegen as X86Codegen
 import qualified LiveOak.ARMCodegen as ARMCodegen
+import qualified LiveOak.LLVMCodegen as LLVMCodegen
 
 -- | Compilation stages.
 data CompilationStage
@@ -206,4 +211,25 @@ compileToARMWithWarnings path source = do
   -- AArch64 code generation
   code <- ARMCodegen.generateARMFromSSA finalSSA symbols
 
+  return (code, warnings)
+
+--------------------------------------------------------------------------------
+-- LLVM IR Compilation
+--------------------------------------------------------------------------------
+
+-- | Compile source text to LLVM IR.
+compileToLLVM :: FilePath -> Text -> Result Text
+compileToLLVM path source = fst <$> compileToLLVMWithWarnings path source
+
+-- | Compile source text to LLVM IR, also returning warnings.
+compileToLLVMWithWarnings :: FilePath -> Text -> Result (Text, [Warning])
+compileToLLVMWithWarnings path source = do
+  (program, symbols) <- parseProgram path source
+  validateEntrypoint symbols
+  checkProgram program symbols
+  let warnings = collectWarnings program symbols
+      optimizedProgram = optimize symbols program
+      ssaProg = SSA.toSSAWithCFG symbols optimizedProgram
+      finalSSA = SSA.ssaX86SafePipelineWithSymbols symbols ssaProg
+  code <- LLVMCodegen.generateLLVMFromSSA finalSSA symbols
   return (code, warnings)

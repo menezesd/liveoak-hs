@@ -14,7 +14,7 @@ import qualified Data.Text.IO as TIO
 import LiveOak.Compiler
 
 -- | Compilation target
-data Target = TargetSAM | TargetX86_64 | TargetAArch64
+data Target = TargetSAM | TargetX86_64 | TargetAArch64 | TargetLLVM
   deriving (Eq, Show)
 
 -- | Parse command-line arguments
@@ -70,6 +70,8 @@ parseTarget flags =
         Just "aarch64" -> Just TargetAArch64
         Just "arm64" -> Just TargetAArch64
         Just "arm" -> Just TargetAArch64
+        Just "llvm" -> Just TargetLLVM
+        Just "llvm-ir" -> Just TargetLLVM
         Just _other -> Nothing  -- Will cause error below if no valid target
         Nothing -> Nothing
 
@@ -86,6 +88,7 @@ compileWithOptions Options{..} = do
         TargetSAM -> compileCollectAllErrors
         TargetX86_64 -> compileX86CollectAllErrors
         TargetAArch64 -> compileARMCollectAllErrors
+        TargetLLVM -> compileLLVMCollectAllErrors
   let result = compiler optInput source
   case result of
     Right (code, warnings) -> do
@@ -114,6 +117,13 @@ compileARMCollectAllErrors path source =
     Left err -> Left [err]
     Right result -> Right result
 
+-- | Compile to LLVM IR and collect all errors
+compileLLVMCollectAllErrors :: FilePath -> T.Text -> Either [Diag] (T.Text, [Warning])
+compileLLVMCollectAllErrors path source =
+  case compileToLLVMWithWarnings path source of
+    Left err -> Left [err]
+    Right result -> Right result
+
 -- | Print usage information
 printUsage :: IO ()
 printUsage = do
@@ -127,6 +137,7 @@ printUsage = do
   hPutStrLn stderr "                     sam     - SAM assembly (default)"
   hPutStrLn stderr "                     x86_64  - x86_64 assembly (GAS syntax)"
   hPutStrLn stderr "                     aarch64 - AArch64/ARM64 assembly (GAS syntax)"
+  hPutStrLn stderr "                     llvm    - LLVM IR (.ll)"
   hPutStrLn stderr ""
   hPutStrLn stderr "Arguments:"
   hPutStrLn stderr "  input.lo   Input LiveOak source file"
